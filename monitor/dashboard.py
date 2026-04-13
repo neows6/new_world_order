@@ -69,7 +69,7 @@ def _price_change(session, company_id: int) -> dict:
             "prev_close": round(prev.close, 2) if prev and prev.close else None}
 
 
-def _recent_signals(limit: int = 20) -> list:
+def _recent_signals(limit: int = 50) -> list:
     with Session() as session:
         rows = (
             session.query(TradeSignal, Company)
@@ -2796,12 +2796,14 @@ async def _schedule_morning_brief():
 # ── Paper trading auto-scheduler startup ──────────────────────────────────────
 @app.on_event("startup")
 async def _start_paper_scheduler():
+    import logging as _logging
+    _log = _logging.getLogger("paper_scheduler")
     try:
         from paper.auto_scheduler import init_scheduler
         init_scheduler(main_db_url=config.database.url)
-        logger.info("[AUTO] Paper scheduler initialised")
+        _log.info("[AUTO] Paper scheduler initialised")
     except Exception as e:
-        logger.warning(f"[AUTO] Paper scheduler startup failed (will use manual Run Now): {e}")
+        _log.warning(f"[AUTO] Paper scheduler startup failed (will use manual Run Now): {e}")
 
 
 @app.get("/api/paper/scheduler")
