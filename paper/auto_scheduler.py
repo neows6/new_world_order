@@ -168,11 +168,21 @@ class PaperScheduler:
             self._ensure_engines()
             self._apply_thresh_override()
 
-            # Refresh prices before analysis
+            # Refresh prices for config.watchlist + all stage gate tickers
             try:
                 from pipeline.ingestion import IngestionPipeline
+                from config import config as _cfg
+                import json as _json
+                from pathlib import Path as _Path
+                sg_file = _Path("data/stagegate.json")
+                sg_tickers = []
+                if sg_file.exists():
+                    _sg = _json.loads(sg_file.read_text(encoding="utf-8"))
+                    for k in ("stage1", "stage2", "stage3"):
+                        sg_tickers.extend(_sg.get(k, []))
+                all_tickers = list(dict.fromkeys(list(_cfg.watchlist) + sg_tickers))
                 price_pipeline = IngestionPipeline(db_session_factory=self._Session)
-                price_pipeline.run_prices_only()
+                price_pipeline.run_prices_only(tickers=all_tickers)
             except Exception as e:
                 logger.warning(f"[AUTO] Price refresh failed (using cached): {e}")
 

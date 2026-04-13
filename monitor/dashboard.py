@@ -2554,12 +2554,39 @@ def api_stagegate_get():
 
 @app.post("/api/stagegate")
 async def api_stagegate_save(request: Request):
-    import json
+    import json, threading
     body = await request.json()
     stage1 = body.get("stage1", [])
     stage2 = body.get("stage2", [])
-    _save_stagegate({"stage1": stage1, "stage2": stage2})
-    return {"status": "ok", "stage1": len(stage1), "stage2": len(stage2)}
+    stage3 = body.get("stage3", [])
+
+    # Detect tickers that are genuinely new (not in the previous stagegate)
+    existing = _load_stagegate()
+    existing_all = set(existing.get("stage1", []) + existing.get("stage2", []) + existing.get("stage3", []))
+    incoming_all = set(stage1 + stage2 + stage3)
+    new_tickers  = [t for t in incoming_all - existing_all if t]
+
+    _save_stagegate({"stage1": stage1, "stage2": stage2, "stage3": stage3})
+
+    # Auto-ingest any new tickers in the background (prices + fundamentals)
+    if new_tickers:
+        import logging as _log
+        _log.getLogger("stagegate").info(f"[STAGEGATE] New tickers detected: {new_tickers} — auto-ingesting")
+
+        def _ingest_new():
+            try:
+                from models.database import init_db as _idb
+                from pipeline.ingestion import IngestionPipeline
+                _, _S = _idb(config.database.url, echo=False)
+                IngestionPipeline(db_session_factory=_S).run_full_ingest(tickers=new_tickers)
+            except Exception as e:
+                import logging as _log2
+                _log2.getLogger("stagegate").warning(f"[STAGEGATE] Auto-ingest failed: {e}")
+
+        threading.Thread(target=_ingest_new, daemon=True, name="sg-ingest").start()
+
+    return {"status": "ok", "stage1": len(stage1), "stage2": len(stage2),
+            "ingesting": new_tickers}
 
 
 # ── Stage Gate embedded in Paper Trading (auto-patched) ───────────────────────
