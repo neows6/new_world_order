@@ -966,16 +966,24 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
          background: #0d1117; color: #e6edf3; font-size: 13px; line-height: 1.6; }
-  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px;
-           display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 10; }
+  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 10px 20px;
+           display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 10;
+           flex-wrap: wrap; }
   header h1 { font-size: 16px; font-weight: 700; }
   .back-btn { padding: 4px 12px; border-radius: 5px; border: 1px solid #30363d; cursor: pointer;
-              font-size: 12px; background: #21262d; color: #e6edf3; text-decoration: none; }
+              font-size: 12px; background: #21262d; color: #e6edf3; text-decoration: none; flex-shrink: 0; }
   .back-btn:hover { background: #30363d; }
   .refresh-btn { padding: 4px 12px; border-radius: 5px; border: 1px solid #1f6feb; cursor: pointer;
-                 font-size: 12px; background: #1c2e50; color: #58a6ff; margin-left: auto; }
+                 font-size: 12px; background: #1c2e50; color: #58a6ff; flex-shrink: 0; }
   .refresh-btn:hover { background: #2d4a80; }
-  .gen-time { font-size: 11px; color: #8b949e; }
+  .gen-time { font-size: 11px; color: #8b949e; flex-shrink: 0; }
+  /* Heartbeat */
+  #hb-status { display: flex; align-items: center; gap: 5px; font-size: 11px;
+               color: #8b949e; flex-shrink: 0; }
+  #hb-dot { font-size: 14px; line-height: 1; transition: color 0.4s; }
+  #hb-dot.ok  { color: #3fb950; }
+  #hb-dot.err { color: #f85149; }
+  #hb-dot.warn { color: #d29922; }
   main { max-width: 1200px; margin: 0 auto; padding: 20px; display: grid;
          grid-template-columns: 2fr 1fr; gap: 16px; }
   .full { grid-column: 1 / -1; }
@@ -1022,6 +1030,28 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
   .loading { color: #8b949e; font-style: italic; padding: 20px; text-align: center; }
   .error   { color: #f85149; padding: 12px; background: #1a0a0a; border-radius: 6px; }
   #spinner { display: none; color: #8b949e; font-size: 12px; }
+  /* Stage Gate add controls */
+  .mb-add-wrap { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .mb-search { padding: 4px 8px; border-radius: 5px; border: 1px solid #30363d;
+               background: #0d1117; color: #e6edf3; font-size: 12px; width: 90px;
+               text-transform: uppercase; }
+  .mb-search:focus { outline: none; border-color: #58a6ff; }
+  .mb-add-s1, .mb-add-s2 { padding: 4px 10px; border-radius: 5px; cursor: pointer;
+                             font-size: 12px; font-weight: 600; border: 1px solid; }
+  .mb-add-s1 { background: #1c2e50; color: #58a6ff; border-color: #1f6feb; }
+  .mb-add-s1:hover { background: #2d4a80; }
+  .mb-add-s2 { background: #1a2d1a; color: #3fb950; border-color: #238636; }
+  .mb-add-s2:hover { background: #2a4a2a; }
+  .mb-mini { padding: 2px 6px; border-radius: 4px; cursor: pointer; font-size: 10px;
+             font-weight: 700; border: 1px solid #1f6feb; background: #1c2e50;
+             color: #58a6ff; margin-left: 4px; vertical-align: middle; }
+  .mb-mini:hover { background: #2d4a80; }
+  .mb-toast { position: fixed; bottom: 20px; right: 20px; padding: 8px 16px;
+              border-radius: 6px; font-size: 12px; font-weight: 600; z-index: 999;
+              opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+  .mb-toast.show { opacity: 1; }
+  .mb-toast.ok  { background: #1a3a1a; color: #3fb950; border: 1px solid #238636; }
+  .mb-toast.err { background: #3a1a1a; color: #f85149; border: 1px solid #da3633; }
 </style>
 </head>
 <body>
@@ -1029,6 +1059,14 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
   <a class="back-btn" href="/">← Dashboard</a>
   <h1>📊 Morning Market Brief</h1>
   <span class="gen-time" id="gen-time">Loading...</span>
+  <span id="hb-status"><span id="hb-dot" class="warn">●</span><span id="hb-label">Connecting...</span></span>
+  <div style="flex:1"></div>
+  <div class="mb-add-wrap">
+    <input class="mb-search" id="mb-ticker-input" placeholder="TICKER" maxlength="8"
+           onkeydown="if(event.key==='Enter')mbAddToStage(this.value,'1')" title="Type a ticker and press Enter or click +S1/+S2 to add to Stage Gate">
+    <button class="mb-add-s1" onclick="mbAddToStage(document.getElementById('mb-ticker-input').value,'1')" title="Add to Stage 1 (Monitoring)">+S1</button>
+    <button class="mb-add-s2" onclick="mbAddToStage(document.getElementById('mb-ticker-input').value,'2')" title="Add to Stage 2 (Active AI)">+S2</button>
+  </div>
   <button class="refresh-btn" id="refresh-btn" onclick="loadBrief(true)">&#8635; Regenerate</button>
 </header>
 
@@ -1117,7 +1155,7 @@ function buildWSB(items) {
     const dStr = delta > 0 ? '+'+delta : delta;
     return `<div class="wsb-row">
       <span class="wsb-rank">#${t.rank}</span>
-      <span class="wsb-ticker">${t.ticker}</span>
+      <span class="wsb-ticker">${t.ticker}<button class="mb-mini" onclick="mbAddToStage('${t.ticker}','1')">+S1</button></span>
       <div class="wsb-bar-wrap"><div class="wsb-bar" style="width:${barW}%"></div></div>
       <span class="wsb-mentions">${t.mentions}</span>
       <span class="wsb-delta ${dCls}">${dStr}</span>
@@ -1133,7 +1171,7 @@ function buildCongress(trades) {
       const cls = isBuy ? 'ct-buy' : 'ct-sell';
       return `<tr>
         <td><span style="font-size:10px">${t.politician||'—'} <span style="color:#8b949e">(${t.party||'?'})</span></span></td>
-        <td><strong>${t.ticker||'—'}</strong></td>
+        <td><strong>${t.ticker||'—'}</strong>${t.ticker ? `<button class="mb-mini" onclick="mbAddToStage('${t.ticker}','1')">+S1</button>` : ''}</td>
         <td class="${cls}">${t.action||'—'}</td>
         <td style="font-size:11px;color:#8b949e">${t.amount||'—'}</td>
         <td style="font-size:11px;color:#8b949e">${t.date||'—'}</td>
@@ -1246,6 +1284,70 @@ async function loadBrief(forceRefresh = false) {
   } catch(e) {
     document.getElementById('loading-screen').innerHTML =
       `<div class="error">Failed to connect: ${e.message}<br><button onclick="loadBrief()" style="margin-top:8px;padding:6px 14px;background:#21262d;border:1px solid #30363d;color:#e6edf3;border-radius:5px;cursor:pointer">Retry</button></div>`;
+  }
+}
+
+// ── Heartbeat ──────────────────────────────────────────────────────────────
+let _hbOk = false;
+function _nextBriefTime() {
+  const now = new Date();
+  // Brief auto-regenerates at 06:00 and 09:00 ET — approximate with local time offsets
+  const etOffset = -5 * 60;  // ET = UTC-5 (approximate; ignores DST)
+  const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const etMins  = ((utcMins + etOffset) % (24 * 60) + 24 * 60) % (24 * 60);
+  const slots   = [6 * 60, 9 * 60];
+  let next = null;
+  for (const s of slots) { if (etMins < s) { next = s; break; } }
+  if (next === null) { next = slots[0] + 24 * 60; }
+  const diffMin = next - etMins;
+  if (diffMin < 60) return `Next brief in ~${diffMin}m`;
+  const h = Math.floor(diffMin / 60), m = diffMin % 60;
+  return `Next brief in ~${h}h ${m}m`;
+}
+async function _heartbeat() {
+  const dot   = document.getElementById('hb-dot');
+  const label = document.getElementById('hb-label');
+  try {
+    await fetch('/api/morning-brief', {method:'HEAD', cache:'no-store'});
+    dot.className = 'ok'; label.textContent = 'Live \u2022 ' + _nextBriefTime();
+    _hbOk = true;
+  } catch(e) {
+    dot.className = 'err'; label.textContent = 'Server offline';
+    _hbOk = false;
+  }
+}
+_heartbeat();
+setInterval(_heartbeat, 30000);
+
+let _mbToastTimer = null;
+function _mbToast(msg, ok) {
+  let t = document.getElementById('mb-toast');
+  if (!t) { t = document.createElement('div'); t.id = 'mb-toast'; t.className = 'mb-toast'; document.body.appendChild(t); }
+  t.textContent = msg;
+  t.className = 'mb-toast ' + (ok ? 'ok' : 'err');
+  void t.offsetWidth;
+  t.classList.add('show');
+  if (_mbToastTimer) clearTimeout(_mbToastTimer);
+  _mbToastTimer = setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+async function mbAddToStage(ticker, stage) {
+  ticker = (ticker || '').trim().toUpperCase().replace(/[^A-Z0-9.]/g, '');
+  if (!ticker) { _mbToast('Enter a ticker first', false); return; }
+  try {
+    const r = await fetch('/api/stagegate/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticker, stage})
+    });
+    const d = await r.json();
+    if (d.status === 'added')         _mbToast(`${ticker} added to Stage ${stage} ✓`, true);
+    else if (d.status === 'already_exists') _mbToast(`${ticker} already in Stage Gate`, true);
+    else                              _mbToast(d.error || 'Error adding ticker', false);
+    const inp = document.getElementById('mb-ticker-input');
+    if (inp) inp.value = '';
+  } catch(e) {
+    _mbToast('Network error: ' + e.message, false);
   }
 }
 
@@ -2385,9 +2487,55 @@ def api_paper_account():
         from models.database import init_db as _init_db
         _, _Session = _init_db(config.database.url, echo=False)
         ex = PaperExecutor(main_db_session_factory=_Session)
-        return ex.get_account_summary()
+        summary = ex.get_account_summary()
+        # Enrich open positions with live Schwab prices
+        try:
+            from paper.auto_scheduler import get_scheduler
+            sched = get_scheduler()
+            if sched and sched._market_data and summary.get("positions"):
+                tickers = [p["ticker"] for p in summary["positions"]]
+                quotes = sched._market_data.get_quotes_batch(tickers)
+                for p in summary["positions"]:
+                    q = quotes.get(p["ticker"])
+                    if q and q.get("last_price"):
+                        live = round(float(q["last_price"]), 2)
+                        p["cur_price"] = live
+                        p["mkt_val"]   = round(live * p["qty"], 2)
+                        p["pnl"]       = round(p["mkt_val"] - p["avg_cost"] * p["qty"], 2)
+                        p["pnl_pct"]   = round(p["pnl"] / (p["avg_cost"] * p["qty"]) * 100, 2) if p["avg_cost"] else 0
+        except Exception:
+            pass  # fall back to DB values already in summary
+        return summary
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
+
+
+@app.get("/api/prices")
+def api_prices(tickers: str = ""):
+    """Return {ticker: latest_close_price} from PriceHistory for any requested tickers."""
+    if not tickers:
+        return {}
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    result = {}
+    try:
+        from models.database import init_db as _init_db, PriceHistory, Company
+        _, _Session = _init_db(config.database.url, echo=False)
+        with _Session() as s:
+            rows = (
+                s.query(Company.ticker, PriceHistory.close)
+                .join(PriceHistory, PriceHistory.company_id == Company.id)
+                .filter(Company.ticker.in_(ticker_list))
+                .order_by(Company.ticker, PriceHistory.date.desc())
+                .all()
+            )
+            seen: set = set()
+            for ticker, close in rows:
+                if ticker not in seen and close:
+                    result[ticker] = round(float(close), 2)
+                    seen.add(ticker)
+    except Exception:
+        pass
+    return result
 
 
 @app.get("/api/paper/trades")
@@ -2577,8 +2725,11 @@ async def api_stagegate_save(request: Request):
             try:
                 from models.database import init_db as _idb
                 from pipeline.ingestion import IngestionPipeline
+                import logging as _log2
                 _, _S = _idb(config.database.url, echo=False)
-                IngestionPipeline(db_session_factory=_S).run_full_ingest(tickers=new_tickers)
+                pip = IngestionPipeline(db_session_factory=_S)
+                pip.run_prices_only(tickers=new_tickers)   # fast – cards show prices quickly
+                pip.run_full_ingest(tickers=new_tickers)   # slow – fundamentals follow
             except Exception as e:
                 import logging as _log2
                 _log2.getLogger("stagegate").warning(f"[STAGEGATE] Auto-ingest failed: {e}")
@@ -2587,6 +2738,56 @@ async def api_stagegate_save(request: Request):
 
     return {"status": "ok", "stage1": len(stage1), "stage2": len(stage2),
             "ingesting": new_tickers}
+
+
+@app.post("/api/stagegate/add")
+async def api_stagegate_add(request: Request):
+    """
+    Atomic single-ticker add — used by morning brief and any other page
+    that wants to add a ticker without loading+posting the full state.
+    Body: {"ticker": "AAPL", "stage": "1"}  (stage defaults to "1")
+    """
+    import threading
+    body  = await request.json()
+    ticker = (body.get("ticker") or "").strip().upper()
+    stage  = str(body.get("stage", "1"))
+
+    if not ticker or stage not in ("1", "2", "3"):
+        return {"status": "error", "error": "invalid ticker or stage"}
+
+    current   = _load_stagegate()
+    all_tickers = set(
+        current.get("stage1", []) + current.get("stage2", []) + current.get("stage3", [])
+    )
+
+    if ticker in all_tickers:
+        return {"status": "already_exists", "ticker": ticker}
+
+    current.setdefault("stage" + stage, []).append(ticker)
+    _save_stagegate(current)
+
+    # Auto-ingest prices + fundamentals in background
+    import logging as _log
+    _log.getLogger("stagegate").info(f"[STAGEGATE] Added {ticker} to stage {stage} — auto-ingesting")
+
+    def _ingest():
+        try:
+            from models.database import init_db as _idb
+            from pipeline.ingestion import IngestionPipeline
+            import logging as _log2
+            _, _S = _idb(config.database.url, echo=False)
+            pip = IngestionPipeline(db_session_factory=_S)
+            # Fast: prices only (~2-3s) so the card shows a value immediately
+            pip.run_prices_only(tickers=[ticker])
+            _log2.getLogger("stagegate").info(f"[STAGEGATE] Price fetched for {ticker}")
+            # Slow: fundamentals in same thread (no UI blocking)
+            pip.run_full_ingest(tickers=[ticker])
+        except Exception as e:
+            import logging as _log2
+            _log2.getLogger("stagegate").warning(f"[STAGEGATE] Auto-ingest failed for {ticker}: {e}")
+
+    threading.Thread(target=_ingest, daemon=True, name=f"sg-ingest-{ticker}").start()
+    return {"status": "added", "ticker": ticker, "stage": stage, "ingesting": [ticker]}
 
 
 # ── Stage Gate embedded in Paper Trading (auto-patched) ───────────────────────
@@ -3117,3 +3318,173 @@ for _old, _new in [
     ("getElementById('sg3-act-btn')",     "getElementById('sg-act-btn')"),
 ]:
     PAPER_JS = PAPER_JS.replace(_old, _new)
+
+# ── Efficiency patches (2026-04-13) ──────────────────────────────────────────
+
+# 1. Sticky header in PAPER_HTML (stays visible while scrolling)
+PAPER_HTML = PAPER_HTML.replace(
+    'header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;\n           display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }',
+    'header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;\n           display: flex; align-items: center; gap: 10px; flex-wrap: wrap;\n           position: sticky; top: 0; z-index: 20; }'
+)
+
+# 2. Sticky sched-bar (sits just below sticky header ~50px)
+PAPER_HTML = PAPER_HTML.replace(
+    'sched-bar" style="background:#0d1117;border-bottom:1px solid #21262d;padding:4px 20px;font-size:11px;color:#8b949e;display:flex;gap:16px;flex-wrap:wrap;"',
+    'sched-bar" style="background:#0d1117;border-bottom:1px solid #21262d;padding:4px 20px;font-size:11px;color:#8b949e;display:flex;gap:16px;flex-wrap:wrap;position:sticky;top:50px;z-index:19;"'
+)
+
+# 3. Inject shared signal cache into PAPER_JS (deduplicate /api/signals calls)
+#    Both loadSwimLanes() and sg3Boot() (IIFE) call /api/signals independently.
+#    fetchSignalsOnce() caches the result for 8 s so they share one network hit.
+_SIGNALS_CACHE_JS = (
+    r"// Shared signal cache — deduplicate /api/signals fetches within same render cycle" + "\n"
+    r"let _sigCache = null, _sigCacheTs = 0;" + "\n"
+    r"async function fetchSignalsOnce() {" + "\n"
+    r"  const now = Date.now();" + "\n"
+    r"  if (_sigCache && (now - _sigCacheTs) < 8000) return _sigCache;" + "\n"
+    r"  _sigCache = await fetch('/api/signals').then(r => r.json());" + "\n"
+    r"  _sigCacheTs = now;" + "\n"
+    r"  return _sigCache;" + "\n"
+    r"}" + "\n\n"
+)
+PAPER_JS = PAPER_JS.replace(
+    r"async function loadSwimLanes() {",
+    _SIGNALS_CACHE_JS + r"async function loadSwimLanes() {"
+)
+
+# 4. loadSwimLanes: use cache instead of direct fetch
+PAPER_JS = PAPER_JS.replace(
+    r"const signals = await fetch('/api/signals').then(r => r.json());",
+    r"const signals = await fetchSignalsOnce();"
+)
+
+# 5. sg3Boot (inside IIFE, now part of PAPER_JS after merge): use cache
+PAPER_JS = PAPER_JS.replace(
+    r"const sigs = await fetch('/api/signals').then(r => r.json());\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });",
+    r"const sigs = await fetchSignalsOnce();\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });"
+)
+
+# 6. Invalidate cache on Run Now completion so the post-cycle refresh gets fresh data
+PAPER_JS = PAPER_JS.replace(
+    r"load();\n          loadSwimLanes();\n          if (typeof sg3Boot === 'function') sg3Boot();",
+    r"_sigCacheTs = 0;\n          load();\n          loadSwimLanes();\n          if (typeof sg3Boot === 'function') sg3Boot();"
+)
+
+# ── Fix: sg3Boot uses real newlines (not literal \n) — correct the cache replace ──
+# Prior attempt used raw r"\n" which didn't match; use real \n strings instead
+PAPER_JS = PAPER_JS.replace(
+    "const sigs = await fetch('/api/signals').then(r => r.json());\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });",
+    "const sigs = await fetchSignalsOnce();\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });"
+)
+
+# ── Fix: post-IIFE loadSwimLanes override also fetches signals for pBuildTape ──
+PAPER_JS = PAPER_JS.replace(
+    "const sigs = await fetch('/api/signals').then(r => r.json());\n    pBuildTape(sigs);",
+    "const sigs = await fetchSignalsOnce();\n    pBuildTape(sigs);"
+)
+
+# ── Fix: itool+signals Promise.all — signals half uses cache ──
+PAPER_JS = PAPER_JS.replace(
+    "      fetch('/api/signals').then(r => r.json()).catch(() => []),",
+    "      fetchSignalsOnce().catch(() => []),"
+)
+
+# ── Layout + tape fixes (2026-04-13) ─────────────────────────────────────────
+
+# 1. Make .p-tape-wrap sticky (tape stays visible while scrolling)
+PAPER_JS = PAPER_JS.replace(
+    r'.p-tape-wrap  { overflow: hidden; background: #0a0f17;' + '\n' +
+    r'                  border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0; }',
+    r'.p-tape-wrap  { overflow: hidden; background: #0a0f17;' + '\n' +
+    r'                  border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0;' + '\n' +
+    r'                  position: sticky; top: 50px; z-index: 18; }'
+)
+
+# 2. Sched-bar now sits below header (50px) + tape (26px) = 76px
+PAPER_HTML = PAPER_HTML.replace(
+    'position:sticky;top:50px;z-index:19;',
+    'position:sticky;top:76px;z-index:19;'
+)
+
+# 3. Frontend: after any POST to /api/stagegate (add or save), schedule a delayed
+#    sg3Boot() so cards refresh once the backend price fetch completes (~5-7s).
+#    Intercepts fetch at the page level — runs after IIFE so window.sg3Boot exists.
+_STAGEGATE_REFRESH_JS = (
+    "\n// Auto-refresh Stage Gate cards after any stagegate save (picks up freshly-fetched prices)\n"
+    "(function() {\n"
+    "  const _origFetch = window.fetch.bind(window);\n"
+    "  window.fetch = function(url, opts) {\n"
+    "    const p = _origFetch(url, opts);\n"
+    "    if (typeof url === 'string' && url.includes('/api/stagegate') &&\n"
+    "        opts && (opts.method||'').toUpperCase() === 'POST') {\n"
+    "      p.then(() => setTimeout(() => { if(window.sg3Boot) window.sg3Boot(); }, 7000));\n"
+    "    }\n"
+    "    return p;\n"
+    "  };\n"
+    "})();\n"
+)
+PAPER_JS = PAPER_JS + _STAGEGATE_REFRESH_JS
+
+# ── Fix tape CSS sticky (prior attempt used actual \n; PAPER_JS needs literal \n) ──
+PAPER_JS = PAPER_JS.replace(
+    r'.p-tape-wrap  { overflow: hidden; background: #0a0f17;\n                  border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0; }',
+    r'.p-tape-wrap  { overflow: hidden; background: #0a0f17;\n                  border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0;\n                  position: sticky; top: 50px; z-index: 18; }'
+)
+
+# ── Fix C: sg3Boot() — fill missing prices from /api/prices before sg3Render() ──
+# _SG3_JS uses real newlines, so match with actual \n not raw r"\n"
+# Also make sg3Boot async (it already uses await; need the keyword for correctness)
+PAPER_JS = PAPER_JS.replace(
+    "async function sg3Boot() {",
+    "async function sg3Boot() { /* price-fill enabled */"
+)
+# Inject price-fill block just before sg3Render() at end of sg3Boot
+# _SG3_JS at runtime has REAL newlines (Python evaluates \n in '...' strings)
+PAPER_JS = PAPER_JS.replace(
+    "  _sg3.stage3 = _sg3.stage3 || [];\n  sg3Render();\n}",
+    (
+        "  _sg3.stage3 = _sg3.stage3 || [];\n"
+        "  // Fill missing prices for stage gate tickers without signals\n"
+        "  try {\n"
+        "    const _sgAllTix = [...(_sg3.stage1||[]), ...(_sg3.stage2||[]), ...(_sg3.stage3||[])];\n"
+        "    const _sgMissing = _sgAllTix.filter(t => !_sg3sigs[t] || !_sg3sigs[t].current_price);\n"
+        "    if (_sgMissing.length) {\n"
+        "      const _pm = await fetch('/api/prices?tickers=' + _sgMissing.join(',')).then(r => r.json());\n"
+        "      Object.entries(_pm).forEach(([t, p]) => {\n"
+        "        if (!_sg3sigs[t]) _sg3sigs[t] = { ticker: t };\n"
+        "        _sg3sigs[t].current_price = p;\n"
+        "      });\n"
+        "    }\n"
+        "  } catch(e) {}\n"
+        "  sg3Render();\n"
+        "}"
+    )
+)
+
+# ── Fix D: pBuildTape() — show all priced tickers, repeat to fill full banner ──
+# _FEAT_JS at runtime has REAL newlines (Python evaluates \n in '...' strings)
+PAPER_JS = PAPER_JS.replace(
+    "pBuildTape(sigs) {\n"
+    "  const track = document.getElementById('p-tape');\n"
+    "  if (!track) return;\n"
+    "  const items = (sigs || []).filter(s => {\n"
+    "    const sig = (s.signal || '').toUpperCase();\n"
+    "    return sig === 'BUY' || sig === 'STRONG_BUY' || sig === 'SELL' || sig === 'STRONG_SELL';\n"
+    "  });\n"
+    "  if (!items.length) { track.innerHTML = '<span class=\"pt-neu\">No signals</span>'; return; }\n"
+    "  const all = [...items, ...items];",
+    (
+        "pBuildTape(sigs) {\n"
+        "  const track = document.getElementById('p-tape');\n"
+        "  if (!track) return;\n"
+        "  // All tickers with a price, sorted by signal strength\n"
+        "  const _sigOrder = {'STRONG_BUY':0,'BUY':1,'SELL':2,'STRONG_SELL':3};\n"
+        "  const items = (sigs || []).filter(s => s.current_price).sort((a,b) => {\n"
+        "    const sa = (a.signal||'z').toUpperCase(), sb = (b.signal||'z').toUpperCase();\n"
+        "    return (_sigOrder[sa]??9) - (_sigOrder[sb]??9);\n"
+        "  });\n"
+        "  if (!items.length) { track.innerHTML = '<span class=\"pt-neu\">No data</span>'; return; }\n"
+        "  const _repeat = Math.max(2, Math.ceil(40 / items.length));\n"
+        "  const all = Array.from({length: _repeat}, () => items).flat();"
+    )
+)
