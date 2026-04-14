@@ -254,7 +254,6 @@ class SchwabMarketData:
                 symbol,
                 contract_type=_SchwabClient.Options.ContractType.ALL,
                 to_date=to_date,
-                option_type=_SchwabClient.Options.Type.STANDARD,
             )
             resp.raise_for_status()
             raw = resp.json()

@@ -350,7 +350,7 @@ WHEEL_HTML = '''<!DOCTYPE html>
 <body>
 <header>
   <a href="/" class="back-btn">← Back</a>
-  <h1>🎡 WHEEL STRATEGY</h1>
+  <h1>🎡 WHEEL STRATEGY <span style="font-size:11px;padding:2px 8px;border-radius:4px;background:#3d2b00;color:#d29922;font-weight:600;letter-spacing:1px;vertical-align:middle;margin-left:6px">PAPER / DRY RUN</span></h1>
   <div class="header-right">
     <span id="scan-status"></span>
     <button class="scan-btn" id="scan-btn" onclick="startScan()">🔍 Scan S&amp;P 500</button>
