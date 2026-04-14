@@ -619,7 +619,16 @@ function renderSignals(signals) {
     <th>Time (local)</th>
   </tr>`;
 
-  for (const s of signals) {
+  // Group by ticker — one primary row per ticker, hidden sub-rows for history
+  const _grp = {};
+  (signals || []).forEach(s => { if (!_grp[s.ticker]) _grp[s.ticker] = []; _grp[s.ticker].push(s); });
+  Object.values(_grp).forEach(g => g.sort((a, b) => new Date(b.generated_at||0) - new Date(a.generated_at||0)));
+  const _sigRank = {'STRONG_BUY':0,'BUY':1,'HOLD':2,'STRONG_SELL':3,'SELL':4};
+  const _tkOrd = Object.keys(_grp).sort((a, b) =>
+    (_sigRank[_grp[a][0].signal]??9) - (_sigRank[_grp[b][0].signal]??9));
+  for (const _tk of _tkOrd) { for (const [_si, s] of _grp[_tk].entries()) {
+  const _isPrimary = _si === 0; const _hasHistory = _grp[_tk].length > 1;
+
     const origCls = s.signal === 'BUY' ? 'signal-buy' : s.signal === 'SELL' ? 'signal-sell' : 'signal-hold';
     const conf   = s.confidence || 0;
     const mosVal = s.margin_of_safety;
@@ -724,8 +733,8 @@ function renderSignals(signals) {
     const utcStr   = s.generated_at.replace(' ', 'T') + 'Z';
     const localTime = new Date(utcStr).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
 
-    html += `<tr>
-      <td><strong>${s.ticker}</strong>${acted}</td>
+    html += `<tr${!_isPrimary ? ` class="sig-hist-row" data-ticker="${s.ticker}" style="display:none;opacity:0.75"` : ''}>
+      <td><strong>${s.ticker}</strong>${acted}${_isPrimary && _hasHistory ? `<span onclick="toggleSigHistory('${s.ticker}')" style="cursor:pointer;color:#8b949e;font-size:10px;margin-left:5px;user-select:none" title="${_grp[_tk].length-1} older entr${_grp[_tk].length>2?'ies':'y'}">&#9654;</span>` : ''}</td>
       <td class="${origCls}">${dispSignal}</td>
       <td>
         <span style="font-weight:600">${price}</span>
@@ -757,8 +766,13 @@ function renderSignals(signals) {
       <td>${blocker}</td>
       <td style="color:#8b949e;font-size:12px">${localTime}</td>
     </tr>`;
-  }
+  }} // end inner + outer ticker loop
   el.innerHTML = html + '</table>';
+}
+
+function toggleSigHistory(ticker) {
+  const rows = document.querySelectorAll('.sig-hist-row[data-ticker="' + ticker + '"]');
+  rows.forEach(r => { r.style.display = r.style.display === 'none' ? '' : 'none'; });
 }
 
 async function fetchSignals() {
@@ -2239,7 +2253,9 @@ function renderTable(results) {
       '<td class="' + kCls + '">' + r.stoch_k.toFixed(1) + '</td>' +
       '<td class="' + sigCls + '">' + sigIcon + ' ' + r.signal.toUpperCase() + '</td>' +
       '<td><button class="chart-btn" onclick="event.stopPropagation();openChart(\\'' +
-        r.ticker + '\\')">Chart</button></td>' +
+        r.ticker + '\\')">Chart</button>' +
+      ' <button class="it-add-btn it-add-s1" onclick="event.stopPropagation();itAddToStage(\\'' + r.ticker + '\\',\\'1\\')" title="Add to Stage 1">+S1</button>' +
+      ' <button class="it-add-btn it-add-s2" onclick="event.stopPropagation();itAddToStage(\\'' + r.ticker + '\\',\\'2\\')" title="Add to Stage 2">+S2</button></td>' +
       '</tr>';
   }
   wrap.innerHTML = html + '</table>';
@@ -2390,6 +2406,36 @@ function modalBgClick(e) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 loadScan();
 setInterval(loadScan, 30000);
+
+// ── Stage Gate quick-add buttons ─────────────────────────────────────────────
+(function() {
+  const s = document.createElement('style');
+  s.textContent = `
+    .it-add-btn { padding: 2px 6px; font-size: 10px; border-radius: 4px; cursor: pointer; margin-left: 3px; }
+    .it-add-s1 { border: 1px solid #8b949e; color: #8b949e; background: transparent; }
+    .it-add-s1:hover { background: rgba(139,148,158,0.15); }
+    .it-add-s2 { border: 1px solid #58a6ff; color: #58a6ff; background: transparent; }
+    .it-add-s2:hover { background: rgba(88,166,255,0.15); }
+  `;
+  document.head.appendChild(s);
+})();
+
+async function itAddToStage(ticker, stage) {
+  try {
+    const resp = await fetch('/api/stagegate/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticker: ticker, stage: stage}),
+    }).then(r => r.json());
+    const btn = event.currentTarget;
+    const orig = btn.textContent;
+    btn.textContent = (resp && resp.status === 'already_exists') ? '\\u2713' : '\\u2713 Added';
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+  } catch(e) {
+    console.error('itAddToStage error:', e);
+  }
+}
 """
 
 
@@ -3568,3 +3614,129 @@ PAPER_JS = PAPER_JS.replace(
     "          + '\\uD83E\\uDD16 ' + (_aiOn ? 'ON' : 'OFF') + '</button>';\n"
     "  }"
 )
+
+# ── Item 1: Info icon on Paper Trading header ─────────────────────────────────
+PAPER_HTML = PAPER_HTML.replace(
+    '&#127918; Paper Trading</h1>\n  <div class="header-right">',
+    '&#127918; Paper Trading &nbsp;<button id="paper-info-btn" onclick="paperShowInfo()" '
+    'style="background:none;border:1px solid #58a6ff;color:#58a6ff;border-radius:50%;'
+    'width:20px;height:20px;font-size:11px;cursor:pointer;padding:0;line-height:18px;'
+    'vertical-align:middle">&#x2139;</button></h1>\n  <div class="header-right">',
+)
+
+_PAPER_INFO_JS = """
+// ── Paper Trading info modal ──────────────────────────────────────────────────
+function paperShowInfo() {
+  let m = document.getElementById('paper-info-modal');
+  if (!m) {
+    m = document.createElement('div');
+    m.id = 'paper-info-modal';
+    m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center;';
+    m.innerHTML = `<div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;max-width:520px;width:92%;max-height:80vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h2 style="color:#58a6ff;font-size:16px">&#127918; Paper Trading &#8212; How It Works</h2>
+        <button onclick="document.getElementById('paper-info-modal').style.display='none'" style="background:none;border:none;color:#8b949e;font-size:20px;cursor:pointer;line-height:1">&#x2715;</button>
+      </div>
+      <div style="font-size:13px;line-height:1.75;color:#e6edf3">
+        <p><strong style="color:#58a6ff">3-Stage Workflow</strong></p>
+        <p style="margin-top:8px">&#9312; <strong>Stage 1 &#8212; Monitoring:</strong> Stocks on your watchlist. AI does not trade them. Use the search box or +S1 buttons to add tickers here.</p>
+        <p style="margin-top:8px">&#9313; <strong>Stage 2 &#8212; Active AI:</strong> The full 6-layer pipeline runs every 5 min during market hours (9:30am&#8211;4pm ET). The AI may place paper BUY orders.</p>
+        <p style="margin-top:8px">&#9314; <strong>Stage 3 &#8212; Open Positions:</strong> Tickers with an open paper position. Stop-loss and take-profit levels are monitored every 60 seconds.</p>
+        <hr style="border:none;border-top:1px solid #30363d;margin:14px 0">
+        <p><strong style="color:#d29922">&#129504; AI Exit Toggle</strong> &#8212; Each Stage 3 card has a toggle. When ON, the pipeline evaluates exit signals. A SELL or STRONG_SELL triggers a paper SELL of the full position.</p>
+        <hr style="border:none;border-top:1px solid #30363d;margin:14px 0">
+        <p><strong style="color:#3fb950">Stage 2 + Stage 3 Split</strong> &#8212; A ticker can exist in both Stage 2 and Stage 3 simultaneously. This lets the AI continue evaluating pyramid BUY signals while a position is open.</p>
+        <hr style="border:none;border-top:1px solid #30363d;margin:14px 0">
+        <p style="color:#8b949e;font-size:11px">Cycle: every 5 min (Mon&#8211;Fri) &middot; Stops: every 60 s &middot; Starting balance: $100,000</p>
+      </div>
+    </div>`;
+    document.body.appendChild(m);
+    m.addEventListener('click', function(e) { if (e.target === m) m.style.display = 'none'; });
+  } else {
+    m.style.display = 'flex';
+  }
+}
+window.paperShowInfo = paperShowInfo;
+"""
+PAPER_JS = PAPER_JS + _PAPER_INFO_JS
+
+
+# ── Item 2a: Condense swim lanes from 3 to 2 rows ────────────────────────────
+PAPER_JS = PAPER_JS.replace(
+    "  const MODELS = [\n"
+    "    { label: 'Standard',     conf: 0.50,  mos: 0.15,   fud: 0.60 },\n"
+    "    { label: 'Relaxed -25%', conf: 0.375, mos: 0.1125, fud: 0.45 },\n"
+    "    { label: 'Relaxed -50%', conf: 0.25,  mos: 0.075,  fud: 0.30 },\n"
+    "  ];",
+    "  const MODELS = [\n"
+    "    { label: 'Standard',     conf: 0.50,  mos: 0.15,   fud: 0.60 },\n"
+    "    { label: 'Relaxed -25%', conf: 0.375, mos: 0.1125, fud: 0.45 },\n"
+    "  ];",
+)
+
+
+# ── Item 2b: Collapsible trade history grouped by date ────────────────────────
+_TRADE_OLD = (
+    "      let h = '<table><tr><th>Time</th><th>Ticker</th><th>Action</th>"
+    "<th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th></tr>';\n"
+    "      for (const t of trades) {\n"
+    "        const dt = t.timestamp\n"
+    "          ? new Date(t.timestamp + 'Z').toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})\n"
+    "          : '\\u2014';\n"
+    "        h += '<tr><td class=\"neu\" style=\"font-size:11px\">' + dt + '</td><td><strong>' + t.ticker +\n"
+    "          '</strong></td><td class=\"' + (t.action==='BUY'?'up':'dn') + '\">' + t.action +\n"
+    "          '</td><td>' + t.qty + '</td><td>' + fmt(t.price) + '</td><td>' + fmt(t.total, 0) +\n"
+    "          '</td><td class=\"neu\">' + fmt(t.cash_after, 0) + '</td></tr>';\n"
+    "      }\n"
+    "      tw.innerHTML = h + '</table>';\n"
+)
+_TRADE_NEW = (
+    "      const _byDate = {}, _dkeys = [];\n"
+    "      for (const t of trades) {\n"
+    "        const d = t.timestamp ? new Date(t.timestamp + 'Z') : null;\n"
+    "        const dk = d ? String(d.getMonth()+1).padStart(2,'0') + '/'\n"
+    "          + String(d.getDate()).padStart(2,'0') + '/' + d.getFullYear() : 'Unknown';\n"
+    "        if (!_byDate[dk]) { _byDate[dk] = []; _dkeys.push(dk); }\n"
+    "        _byDate[dk].push(Object.assign({}, t, {_d: d}));\n"
+    "      }\n"
+    "      let h = '<table><tr><th>Time</th><th>Ticker</th><th>Action</th>"
+    "<th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th></tr>';\n"
+    "      _dkeys.forEach(function(dk, i) {\n"
+    "        const grp = _byDate[dk], exp = i === 0;\n"
+    "        h += '<tr class=\"trade-date-hdr\" onclick=\"toggleTradeDate(this)\" data-date-key=\"' + dk\n"
+    "           + '\" style=\"cursor:pointer;background:#161b22\">'\n"
+    "           + '<td colspan=\"7\" style=\"padding:6px 12px;font-size:11px;color:#8b949e;letter-spacing:.5px\">'\n"
+    "           + (exp ? '&#9660;' : '&#9654;') + ' ' + dk\n"
+    "           + ' <span style=\"color:#555\">(' + grp.length + ' trade' + (grp.length > 1 ? 's' : '') + ')</span></td></tr>';\n"
+    "        grp.forEach(function(t) {\n"
+    "          const dt = t._d ? t._d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '\\u2014';\n"
+    "          h += '<tr class=\"trade-date-row\" data-date-parent=\"' + dk + '\" style=\"display:' + (exp ? '' : 'none') + '\">'\n"
+    "             + '<td class=\"neu\" style=\"font-size:11px\">' + dt + '</td>'\n"
+    "             + '<td><strong>' + t.ticker + '</strong></td>'\n"
+    "             + '<td class=\"' + (t.action === 'BUY' ? 'up' : 'dn') + '\">' + t.action + '</td>'\n"
+    "             + '<td>' + t.qty + '</td><td>' + fmt(t.price) + '</td>'\n"
+    "             + '<td>' + fmt(t.total, 0) + '</td>'\n"
+    "             + '<td class=\"neu\">' + fmt(t.cash_after, 0) + '</td></tr>';\n"
+    "        });\n"
+    "      });\n"
+    "      tw.innerHTML = h + '</table>';\n"
+)
+
+if _TRADE_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_TRADE_OLD, _TRADE_NEW)
+    _TOGGLE_TRADE_JS = """
+// ── Toggle trade date groups ──────────────────────────────────────────────────
+function toggleTradeDate(hdr) {
+  const dk = hdr.dataset.dateKey;
+  const rows = document.querySelectorAll('.trade-date-row[data-date-parent="' + dk + '"]');
+  if (!rows.length) return;
+  const exp = rows[0].style.display === 'none';
+  rows.forEach(function(r) { r.style.display = exp ? '' : 'none'; });
+  const cell = hdr.querySelector('td');
+  if (cell) cell.innerHTML = cell.innerHTML.replace(exp ? '&#9654;' : '&#9660;', exp ? '&#9660;' : '&#9654;');
+}
+"""
+    PAPER_JS = PAPER_JS + _TOGGLE_TRADE_JS
+else:
+    import sys as _sys
+    print('[WARN] Item 2b: trade history target string not found in PAPER_JS', file=_sys.stderr)
