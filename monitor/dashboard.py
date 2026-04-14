@@ -2538,6 +2538,28 @@ def api_prices(tickers: str = ""):
     return result
 
 
+@app.get("/api/ai-exits")
+def api_ai_exits_get():
+    """Return {ticker: bool} AI exit toggle state from data/ai_exits.json."""
+    import json
+    from pathlib import Path
+    f = Path("data/ai_exits.json")
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+
+@app.post("/api/ai-exits")
+async def api_ai_exits_post(request: Request):
+    """Update AI exit toggles. Body: {ticker: bool, ...}"""
+    import json
+    from pathlib import Path
+    body = await request.json()
+    f = Path("data/ai_exits.json")
+    current = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    current.update({k: bool(v) for k, v in body.items()})
+    f.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    return {"status": "ok"}
+
+
 @app.get("/api/paper/trades")
 def api_paper_trades():
     try:
@@ -2756,14 +2778,19 @@ async def api_stagegate_add(request: Request):
         return {"status": "error", "error": "invalid ticker or stage"}
 
     current   = _load_stagegate()
-    all_tickers = set(
-        current.get("stage1", []) + current.get("stage2", []) + current.get("stage3", [])
-    )
+    target    = "stage" + stage
+    in_stages = {k for k in ("stage1", "stage2", "stage3") if ticker in current.get(k, [])}
 
-    if ticker in all_tickers:
-        return {"status": "already_exists", "ticker": ticker}
+    if in_stages:
+        if target in in_stages:
+            return {"status": "already_exists", "ticker": ticker}
+        # Allow stage2+stage3 coexistence (split/pyramid mode); block all other cross-stage combos
+        allowed = (in_stages == {"stage3"} and target == "stage2") or \
+                  (in_stages == {"stage2"} and target == "stage3")
+        if not allowed:
+            return {"status": "already_exists", "ticker": ticker}
 
-    current.setdefault("stage" + stage, []).append(ticker)
+    current.setdefault(target, []).append(ticker)
     _save_stagegate(current)
 
     # Auto-ingest prices + fundamentals in background
@@ -3487,4 +3514,57 @@ PAPER_JS = PAPER_JS.replace(
         "  const _repeat = Math.max(2, Math.ceil(40 / items.length));\n"
         "  const all = Array.from({length: _repeat}, () => items).flat();"
     )
+)
+
+# ── AI Exit Toggle: global state, loader, and toggle handler ─────────────────
+# Appended after the IIFE so these run at page-load time and are accessible
+# as window.* properties from inside the IIFE (sg3CardHtml reads window._sg3aiExits).
+_AI_EXIT_JS = (
+    "\n// ── AI Exit Toggle (Stage 3) ─────────────────────────────────────────────\n"
+    "window._sg3aiExits = {};\n"
+    "window.sg3LoadAiExits = async function() {\n"
+    "  try { window._sg3aiExits = await fetch('/api/ai-exits').then(r => r.json()); }\n"
+    "  catch(e) {}\n"
+    "};\n"
+    "window.sg3ToggleAiExit = async function(ticker) {\n"
+    "  window._sg3aiExits[ticker] = !window._sg3aiExits[ticker];\n"
+    "  try {\n"
+    "    await fetch('/api/ai-exits', {\n"
+    "      method: 'POST',\n"
+    "      headers: {'Content-Type': 'application/json'},\n"
+    "      body: JSON.stringify({[ticker]: window._sg3aiExits[ticker]})\n"
+    "    });\n"
+    "  } catch(e) {}\n"
+    "  if (window.sg3Render) window.sg3Render();\n"
+    "};\n"
+    "// Wrap window.sg3Boot to also load AI exits before rendering\n"
+    "(function() {\n"
+    "  const _origSg3Boot = window.sg3Boot;\n"
+    "  window.sg3Boot = async function() {\n"
+    "    await window.sg3LoadAiExits();\n"
+    "    if (_origSg3Boot) await _origSg3Boot();\n"
+    "  };\n"
+    "})();\n"
+    "// CSS for AI exit button states\n"
+    "(function() {\n"
+    "  const s = document.createElement('style');\n"
+    "  s.textContent = '.sg3-btn-ai { color: #8b949e; border-color: #30363d; font-size: 10px; }'\n"
+    "    + ' .sg3-btn-ai-on { color: #3fb950; border-color: #3fb950; background: rgba(63,185,80,0.1); font-size: 10px; }';\n"
+    "  document.head.appendChild(s);\n"
+    "})();\n"
+)
+PAPER_JS = PAPER_JS + _AI_EXIT_JS
+
+# ── AI Exit Toggle: inject button into Stage 3 card (sg3CardHtml) ─────────────
+# Use the unique "Sell</button>';\n  }" tail as the target (avoids backslash-quote escaping issues)
+PAPER_JS = PAPER_JS.replace(
+    "title=\"Sell\">Sell</button>';\n  }",
+    "title=\"Sell\">Sell</button>';\n"
+    "    const _aiOn = (window._sg3aiExits || {})[ticker] || false;\n"
+    "    btns += '<button class=\"sg3-btn sg3-btn-ai' + (_aiOn ? ' sg3-btn-ai-on' : '') + '\" '\n"
+    "          + 'data-ticker=\"' + ticker + '\" '\n"
+    "          + 'onclick=\"window.sg3ToggleAiExit && window.sg3ToggleAiExit(this.dataset.ticker)\" '\n"
+    "          + 'title=\"AI exit ' + (_aiOn ? 'ON — click to disable' : 'OFF — click to enable') + '\">'  \n"
+    "          + '\\uD83E\\uDD16 ' + (_aiOn ? 'ON' : 'OFF') + '</button>';\n"
+    "  }"
 )

@@ -227,11 +227,16 @@ class PaperExecutor:
             for k in ("stage1", "stage2", "stage3"):
                 sg.setdefault(k, [])
             if action == "BUY":
-                for k in ("stage1", "stage2"):
-                    if ticker in sg[k]:
-                        sg[k].remove(ticker)
+                # Always remove from stage1
+                if ticker in sg["stage1"]:
+                    sg["stage1"].remove(ticker)
+                # First buy: move from stage2 → stage3
+                # Pyramid buy (already in stage3 from a split): keep stage2 presence as-is
                 if ticker not in sg["stage3"]:
+                    if ticker in sg["stage2"]:
+                        sg["stage2"].remove(ticker)
                     sg["stage3"].append(ticker)
+                # else: pyramid — stage2 presence unchanged
             elif action == "SELL":
                 if ticker in sg["stage3"]:
                     sg["stage3"].remove(ticker)
@@ -242,6 +247,39 @@ class PaperExecutor:
                 json.dump(sg, f, indent=2)
         except Exception as e:
             logger.warning(f"[PAPER] stagegate sync failed: {e}")
+
+    def execute_sell(self, ticker: str, price: float, reason: str = "AI_SELL") -> bool:
+        """Fire a paper SELL for all shares of ticker at the given price (AI-driven exit)."""
+        try:
+            with self.Session() as s:
+                account  = s.query(PaperAccount).first()
+                position = s.query(PaperPosition).filter_by(ticker=ticker).first()
+                if not position or position.qty <= 0.001:
+                    return False
+                qty      = position.qty
+                proceeds = round(qty * price, 2)
+                account.cash = round(account.cash + proceeds, 2)
+                s.add(PaperTrade(
+                    ticker     = ticker,
+                    action     = "SELL",
+                    qty        = qty,
+                    price      = price,
+                    total      = proceeds,
+                    cash_after = account.cash,
+                    signal     = "AI_SELL",
+                    notes      = reason[:500],
+                    timestamp  = datetime.now(timezone.utc),
+                ))
+                s.delete(position)
+                s.commit()
+            self._update_stagegate(ticker, "SELL")
+            logger.info(
+                f"[AI EXIT] SOLD {qty}× {ticker} @ ${price:.2f} = ${proceeds:,.2f} | {reason}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[AI EXIT] execute_sell failed for {ticker}: {e}")
+            return False
 
     def _latest_price(self, ticker: str) -> Optional[float]:
         if not self.main_Session:
