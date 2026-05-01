@@ -104,6 +104,50 @@ class SchwabMarketData:
             logger.error(f"Failed to fetch price history for {ticker}: {e}")
             return []
 
+    def get_price_history_intraday(
+        self,
+        ticker: str,
+        freq_minutes: int = 5,
+    ) -> list:
+        """
+        Fetch today's intraday OHLCV candles.
+        Returns list of dicts: {date, open, high, low, close, volume}
+        freq_minutes: 1 or 5 (default 5)
+        """
+        client = self._get_client()
+        end_dt   = datetime.now()
+        start_dt = end_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+
+        try:
+            if freq_minutes == 1:
+                resp = client.get_price_history_every_minute(
+                    symbol=ticker,
+                    start_datetime=start_dt,
+                    end_datetime=end_dt,
+                )
+            else:
+                resp = client.get_price_history_every_five_minutes(
+                    symbol=ticker,
+                    start_datetime=start_dt,
+                    end_datetime=end_dt,
+                )
+            resp.raise_for_status()
+            candles = resp.json().get("candles", [])
+            return [
+                {
+                    "date":   datetime.fromtimestamp(c["datetime"] / 1000),
+                    "open":   c.get("open"),
+                    "high":   c.get("high"),
+                    "low":    c.get("low"),
+                    "close":  c.get("close"),
+                    "volume": c.get("volume"),
+                }
+                for c in candles
+            ]
+        except Exception as e:
+            logger.error(f"Failed to fetch intraday history for {ticker}: {e}")
+            return []
+
     def get_quote(self, ticker: str) -> Optional[dict]:
         """
         Fetch real-time quote for a single ticker.
@@ -153,16 +197,35 @@ class SchwabMarketData:
             for ticker, info in data.items():
                 quote = info.get("quote", {})
                 fundamental = info.get("fundamental", {})
+                last        = quote.get("lastPrice") or quote.get("mark")
+                close_price = quote.get("closePrice") or quote.get("regularMarketLastPrice")
+                net_change  = quote.get("netChange") or quote.get("regularMarketNetChange")
+                net_pct     = quote.get("netPercentChange") or quote.get("regularMarketPercentChange")
+                high_price  = quote.get("highPrice") or quote.get("regularMarketHighPrice")
+                low_price   = quote.get("lowPrice")  or quote.get("regularMarketLowPrice")
+                open_price  = quote.get("openPrice") or quote.get("regularMarketOpenPrice")
+                volume      = quote.get("totalVolume") or quote.get("regularMarketVolume")
+                if net_pct is None and net_change is not None and close_price:
+                    try:
+                        net_pct = round(net_change / close_price * 100, 2)
+                    except Exception:
+                        pass
                 result[ticker] = {
-                    "ticker": ticker,
-                    "last_price": quote.get("lastPrice") or quote.get("mark"),
-                    "bid": quote.get("bidPrice"),
-                    "ask": quote.get("askPrice"),
-                    "volume": quote.get("totalVolume"),
-                    "market_cap": fundamental.get("marketCap"),
+                    "ticker":        ticker,
+                    "last_price":    last,
+                    "open_price":    round(float(open_price), 4)  if open_price  else None,
+                    "high_price":    round(float(high_price), 4)  if high_price  else None,
+                    "low_price":     round(float(low_price), 4)   if low_price   else None,
+                    "volume":        int(volume)                   if volume      else None,
+                    "bid":           quote.get("bidPrice"),
+                    "ask":           quote.get("askPrice"),
+                    "net_change":    round(float(net_change), 4)  if net_change  is not None else None,
+                    "net_pct_change":round(float(net_pct), 2)     if net_pct     is not None else None,
+                    "prev_close":    round(float(close_price), 2) if close_price else None,
+                    "market_cap":    fundamental.get("marketCap"),
                     "shares_outstanding": fundamental.get("sharesOutstanding"),
-                    "pe_ratio": fundamental.get("peRatio"),
-                    "timestamp": datetime.now(),
+                    "pe_ratio":      fundamental.get("peRatio"),
+                    "timestamp":     datetime.now(),
                 }
 
             logger.info(f"Fetched batch quotes for {len(result)} tickers")
@@ -255,7 +318,11 @@ class SchwabMarketData:
                 contract_type=_SchwabClient.Options.ContractType.ALL,
                 to_date=to_date,
             )
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except Exception as _http_err:
+                logger.error(f"get_options_chain({symbol}) HTTP {resp.status_code}: {resp.text[:300]}")
+                return None
             raw = resp.json()
 
             underlying_price = raw.get("underlyingPrice", 0)

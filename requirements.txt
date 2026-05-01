@@ -1,0 +1,39 @@
+# Core
+requests>=2.31.0
+aiohttp>=3.9.0
+asyncio
+
+# Database
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+
+# Data processing
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Schwab API (you already have OAuth sorted)
+schwab-py>=1.0.0
+
+# Scheduling & orchestration
+apscheduler>=3.10.0
+
+# Logging & config
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# Rate limiting
+ratelimit>=2.2.1
+
+# Morning brief
+yfinance>=0.2.0
+feedparser>=6.0.0
+google-genai>=0.8.0      # Gemini Flash (primary AI narrator)
+anthropic>=0.28.0        # Claude Haiku (fallback)
+
+# Web dashboards
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0

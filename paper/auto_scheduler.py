@@ -68,10 +68,11 @@ class PaperScheduler:
         self._fft = self._fib = self._insider = None
         self._vwap = self._vol = self._vix = None
         self._aggregator = self._fud = None
-        self._decision = self._risk = None
-        self._executor   = None
+        self._risk = None
         self._market_data = None
         self._paper_Session = None
+        self._st_analyzer   = None
+        self._paper_models  = None   # list of 3 model configs
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -79,9 +80,11 @@ class PaperScheduler:
         if self._started:
             return
         self._started = True
-        threading.Thread(target=self._cycle_loop,   daemon=True, name="paper-cycle").start()
-        threading.Thread(target=self._monitor_loop, daemon=True, name="paper-stops").start()
-        logger.info("[AUTO] Paper scheduler started — cycle every 5 min, stops every 60s (market hours)")
+        threading.Thread(target=self._cycle_loop,     daemon=True, name="paper-cycle").start()
+        threading.Thread(target=self._monitor_loop,   daemon=True, name="paper-stops").start()
+        threading.Thread(target=self._r2000_loop,     daemon=True, name="paper-r2000").start()
+        threading.Thread(target=self._tipranks_loop,  daemon=True, name="paper-tipranks").start()
+        logger.info("[AUTO] Paper scheduler started — cycle every 5 min, stops every 60s, R2000 scan 3x/day, TipRanks scan 2x/day")
 
     def pause(self):
         self._paused = True
@@ -132,14 +135,22 @@ class PaperScheduler:
     def _cycle_loop(self):
         """Fire the full AI cycle every 5 minutes on the clock boundary."""
         import time
+        _eod_snapped: set = set()   # dates already snapshotted
         while True:
             try:
+                now = datetime.now(ET)
                 if not self._paused and _is_market_hours():
-                    now = datetime.now(ET)
                     if now.minute % 5 == 0 and now.second < 15:
                         if (self._last_cycle is None or
                                 (datetime.now(timezone.utc) - self._last_cycle).total_seconds() > 250):
                             self._run_cycle()
+                # Save EOD snapshot at 16:00 ET (market close)
+                today = now.date()
+                if (now.hour == 16 and now.minute == 0 and now.second < 30
+                        and now.weekday() < 5
+                        and today not in _eod_snapped):
+                    _eod_snapped.add(today)
+                    self._save_eod_snapshots()
             except Exception as e:
                 logger.warning(f"[AUTO] Cycle loop error: {e}")
             time.sleep(10)
@@ -154,6 +165,70 @@ class PaperScheduler:
             except Exception as e:
                 logger.warning(f"[AUTO] Stop monitor loop error: {e}")
             time.sleep(60)
+
+    def _tipranks_loop(self):
+        """Poll every 30s; fire TipRanks batch scan at 09:15 and 16:05 ET."""
+        import time, json
+        from pathlib import Path as _Path
+        while True:
+            try:
+                from monitor.tipranks_scanner import should_fire_now as _tr_fire, run_scan as _tr_scan
+                slot = _tr_fire()
+                if slot and not self._paused:
+                    from config import config as _cfg
+                    from paper.executor import PAPER_MODEL_CONFIGS
+                    tickers: set = set(_cfg.watchlist)
+                    for model, cfg in PAPER_MODEL_CONFIGS.items():
+                        try:
+                            sg = json.loads(_Path(cfg["stagegate"]).read_text(encoding="utf-8"))
+                            for k in ("stage1", "stage2", "stage3"):
+                                tickers.update(sg.get(k, []))
+                        except Exception:
+                            pass
+                    r2k = _Path("data/stagegate_russell2000.json")
+                    if r2k.exists():
+                        tickers.update(json.loads(r2k.read_text(encoding="utf-8")).get("stage1", []))
+                    logger.info(f"[AUTO] Firing TipRanks scan for slot {slot} — {len(tickers)} tickers")
+                    threading.Thread(
+                        target=_tr_scan,
+                        args=(list(tickers),),
+                        daemon=True,
+                        name=f"tipranks-scan-{slot}",
+                    ).start()
+            except Exception as e:
+                logger.warning(f"[AUTO] TipRanks loop error: {e}")
+            time.sleep(30)
+
+    def _r2000_loop(self):
+        """Poll every 30s; fire R2000 scan at 08:30, 12:00, 15:00 ET."""
+        import time
+        while True:
+            try:
+                from paper.r2000_scanner import should_fire_now, run_scan
+                slot = should_fire_now()
+                if slot and not self._paused:
+                    self._ensure_engines()
+                    engines = {
+                        "fft":        self._fft,
+                        "fib":        self._fib,
+                        "vwap":       self._vwap,
+                        "vol":        self._vol,
+                        "vix":        self._vix,
+                        "aggregator": self._aggregator,
+                        "st":         self._st_analyzer,
+                        "analysis":   self._analysis_engine,
+                        "market_data":self._market_data,
+                    }
+                    logger.info(f"[AUTO] Firing R2000 scan for slot {slot}")
+                    threading.Thread(
+                        target=run_scan,
+                        args=(self._Session, engines),
+                        daemon=True,
+                        name=f"r2000-scan-{slot}",
+                    ).start()
+            except Exception as e:
+                logger.warning(f"[AUTO] R2000 loop error: {e}")
+            time.sleep(30)
 
     # ── Core jobs ──────────────────────────────────────────────────────────────
 
@@ -188,20 +263,20 @@ class PaperScheduler:
 
             from paper.runner import run_paper_cycle
             run_paper_cycle(
-                Session        = self._Session,
-                analysis_engine= self._analysis_engine,
-                fft_detector   = self._fft,
-                fib_analyzer   = self._fib,
-                insider_analyzer=self._insider,
-                vwap_calc      = self._vwap,
-                vol_analyzer   = self._vol,
-                vix_detector   = self._vix,
-                aggregator     = self._aggregator,
-                fud_engine     = self._fud,
-                decision_engine= self._decision,
-                risk_manager   = self._risk,
-                executor       = self._executor,
-                market_data    = self._market_data,
+                Session         = self._Session,
+                analysis_engine = self._analysis_engine,
+                fft_detector    = self._fft,
+                fib_analyzer    = self._fib,
+                insider_analyzer= self._insider,
+                vwap_calc       = self._vwap,
+                vol_analyzer    = self._vol,
+                vix_detector    = self._vix,
+                aggregator      = self._aggregator,
+                fud_engine      = self._fud,
+                risk_manager    = self._risk,
+                market_data     = self._market_data,
+                st_analyzer     = self._st_analyzer,
+                models          = self._paper_models,
             )
 
             self._last_cycle = datetime.now(timezone.utc)
@@ -224,6 +299,37 @@ class PaperScheduler:
         except Exception as e:
             logger.warning(f"[AUTO] Stop check failed: {e}")
 
+    def _save_eod_snapshots(self):
+        """Save end-of-day equity snapshot for all models at market close."""
+        try:
+            from paper.executor import PAPER_MODEL_CONFIGS
+            from paper.account import init_paper_db, PaperAccount, PaperPosition, PaperEquitySnapshot
+            from datetime import date
+            today = date.today()
+            for model, cfg in PAPER_MODEL_CONFIGS.items():
+                try:
+                    _, MSession = init_paper_db(cfg["db"])
+                    with MSession() as s:
+                        if s.query(PaperEquitySnapshot).filter_by(snap_date=today).first():
+                            continue
+                        acct = s.query(PaperAccount).first()
+                        positions = s.query(PaperPosition).filter(PaperPosition.qty > 0).all()
+                        cash = acct.cash if acct else 0.0
+                        pos_val = sum(p.qty * p.avg_cost for p in positions)
+                        snap = PaperEquitySnapshot(
+                            snap_date=today,
+                            total_equity=round(cash + pos_val, 2),
+                            cash=round(cash, 2),
+                            positions_value=round(pos_val, 2),
+                        )
+                        s.add(snap)
+                        s.commit()
+                        logger.info(f"[AUTO] EOD snapshot saved for {model}: equity={cash+pos_val:.2f}")
+                except Exception as e:
+                    logger.warning(f"[AUTO] EOD snapshot failed for {model}: {e}")
+        except Exception as e:
+            logger.warning(f"[AUTO] EOD snapshot job failed: {e}")
+
     # ── Engine initialization ──────────────────────────────────────────────────
 
     def _ensure_engines(self):
@@ -240,12 +346,12 @@ class PaperScheduler:
                 VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
             )
             from signals.aggregator import SignalAggregator
+            from signals.supertrend import SuperTrendAnalyzer
             from fud.filter_engine import FUDFilterEngine
-            from decision.engine import DecisionEngine
             from risk.manager import RiskManager
             from broker.market_data import SchwabMarketData
-            from paper.executor import PaperExecutor
             from paper.account import init_paper_db
+            from paper.runner import build_paper_models
 
             _, self._Session = init_db(self._db_url, echo=False)
 
@@ -257,11 +363,11 @@ class PaperScheduler:
             self._vol             = VolumeProfileAnalyzer()
             self._vix             = VIXRegimeDetector()
             self._aggregator      = SignalAggregator()
+            self._st_analyzer     = SuperTrendAnalyzer()
             self._fud             = FUDFilterEngine(db_session_factory=self._Session)
-            self._decision        = DecisionEngine(db_session_factory=self._Session)
             self._risk            = RiskManager(db_session_factory=self._Session)
             self._market_data     = SchwabMarketData()
-            self._executor        = PaperExecutor(main_db_session_factory=self._Session)
+            self._paper_models    = build_paper_models(self._Session, self._risk)
 
             _, self._paper_Session = init_paper_db()
 
@@ -272,19 +378,24 @@ class PaperScheduler:
             raise
 
     def _apply_thresh_override(self):
-        """Mirror dashboard's threshold override logic."""
+        """Apply UI threshold override to the standard model's decision engine only."""
         try:
             import json
             from pathlib import Path
             from decision.engine import DecisionEngine as DE
+            MULT = {"high": 1.0, "med": 0.85, "low": 0.70}
             f = Path("data/thresh_override.json")
             if not f.exists():
                 return
             o = json.loads(f.read_text())
-            if "min_confidence"     in o: DE.MIN_CONFIDENCE     = o["min_confidence"]
-            if "min_mos"            in o: DE.MIN_MARGIN_OF_SAFETY = o["min_mos"]
-            if "min_fud_quality"    in o: DE.MIN_FUD_QUALITY     = o["min_fud_quality"]
-            if "reynolds_bypass"    in o: DE.REYNOLDS_BYPASS     = o["reynolds_bypass"]
+            lv = o.get("level", "high")
+            m = MULT.get(lv, 1.0)
+            # Only update class-level attrs (affects standard model which has no instance overrides)
+            DE.MIN_ENSEMBLE_PROB   = round(0.45 * m, 4)
+            DE.MIN_QUANTUM_CERTAIN = round(0.45 * m, 4)
+            DE.MAX_REYNOLDS        = round(5.0  / m, 4) if m > 0 else 5.0
+            DE.MIN_RR_RATIO        = round(1.5  * m, 4)
+            DE.MAX_KALMAN_SURPRISE = round(2.5  / m, 4) if m > 0 else 2.5
         except Exception:
             pass
 

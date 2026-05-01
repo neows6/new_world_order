@@ -1,0 +1,26 @@
+# Secrets & auth
+.env
+tokens/
+data/tipranks_cookies.json
+
+# Runtime data (DBs, caches, scan results)
+data/
+logs/
+*.log
+logsmonitor_stdout.log
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Archives
+monitor/files.zip
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db

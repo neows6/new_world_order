@@ -64,12 +64,24 @@ class BriefConfig:
 
 
 @dataclass
+class TipRanksConfig:
+    email:    str = field(default_factory=lambda: os.getenv("TIPRANKS_EMAIL",    "Alonzoaceves@gmail.com"))
+    password: str = field(default_factory=lambda: os.getenv("TIPRANKS_PASSWORD", "Texas123"))
+
+
+@dataclass
 class AppConfig:
     schwab: SchwabConfig = field(default_factory=SchwabConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     edgar: EdgarConfig = field(default_factory=EdgarConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     brief: BriefConfig = field(default_factory=BriefConfig)
+    tipranks: TipRanksConfig = field(default_factory=TipRanksConfig)
+
+    # AI Watch tickers — scanned every 1 minute, breakout override active.
+    # When momentum ≥ "momentum" AND RVOL ≥ 1.5×, fundamentals score is floored
+    # at 0 so premium valuation doesn't block a confirmed breakout signal.
+    ai_watch_tickers: list = field(default_factory=lambda: ["TSLA"])
 
     # Tickers to watch — extend as needed
     watchlist: list = field(default_factory=lambda: [

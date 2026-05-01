@@ -14,6 +14,7 @@ Can run alongside main.py (uses a separate DB and port-less — no web server).
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,14 +32,18 @@ from signals.fft_cycles import FFTCycleDetector
 from signals.fibonacci import FibonacciAnalyzer
 from signals.insider_flow import InsiderFlowAnalyzer
 from signals.market_microstructure import VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
-from signals.aggregator import SignalAggregator
+from signals.aggregator import SignalAggregator, ClaudeMomentumAggregator
+from signals.supertrend import SuperTrendAnalyzer
 from fud.filter_engine import FUDFilterEngine
 from decision.engine import DecisionEngine
 from risk.manager import RiskManager
 from broker.market_data import SchwabMarketData
 
 from paper.account import init_paper_db
-from paper.executor import PaperExecutor
+from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS
+
+# Base buy threshold (must match signals/aggregator.py BUY_THRESHOLD)
+_BASE_BUY_THRESHOLD = 0.08
 
 
 def setup_logging():
@@ -54,7 +59,13 @@ def setup_logging():
     )
 
 
-def _load_price_data(Session, ticker: str) -> dict:
+def _load_price_data(Session, ticker: str, live_quotes: dict | None = None) -> dict:
+    """Load EOD price history from DB and override current_price with live quote if provided.
+
+    Args:
+        live_quotes: pre-fetched {ticker: {last_price, ...}} from get_quotes_batch — avoids
+                     per-ticker API calls inside the loop. Pass None to skip live override.
+    """
     with Session() as session:
         company = session.query(Company).filter_by(ticker=ticker).first()
         if not company:
@@ -74,42 +85,127 @@ def _load_price_data(Session, ticker: str) -> dict:
     lows    = [r.low    for r in records if r.low]
     volumes = [r.volume for r in records if r.volume]
 
+    # Inject live intraday bar into all arrays so every indicator uses live data
+    if live_quotes is not None:
+        q = live_quotes.get(ticker, {})
+        lp = q.get("last_price")
+        if lp:
+            live_price = round(float(lp), 2)
+            live_high   = q.get("high_price")  or live_price
+            live_low    = q.get("low_price")   or live_price
+            live_volume = q.get("volume")      or (volumes[-1] if volumes else 0)
+            # Replace last EOD bar with today's live intraday bar
+            if closes:  closes[-1]  = live_price
+            else:       closes.append(live_price)
+            if highs:   highs[-1]   = live_high
+            else:       highs.append(live_high)
+            if lows:    lows[-1]    = live_low
+            else:       lows.append(live_low)
+            if volumes: volumes[-1] = live_volume
+            else:       volumes.append(live_volume)
+        else:
+            live_price = None
+    else:
+        live_price = None
+
     return {
         "closes": closes, "highs": highs,
         "lows": lows, "volumes": volumes,
         "cik": cik,
-        "current_price": closes[-1] if closes else None,
+        "current_price": live_price if live_price else (closes[-1] if closes else None),
     }
 
 
-def _get_stage2_tickers() -> list:
-    """Return Stage 2 tickers from stagegate.json (AI-active stocks)."""
+def _fetch_live_quotes(tickers: list) -> dict:
+    """Single Schwab batch quote call. Returns {} on failure."""
+    try:
+        from broker.market_data import SchwabMarketData
+        return SchwabMarketData().get_quotes_batch(tickers)
+    except Exception:
+        return {}
+
+
+def _append_daily_log(model_name: str, cycle_time: str, decisions: dict, approved_tickers: set, l3_results: dict):
+    """Append one JSON line per ticker to data/daily_logs/YYYY-MM-DD.jsonl."""
+    import json as _j
+    from datetime import datetime
+    import pytz
+    ET = pytz.timezone("America/New_York")
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    log_dir = Path("data/daily_logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{today}.jsonl"
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            for ticker, dec in decisions.items():
+                l3 = l3_results.get(ticker)
+                composite = getattr(getattr(l3, "incoming_signal", None), "composite_score", None)
+                entry = {
+                    "time":            cycle_time,
+                    "model":           model_name,
+                    "ticker":          ticker,
+                    "action":          dec.action,
+                    "go_no_go":        dec.go_no_go,
+                    "traded":          ticker in approved_tickers,
+                    "composite_score": round(composite, 4) if composite is not None else None,
+                    "blocking_reason": dec.blocking_reason,
+                    "gates_passed":    dec.gates_passed,
+                    "gates_failed":    dec.gates_failed,
+                    "ensemble_prob":   round(dec.ensemble_probability_bull, 3),
+                    "rr_ratio":        round(dec.risk_reward_ratio, 2) if dec.risk_reward_ratio else None,
+                    "reynolds":        dec.reynolds_regime,
+                    "kalman_trend":    dec.kalman_trend,
+                    "narrative":       dec.decision_narrative,
+                }
+                f.write(_j.dumps(entry) + "\n")
+    except Exception as e:
+        logger.warning(f"[DAILY LOG] Failed to write: {e}")
+
+
+def _get_stage2_tickers(stagegate_file: str = "data/stagegate.json") -> list:
+    """Return Stage 2 tickers from the model's stagegate file.
+    For the russell2000 model, stage1 IS the processing universe (stage2 stays empty)."""
     import json
     from pathlib import Path
-    sg_file = Path("data/stagegate.json")
+    sg_file = Path(stagegate_file)
     if sg_file.exists():
         try:
             sg = json.loads(sg_file.read_text(encoding="utf-8"))
+            stage1 = sg.get("stage1", [])
             stage2 = sg.get("stage2", [])
+            stage3 = sg.get("stage3", [])
             if stage2:
-                logger.info(f"Stage Gate: running AI on {len(stage2)} Stage 2 tickers: {stage2}")
+                logger.info(f"Stage Gate ({stagegate_file}): running AI on {len(stage2)} Stage 2 tickers: {stage2}")
                 return stage2
+            if stage3:
+                # Stage2 empty but positions held in Stage3 — no new candidates, don't fall back
+                logger.info(f"Stage Gate ({stagegate_file}): stage2 empty, {len(stage3)} held in stage3 — skipping cycle")
+                return []
         except Exception:
             pass
-    logger.info("Stage Gate: no Stage 2 tickers — falling back to full watchlist")
+    logger.info(f"Stage Gate ({stagegate_file}): no Stage 2 tickers — falling back to full watchlist")
     return list(config.watchlist)
 
 
-def _get_ai_exit_tickers() -> list:
+def _get_ai_exit_tickers(stagegate_file: str = "data/stagegate.json") -> list:
     """Return Stage 3 tickers that have the AI exit toggle enabled."""
     import json
     from pathlib import Path
-    ai_exits_file = Path("data/ai_exits.json")
+    # Derive model-specific ai_exits file from stagegate_file path
+    sg_path = str(stagegate_file)
+    if "very_relaxed" in sg_path:
+        ai_exits_file = Path("data/ai_exits_very_relaxed.json")
+    elif "relaxed" in sg_path:
+        ai_exits_file = Path("data/ai_exits_relaxed.json")
+    elif "claude" in sg_path:
+        ai_exits_file = Path("data/ai_exits_claude.json")
+    else:
+        ai_exits_file = Path("data/ai_exits.json")
     if not ai_exits_file.exists():
         return []
     try:
         overrides = json.loads(ai_exits_file.read_text(encoding="utf-8"))
-        sg_file = Path("data/stagegate.json")
+        sg_file = Path(stagegate_file)
         if not sg_file.exists():
             return []
         sg = json.loads(sg_file.read_text(encoding="utf-8"))
@@ -117,6 +213,35 @@ def _get_ai_exit_tickers() -> list:
         return [t for t in stage3 if overrides.get(t, False)]
     except Exception:
         return []
+
+
+def _seed_model_stagegates():
+    """Seed relaxed/very_relaxed stagegate files from standard if they don't exist.
+    Only copies stage1/stage2 — stage3 starts empty (each model has its own positions)."""
+    import json
+    from pathlib import Path
+    src = Path("data/stagegate.json")
+    if not src.exists():
+        return
+    try:
+        standard = json.loads(src.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    for model, cfg in PAPER_MODEL_CONFIGS.items():
+        if model == "standard":
+            continue
+        dst = Path(cfg["stagegate"])
+        if not dst.exists():
+            try:
+                seed = {
+                    "stage1": standard.get("stage1", []),
+                    "stage2": standard.get("stage2", []),
+                    "stage3": [],  # each model tracks its own open positions
+                }
+                dst.write_text(json.dumps(seed, indent=2), encoding="utf-8")
+                logger.info(f"[PAPER] Seeded {dst} from standard stagegate (stage3 cleared)")
+            except Exception as e:
+                logger.warning(f"[PAPER] Could not seed {dst}: {e}")
 
 
 def _get_vix(market_data: SchwabMarketData) -> float:
@@ -129,39 +254,78 @@ def _get_vix(market_data: SchwabMarketData) -> float:
     return 20.0
 
 
+_TOKEN_EXPIRY_WARNED: set = set()  # tracks which expiry dates we've already alerted
+
+def _check_schwab_token_expiry():
+    """Warn via Telegram if the Schwab token will expire within 2 days."""
+    import json as _json
+    from datetime import timedelta, timezone as _tz
+    token_path = Path("tokens/schwab_token.json")
+    if not token_path.exists():
+        return
+    try:
+        data = _json.loads(token_path.read_text(encoding="utf-8"))
+        created_ts = data.get("creation_timestamp")
+        if not created_ts:
+            return
+        created = datetime.fromtimestamp(created_ts, tz=_tz.utc)
+        expires = created + timedelta(days=7)
+        now = datetime.now(_tz.utc)
+        days_left = (expires - now).total_seconds() / 86400
+        expiry_date = expires.strftime("%Y-%m-%d")
+        if days_left <= 2 and expiry_date not in _TOKEN_EXPIRY_WARNED:
+            _TOKEN_EXPIRY_WARNED.add(expiry_date)
+            from monitor.telegram_bot import send_alert
+            send_alert(
+                f"⚠️ <b>Schwab Token Expiring</b>\n"
+                f"Your Schwab refresh token expires in <b>{days_left:.1f} days</b> ({expiry_date}).\n"
+                f"Run <code>python get_token.py</code> in the NWO folder to re-authenticate."
+            )
+            logger.warning(f"[AUTH] Schwab token expires in {days_left:.1f} days — Telegram alert sent")
+    except Exception as e:
+        logger.warning(f"[AUTH] Token expiry check failed: {e}")
+
+
 def run_paper_cycle(
     Session,
     analysis_engine, fft_detector, fib_analyzer,
     insider_analyzer, vwap_calc, vol_analyzer,
     vix_detector, aggregator, fud_engine,
-    decision_engine, risk_manager,
-    executor: PaperExecutor,
+    risk_manager,
     market_data: SchwabMarketData,
+    st_analyzer: SuperTrendAnalyzer = None,
+    models: list = None,
 ):
+    """
+    Run one paper trading cycle for all configured models.
+
+    Args:
+        models: list of dicts, each with keys:
+            name           — "standard" | "relaxed" | "very_relaxed"
+            executor       — PaperExecutor instance
+            decision_engine — DecisionEngine instance
+            buy_threshold  — float (e.g. 0.10, 0.075, 0.05)
+            stagegate_file — str path to this model's stagegate JSON
+    """
     if PAUSE_FLAG.exists():
         logger.info("Paper cycle skipped — system PAUSED")
         return
 
+    _check_schwab_token_expiry()
+
+    if not models:
+        logger.warning("run_paper_cycle: no models configured — nothing to do")
+        return
+
     logger.info("─" * 60)
-    logger.info("Paper trading cycle start")
+    logger.info(f"Paper trading cycle start — {len(models)} model(s): {[m['name'] for m in models]}")
 
-    portfolio_value = None
-    try:
-        summary = executor.get_account_summary()
-        portfolio_value = summary["total_equity"]
-        logger.info(
-            f"Paper account: ${portfolio_value:,.2f} total "
-            f"(cash ${summary['cash']:,.2f} | "
-            f"P&L {summary['total_pnl_pct']:+.2f}%)"
-        )
-    except Exception as e:
-        logger.warning(f"Could not fetch paper account value: {e}")
-
+    # VIX regime is shared across all models
     vix_level  = _get_vix(market_data)
     vix_regime = vix_detector.classify(vix_level)
     logger.info(f"VIX {vix_level:.1f} → {vix_regime.regime} | {vix_regime.action}")
 
-    # Load I-Tool cache for technical signal enrichment
+    # Load I-Tool cache (shared)
     _itool_signals: dict = {}
     try:
         import json as _json
@@ -170,127 +334,280 @@ def run_paper_cycle(
             _itool_data = _json.loads(_itool_cache.read_text(encoding="utf-8"))
             for r in _itool_data.get("results", []):
                 if r.get("ticker") and r.get("signal"):
-                    _itool_signals[r["ticker"]] = r["signal"]  # "bullish" | "bearish"
+                    _itool_signals[r["ticker"]] = r["signal"]
             logger.info(f"[ITOOL] Loaded {len(_itool_signals)} technical signals from cache")
     except Exception as e:
         logger.warning(f"[ITOOL] Could not load I-Tool cache: {e}")
 
-    layer3_results = {}
+    # Load TipRanks cache (shared)
+    from monitor.tipranks_scanner import get_cached_signal as _tr_get
+    from signals.tipranks_signal import TipRanksResult as _TRResult
 
-    for ticker in _get_stage2_tickers():
-        try:
-            analysis = analysis_engine.analyze_ticker(ticker)
-            if not analysis:
-                continue
-
-            price = _load_price_data(Session, ticker)
-            closes        = price.get("closes", [])
-            highs         = price.get("highs", [])
-            lows          = price.get("lows", [])
-            volumes       = price.get("volumes", [])
-            current_price = price.get("current_price") or analysis.current_price
-            cik           = price.get("cik") or ""
-
-            fft     = fft_detector.analyze(ticker, closes)        if len(closes) >= 64  else None
-            fib     = fib_analyzer.analyze(ticker, highs, lows, closes) if len(closes) >= 30 else None
-            insider = insider_analyzer.score(ticker, cik, current_price) if cik else None
-            vwap    = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5 else None
-            vol_profile = vol_analyzer.analyze(ticker, highs, lows, closes, volumes) if len(closes) >= 10 else None
-
-            agg_signal = aggregator.aggregate(
-                analysis=analysis, fft=fft, fib=fib, insider=insider,
-                vwap=vwap, vol_profile=vol_profile,
-                vix_regime=vix_regime, current_price=current_price,
-                itool_signal=_itool_signals.get(ticker),
-            )
-
-            l3_result = fud_engine.analyze_ticker(ticker, agg_signal)
-            layer3_results[ticker] = l3_result
-
-        except Exception as e:
-            logger.error(f"Paper L2/Signals/L3 failed for {ticker}: {e}")
-
-    if not layer3_results:
-        logger.info("No tickers passed L3 — paper cycle complete.")
-        return
-
-    # Load per-ticker gate overrides from UI settings
-    _gate_overrides = {}
+    # Gate overrides loaded per-model below; keep a shared base for standard
+    import json as _json
+    _base_gate_overrides = {}
     try:
-        import json as _json
         _go_file = Path("data/gate_overrides.json")
         if _go_file.exists():
-            _gate_overrides = _json.loads(_go_file.read_text(encoding="utf-8"))
+            _base_gate_overrides = _json.loads(_go_file.read_text(encoding="utf-8"))
     except Exception:
         pass
 
-    decisions = decision_engine.run_watchlist(
-        layer3_results=layer3_results,
-        portfolio_value=portfolio_value,
-        max_trade_dollars=config.risk.max_dollar_per_trade if hasattr(config.risk, "max_dollar_per_trade") else 500.0,
-        gate_overrides=_gate_overrides,
-    )
+    # Collect union of stage2 tickers across all model stagegates
+    _all_sg_tickers = list(dict.fromkeys(
+        t for m in models for t in _get_stage2_tickers(m.get("stagegate_file", "data/stagegate.json"))
+    ))
 
-    risk_assessments = risk_manager.assess_watchlist(
-        decisions=decisions,
-        portfolio_value=portfolio_value,
-        market_returns=[],
-    )
+    _live_quotes = _fetch_live_quotes(_all_sg_tickers)
+    if _live_quotes:
+        logger.info(f"[LIVE] Fetched live prices for {len(_live_quotes)} tickers")
 
-    approved = []
-    for ticker, assessment in risk_assessments.items():
-        if assessment.approved:
-            result = executor.execute(assessment)
-            if result:
-                approved.append(ticker)
+    _live_prices = {t: round(float(q["last_price"]), 2)
+                    for t, q in _live_quotes.items() if q.get("last_price")}
 
-    logger.info(f"Paper cycle complete. {len(approved)} paper trade(s) executed" +
-                (f": {approved}" if approved else "."))
+    # ── Per-model log header ───────────────────────────────────────────────────
+    for m in models:
+        try:
+            summ = m["executor"].get_account_summary()
+            pv   = summ["total_equity"]
+            logger.info(
+                f"[{m['name'].upper()}] ${pv:,.2f} total "
+                f"(cash ${summ['cash']:,.2f} | P&L {summ['total_pnl_pct']:+.2f}%)"
+            )
+            m["portfolio_value"] = pv
+        except Exception as e:
+            logger.warning(f"[{m['name'].upper()}] Could not fetch account value: {e}")
+            m["portfolio_value"] = None
 
-    # ── AI-managed exits for Stage 3 tickers with toggle ON ───────────────────
-    ai_exit_tickers = [t for t in _get_ai_exit_tickers() if t not in layer3_results]
-    if ai_exit_tickers:
-        logger.info(f"[AI EXIT] Checking {len(ai_exit_tickers)} Stage 3 ticker(s) for exit signals")
+    # ── Signal computation + per-model pipeline ────────────────────────────────
+    # Build per-model layer3 dicts — signals computed once, aggregated per model
+    model_l3: dict = {m["name"]: {} for m in models}
+
+    # Union of tickers to analyze (may differ per model if stategates diverge)
+    for m in models:
+        sg_file  = m.get("stagegate_file", "data/stagegate.json")
+        tickers  = _get_stage2_tickers(sg_file)
+        bt       = m.get("buy_threshold", _BASE_BUY_THRESHOLD)
+
+        for ticker in tickers:
+            try:
+                analysis = analysis_engine.analyze_ticker(ticker)
+                if not analysis:
+                    continue
+
+                price         = _load_price_data(Session, ticker, live_quotes=_live_quotes)
+                closes        = price.get("closes", [])
+                highs         = price.get("highs", [])
+                lows          = price.get("lows", [])
+                volumes       = price.get("volumes", [])
+                current_price = price.get("current_price") or analysis.current_price
+                cik           = price.get("cik") or ""
+
+                fft        = fft_detector.analyze(ticker, closes)              if len(closes) >= 64  else None
+                fib        = fib_analyzer.analyze(ticker, highs, lows, closes) if len(closes) >= 30  else None
+                insider    = insider_analyzer.score(ticker, cik, current_price) if cik               else None
+                vwap       = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5  else None
+                vol_profile = vol_analyzer.analyze(ticker, highs, lows, closes, volumes)  if len(closes) >= 10 else None
+                st         = st_analyzer.analyze(ticker, highs, lows, closes, volumes)    if (st_analyzer and len(closes) >= 20) else None
+
+                _tr_raw = _tr_get(ticker)
+                _tr_result = None
+                if _tr_raw:
+                    _tr_result = _TRResult(
+                        ticker=ticker,
+                        smart_score=_tr_raw.get("smart_score"),
+                        buy_pct=_tr_raw.get("buy_pct"),
+                        hold_pct=_tr_raw.get("hold_pct"),
+                        sell_pct=_tr_raw.get("sell_pct"),
+                        price_target_mean=_tr_raw.get("price_target"),
+                        composite_score=_tr_raw.get("composite", 0.0),
+                        analyst_count=_tr_raw.get("analyst_count", 0),
+                    )
+
+                _agg = m.get("aggregator") or aggregator
+                agg = _agg.aggregate(
+                    analysis=analysis, fft=fft, fib=fib, insider=insider,
+                    vwap=vwap, vol_profile=vol_profile,
+                    vix_regime=vix_regime, current_price=current_price,
+                    itool_signal=_itool_signals.get(ticker),
+                    supertrend=st, tipranks=_tr_result,
+                    buy_threshold_override=bt,
+                )
+                l3 = fud_engine.analyze_ticker(ticker, agg)
+                model_l3[m["name"]][ticker] = l3
+
+            except Exception as e:
+                logger.error(f"[{m['name'].upper()}] L2/Signals/L3 failed for {ticker}: {e}")
+
+    # ── Decision + risk + execution per model ─────────────────────────────────
+    max_dollars = config.risk.max_dollar_per_trade if hasattr(config.risk, "max_dollar_per_trade") else 500.0
+
+    for m in models:
+        l3_results    = model_l3[m["name"]]
+        portfolio_val = m.get("portfolio_value")
+        de            = m["decision_engine"]
+        ex            = m["executor"]
+
+        if not l3_results:
+            logger.info(f"[{m['name'].upper()}] No tickers passed L3 — skipping")
+            continue
+
+        try:
+            # Load model-specific gate overrides; very_relaxed always bypasses FUD
+            _model_name = m["name"]
+            _go_fname   = "gate_overrides.json" if _model_name == "standard" else f"gate_overrides_{_model_name}.json"
+            _gate_overrides = dict(_base_gate_overrides)
+            try:
+                _go_path = Path("data") / _go_fname
+                if _go_path.exists():
+                    _gate_overrides = _json.loads(_go_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            if _model_name == "very_relaxed":
+                # "*" key applies FUD bypass to every ticker in run_watchlist
+                _gate_overrides.setdefault("*", [])
+                if "fud" not in _gate_overrides["*"]:
+                    _gate_overrides["*"].append("fud")
+
+            decisions = de.run_watchlist(
+                layer3_results=l3_results,
+                portfolio_value=portfolio_val,
+                max_trade_dollars=max_dollars,
+                gate_overrides=_gate_overrides,
+                live_prices=_live_prices,
+            )
+            risk_assessments = risk_manager.assess_watchlist(
+                decisions=decisions,
+                portfolio_value=portfolio_val,
+                market_returns=[],
+            )
+            approved = []
+            for ticker, assessment in risk_assessments.items():
+                if assessment.approved:
+                    result = ex.execute(assessment)
+                    if result:
+                        approved.append(ticker)
+            logger.info(
+                f"[{m['name'].upper()}] Cycle complete. {len(approved)} trade(s)" +
+                (f": {approved}" if approved else ".")
+            )
+            import pytz as _pytz
+            _cycle_time = datetime.now(_pytz.timezone("America/New_York")).strftime("%H:%M")
+            _append_daily_log(_model_name, _cycle_time, decisions, set(approved), l3_results)
+        except Exception as e:
+            logger.error(f"[{m['name'].upper()}] Decision/risk/execute failed: {e}")
+
+    # ── AI-managed exits (per model) ───────────────────────────────────────────
+    for m in models:
+        sg_file       = m.get("stagegate_file", "data/stagegate.json")
+        l3_results    = model_l3[m["name"]]
+        portfolio_val = m.get("portfolio_value")
+        de            = m["decision_engine"]
+        ex            = m["executor"]
+        bt            = m.get("buy_threshold", _BASE_BUY_THRESHOLD)
+
+        ai_exit_tickers = [t for t in _get_ai_exit_tickers(sg_file) if t not in l3_results]
+        if not ai_exit_tickers:
+            continue
+
+        logger.info(f"[{m['name'].upper()}][AI EXIT] Checking {len(ai_exit_tickers)} Stage 3 ticker(s)")
+        _exit_quotes = _fetch_live_quotes(ai_exit_tickers)
         for ticker in ai_exit_tickers:
             try:
                 analysis = analysis_engine.analyze_ticker(ticker)
                 if not analysis:
                     continue
-                price_data    = _load_price_data(Session, ticker)
-                closes        = price_data.get("closes", [])
-                highs         = price_data.get("highs", [])
-                lows          = price_data.get("lows", [])
-                volumes       = price_data.get("volumes", [])
-                current_price = price_data.get("current_price") or analysis.current_price
-                cik           = price_data.get("cik") or ""
+                pd2      = _load_price_data(Session, ticker, live_quotes=_exit_quotes)
+                closes   = pd2.get("closes", [])
+                highs    = pd2.get("highs", [])
+                lows     = pd2.get("lows", [])
+                volumes  = pd2.get("volumes", [])
+                cur_p    = pd2.get("current_price") or analysis.current_price
+                cik      = pd2.get("cik") or ""
 
-                fft         = fft_detector.analyze(ticker, closes)                      if len(closes) >= 64 else None
-                fib         = fib_analyzer.analyze(ticker, highs, lows, closes)         if len(closes) >= 30 else None
-                insider     = insider_analyzer.score(ticker, cik, current_price)        if cik else None
-                vwap        = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5 else None
-                vol_profile = vol_analyzer.analyze(ticker, highs, lows, closes, volumes) if len(closes) >= 10 else None
+                fft        = fft_detector.analyze(ticker, closes)              if len(closes) >= 64  else None
+                fib        = fib_analyzer.analyze(ticker, highs, lows, closes) if len(closes) >= 30  else None
+                insider    = insider_analyzer.score(ticker, cik, cur_p)        if cik               else None
+                vwap       = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5  else None
+                vol_p      = vol_analyzer.analyze(ticker, highs, lows, closes, volumes)   if len(closes) >= 10 else None
+                st         = st_analyzer.analyze(ticker, highs, lows, closes, volumes)    if (st_analyzer and len(closes) >= 20) else None
 
-                agg = aggregator.aggregate(
+                _tr_raw2 = _tr_get(ticker)
+                _tr_result2 = None
+                if _tr_raw2:
+                    _tr_result2 = _TRResult(
+                        ticker=ticker,
+                        smart_score=_tr_raw2.get("smart_score"),
+                        buy_pct=_tr_raw2.get("buy_pct"),
+                        hold_pct=_tr_raw2.get("hold_pct"),
+                        sell_pct=_tr_raw2.get("sell_pct"),
+                        price_target_mean=_tr_raw2.get("price_target"),
+                        composite_score=_tr_raw2.get("composite", 0.0),
+                        analyst_count=_tr_raw2.get("analyst_count", 0),
+                    )
+
+                _agg = m.get("aggregator") or aggregator
+                agg = _agg.aggregate(
                     analysis=analysis, fft=fft, fib=fib, insider=insider,
-                    vwap=vwap, vol_profile=vol_profile,
-                    vix_regime=vix_regime, current_price=current_price,
-                    itool_signal=_itool_signals.get(ticker),
+                    vwap=vwap, vol_profile=vol_p, vix_regime=vix_regime,
+                    current_price=cur_p, itool_signal=_itool_signals.get(ticker),
+                    supertrend=st, tipranks=_tr_result2, buy_threshold_override=bt,
                 )
                 l3 = fud_engine.analyze_ticker(ticker, agg)
-                dec_map = decision_engine.run_watchlist(
+                _elp = {ticker: round(float(_exit_quotes[ticker]["last_price"]), 2)} \
+                    if _exit_quotes.get(ticker, {}).get("last_price") else {}
+                dec_map = de.run_watchlist(
                     layer3_results={ticker: l3},
-                    portfolio_value=portfolio_value,
-                    max_trade_dollars=config.risk.max_dollar_per_trade if hasattr(config.risk, "max_dollar_per_trade") else 500.0,
+                    portfolio_value=portfolio_val,
+                    max_trade_dollars=max_dollars,
                     gate_overrides=_gate_overrides,
+                    live_prices=_elp,
                 )
                 dec = dec_map.get(ticker)
                 if dec:
-                    sig = (dec.signal or "").upper()
-                    if sig in ("SELL", "STRONG_SELL"):
-                        logger.info(f"[AI EXIT] {ticker}: {sig} signal — triggering paper SELL")
-                        executor.execute_sell(ticker, current_price or 0.0, reason=f"AI EXIT: {sig}")
+                    sig = (dec.action or "").upper()
+                    if sig == "SELL":
+                        logger.info(f"[{m['name'].upper()}][AI EXIT] {ticker}: {sig} — triggering SELL")
+                        ex.execute_sell(ticker, cur_p or 0.0, reason=f"AI EXIT: {sig}")
             except Exception as e:
-                logger.error(f"[AI EXIT] Failed for {ticker}: {e}")
+                logger.error(f"[{m['name'].upper()}][AI EXIT] Failed for {ticker}: {e}")
+
+
+def build_paper_models(Session, risk_manager) -> list:
+    """Build paper model configs (standard / relaxed / very_relaxed / claude)."""
+    _seed_model_stagegates()
+    models = []
+    for name, cfg in PAPER_MODEL_CONFIGS.items():
+        mult = cfg["multiplier"]
+        # Claude model: lower buy threshold + custom aggregator
+        if name == "claude":
+            bt  = 0.08
+            agg = ClaudeMomentumAggregator()
+        else:
+            bt  = round(_BASE_BUY_THRESHOLD * mult, 4)
+            agg = None   # use shared default aggregator
+        de   = DecisionEngine(db_session_factory=Session, threshold_multiplier=mult)
+        ex   = PaperExecutor(
+            main_db_session_factory=Session,
+            db_path=cfg["db"],
+            stagegate_file=cfg["stagegate"],
+        )
+        m = {
+            "name":            name,
+            "executor":        ex,
+            "decision_engine": de,
+            "buy_threshold":   bt,
+            "stagegate_file":  cfg["stagegate"],
+        }
+        if agg is not None:
+            m["aggregator"] = agg
+        models.append(m)
+        logger.info(
+            f"[PAPER MODEL] {name}: multiplier={mult} buy_threshold={bt} "
+            f"db={cfg['db']} sg={cfg['stagegate']}"
+            + (" [ClaudeMomentumAggregator]" if agg else "")
+        )
+    return models
 
 
 def main():
@@ -298,11 +615,9 @@ def main():
     os.makedirs("data", exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info("NWO Paper Trading Runner starting")
+    logger.info("NWO Paper Trading Runner starting — 3 models")
     logger.info(f"Watchlist: {config.watchlist}")
     logger.info("=" * 60)
-
-    init_paper_db()
 
     _, Session = init_db(config.database.url, echo=False)
 
@@ -314,11 +629,12 @@ def main():
     vol_analyzer     = VolumeProfileAnalyzer()
     vix_detector     = VIXRegimeDetector()
     aggregator       = SignalAggregator()
+    st_analyzer      = SuperTrendAnalyzer()
     fud_engine       = FUDFilterEngine(db_session_factory=Session)
-    decision_engine  = DecisionEngine(db_session_factory=Session)
     risk_manager     = RiskManager(db_session_factory=Session)
-    executor         = PaperExecutor(main_db_session_factory=Session)
     market_data      = SchwabMarketData()
+
+    paper_models = build_paper_models(Session, risk_manager)
 
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -330,12 +646,12 @@ def main():
             Session, analysis_engine,
             fft_detector, fib_analyzer, insider_analyzer,
             vwap_calc, vol_analyzer, vix_detector, aggregator,
-            fud_engine, decision_engine, risk_manager,
-            executor, market_data,
+            fud_engine, risk_manager, market_data,
+            st_analyzer, paper_models,
         ),
         trigger=CronTrigger(day_of_week="mon-fri", hour="9-16", minute="*/5"),
         id="paper_trading_cycle",
-        name="Paper trading — full 6-layer cycle",
+        name="Paper trading — all 3 models",
         replace_existing=True,
     )
 

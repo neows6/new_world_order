@@ -19,6 +19,13 @@ Base = declarative_base()
 PAPER_DB_URL     = "sqlite:///data/paper_trading.db"
 STARTING_BALANCE = 100_000.0   # $100k paper money
 
+# Model-specific DB paths
+PAPER_DB_PATHS = {
+    "standard":    "data/paper_trading.db",
+    "relaxed":     "data/paper_relaxed.db",
+    "very_relaxed": "data/paper_very_relaxed.db",
+}
+
 
 class PaperAccount(Base):
     """Single-row account — cash balance + metadata."""
@@ -91,9 +98,15 @@ def _migrate_positions(engine):
                 pass  # column already exists — ignore
 
 
-def init_paper_db():
-    """Create DB, tables, and seed account if first run. Returns (engine, Session)."""
-    engine  = create_engine(PAPER_DB_URL, connect_args={"check_same_thread": False})
+def init_paper_db(db_path: str = None):
+    """Create DB, tables, and seed account if first run. Returns (engine, Session).
+
+    Args:
+        db_path: Optional path to SQLite file (e.g. "data/paper_relaxed.db").
+                 Defaults to data/paper_trading.db.
+    """
+    url    = f"sqlite:///{db_path}" if db_path else PAPER_DB_URL
+    engine = create_engine(url, connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     _migrate_positions(engine)
     Session = sessionmaker(bind=engine)

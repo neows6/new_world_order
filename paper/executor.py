@@ -17,20 +17,44 @@ from sqlalchemy.orm import Session as SASession
 from risk.manager import RiskAssessment
 from paper.account import init_paper_db, PaperAccount, PaperPosition, PaperTrade
 
+try:
+    from monitor.telegram_bot import send_alert as _tg
+except Exception:
+    def _tg(msg): return False
+
 _STAGEGATE_FILE = "data/stagegate.json"
+
+# Model threshold multipliers (applied on top of standard thresholds)
+PAPER_MODEL_CONFIGS = {
+    "standard":     {"multiplier": 1.00, "db": "data/paper_trading.db",           "stagegate": "data/stagegate.json"},
+    "relaxed":      {"multiplier": 0.75, "db": "data/paper_relaxed.db",           "stagegate": "data/stagegate_relaxed.json"},
+    "very_relaxed": {"multiplier": 0.50, "db": "data/paper_very_relaxed.db",      "stagegate": "data/stagegate_very_relaxed.json"},
+    "claude":       {"multiplier": 0.85, "db": "data/paper_claude.db",            "stagegate": "data/stagegate_claude.json"},
+}
 
 
 class PaperExecutor:
     """Layer 6 paper-trade executor. Mirrors SchwabExecutor.execute() signature."""
 
-    def __init__(self, main_db_session_factory=None):
+    def __init__(self, main_db_session_factory=None, db_path: str = None,
+                 stagegate_file: str = None):
         """
         Args:
             main_db_session_factory: optional factory for the main DB — used to
                 look up the latest price when assessment.entry_price is None.
+            db_path: SQLite file path (defaults to data/paper_trading.db).
+            stagegate_file: JSON file path for stage gate state (defaults to data/stagegate.json).
         """
-        _, self.Session = init_paper_db()
-        self.main_Session = main_db_session_factory
+        _, self.Session = init_paper_db(db_path)
+        self.main_Session    = main_db_session_factory
+        self._stagegate_file = stagegate_file or _STAGEGATE_FILE
+
+    def _model_label(self) -> str:
+        sf = str(self._stagegate_file)
+        if "claude"       in sf: return "Claude"
+        if "very_relaxed" in sf: return "Very Relaxed"
+        if "relaxed"      in sf: return "Relaxed"
+        return "Standard"
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -58,6 +82,9 @@ class PaperExecutor:
             position = s.query(PaperPosition).filter_by(ticker=ticker).first()
 
             if action == "BUY":
+                if position and position.qty > 0:
+                    logger.info(f"[PAPER] {ticker} already held ({position.qty} shares) — skipping duplicate BUY")
+                    return None
                 if account.cash < total:
                     logger.warning(
                         f"[PAPER] Insufficient cash for {ticker}: "
@@ -128,16 +155,38 @@ class PaperExecutor:
                 f"[PAPER] {action} {qty} × {ticker} @ ${price:.2f} = ${total:,.2f} "
                 f"| cash remaining: ${account.cash:,.2f}"
             )
+            _model = self._model_label()
+            _emoji = "🟢" if action == "BUY" else "🔴"
+            _tg(
+                f"{_emoji} <b>PAPER {action}</b> [{_model}]\n"
+                f"<b>{ticker}</b>  {qty} shares @ ${price:.2f}\n"
+                f"Total: ${total:,.2f}  |  Cash left: ${account.cash:,.2f}"
+            )
             return {"ticker": ticker, "action": action, "qty": qty, "price": price, "total": total}
 
     def get_account_summary(self, price_lookup: Optional[dict] = None) -> dict:
         """
         Return a dict with cash, positions (with current prices), and P&L.
-        price_lookup: {ticker: current_price} — if None, uses latest DB close.
+        price_lookup: {ticker: current_price} — if None, batch-fetches live Schwab quotes.
         """
         with self.Session() as s:
             account   = s.query(PaperAccount).first()
             positions = s.query(PaperPosition).all()
+
+            # Batch-fetch live prices for all open positions if not provided
+            if price_lookup is None:
+                open_tickers = [p.ticker for p in positions if p.qty > 0]
+                if open_tickers:
+                    try:
+                        from broker.market_data import SchwabMarketData
+                        quotes = SchwabMarketData().get_quotes_batch(open_tickers)
+                        price_lookup = {
+                            t: round(float(q["last_price"]), 2)
+                            for t, q in quotes.items()
+                            if q.get("last_price")
+                        }
+                    except Exception:
+                        price_lookup = {}
 
             pos_list      = []
             total_mkt_val = 0.0
@@ -168,18 +217,84 @@ class PaperExecutor:
             cash          = round(account.cash, 2)
             total_equity  = round(cash + total_mkt_val, 2)
             start_bal     = round(account.starting_balance, 2)
-            total_pnl     = round(total_equity - start_bal, 2)
-            total_pnl_pct = round((total_pnl / start_bal * 100) if start_bal else 0, 2)
+            total_cost    = sum(p["cost_basis"] for p in pos_list)
+            total_pnl     = round(total_mkt_val - total_cost, 2)
+            total_pnl_pct = round((total_pnl / total_cost * 100) if total_cost else 0, 2)
+
+            # Daily P&L: current equity minus prior-day snapshot (or estimated from trade history)
+            daily_pnl = 0.0
+            daily_pnl_pct = 0.0
+            try:
+                from paper.account import PaperEquitySnapshot
+                from datetime import date as _date, datetime as _dt
+                today = _date.today()
+                snap = (
+                    s.query(PaperEquitySnapshot)
+                    .filter(PaperEquitySnapshot.snap_date < today)
+                    .order_by(PaperEquitySnapshot.snap_date.desc())
+                    .first()
+                )
+                if snap:
+                    daily_pnl = round(total_equity - snap.total_equity, 2)
+                    daily_pnl_pct = round((daily_pnl / snap.total_equity * 100) if snap.total_equity else 0, 2)
+                else:
+                    # No snapshot yet — reconstruct start-of-day equity from trade history
+                    today_start = _dt.combine(today, _dt.min.time())
+                    last_prior = (
+                        s.query(PaperTrade)
+                        .filter(
+                            PaperTrade.timestamp < today_start,
+                            PaperTrade.cash_after.isnot(None),
+                        )
+                        .order_by(PaperTrade.timestamp.desc())
+                        .first()
+                    )
+                    if last_prior:
+                        # Cash at start of today = cash_after of last trade before today
+                        start_cash = last_prior.cash_after
+                        # Today's buys added to cost basis — remove them to get prior positions value
+                        today_buy_total = sum(
+                            t.total for t in s.query(PaperTrade)
+                            .filter(
+                                PaperTrade.action == "BUY",
+                                PaperTrade.timestamp >= today_start,
+                            )
+                            .all()
+                        )
+                        start_pos_value = max(0.0, total_cost - today_buy_total)
+                        start_equity = start_cash + start_pos_value
+                        if start_equity > 0:
+                            daily_pnl = round(total_equity - start_equity, 2)
+                            daily_pnl_pct = round(daily_pnl / start_equity * 100, 2)
+                    # Save a snapshot for today so future calls use it
+                    try:
+                        if not s.query(PaperEquitySnapshot).filter_by(snap_date=today).first():
+                            s.add(PaperEquitySnapshot(
+                                snap_date=today,
+                                total_equity=total_equity,
+                                cash=cash,
+                                positions_value=total_mkt_val,
+                            ))
+                            s.commit()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             return {
-                "cash":           cash,
-                "positions_value": round(total_mkt_val, 2),
-                "total_equity":   total_equity,
+                "cash":             cash,
+                "positions_value":  round(total_mkt_val, 2),
+                "total_invested":   round(total_cost, 2),
+                "total_equity":     total_equity,
                 "starting_balance": start_bal,
-                "total_pnl":      total_pnl,
-                "total_pnl_pct":  total_pnl_pct,
-                "positions":      pos_list,
-                "created_at":     account.created_at.isoformat() if account.created_at else None,
+                "total_pnl":        total_pnl,
+                "total_pnl_pct":    total_pnl_pct,
+                "lifetime_pnl":     round(total_equity - start_bal, 2),
+                "lifetime_pnl_pct": round((total_equity - start_bal) / start_bal * 100 if start_bal else 0, 2),
+                "daily_pnl":        daily_pnl,
+                "daily_pnl_pct":    daily_pnl_pct,
+                "positions":        pos_list,
+                "created_at":       account.created_at.isoformat() if account.created_at else None,
             }
 
     def get_recent_trades(self, limit: int = 50) -> list:
@@ -198,6 +313,7 @@ class PaperExecutor:
                     "price":     t.price,
                     "total":     t.total,
                     "cash_after": t.cash_after,
+                    "signal":    t.signal,
                     "timestamp": t.timestamp.isoformat() if t.timestamp else None,
                 }
                 for t in trades
@@ -217,12 +333,13 @@ class PaperExecutor:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _update_stagegate(self, ticker: str, action: str):
-        """Sync stagegate.json after a trade: BUY → stage3, SELL → stage2."""
+        """Sync stagegate file after a trade: BUY → stage3, SELL → stage2."""
         import json, os
         try:
-            if not os.path.exists(_STAGEGATE_FILE):
+            sg_file = self._stagegate_file
+            if not os.path.exists(sg_file):
                 return
-            with open(_STAGEGATE_FILE, encoding="utf-8") as f:
+            with open(sg_file, encoding="utf-8") as f:
                 sg = json.load(f)
             for k in ("stage1", "stage2", "stage3"):
                 sg.setdefault(k, [])
@@ -243,8 +360,28 @@ class PaperExecutor:
                 # Return to stage2 (still AI-watched) if not already placed
                 if ticker not in sg["stage1"] and ticker not in sg["stage2"]:
                     sg["stage2"].append(ticker)
-            with open(_STAGEGATE_FILE, "w", encoding="utf-8") as f:
+            with open(sg_file, "w", encoding="utf-8") as f:
                 json.dump(sg, f, indent=2)
+
+            # Auto-enable AI exit toggle on AI BUY so the AI monitors for exits
+            if action == "BUY":
+                sg_path = str(sg_file)
+                if "very_relaxed" in sg_path:
+                    ai_exits_path = "data/ai_exits_very_relaxed.json"
+                elif "relaxed" in sg_path:
+                    ai_exits_path = "data/ai_exits_relaxed.json"
+                elif "claude" in sg_path:
+                    ai_exits_path = "data/ai_exits_claude.json"
+                else:
+                    ai_exits_path = "data/ai_exits.json"
+                try:
+                    exits = json.loads(open(ai_exits_path, encoding="utf-8").read()) if os.path.exists(ai_exits_path) else {}
+                    exits[ticker] = True
+                    with open(ai_exits_path, "w", encoding="utf-8") as f:
+                        json.dump(exits, f, indent=2)
+                except Exception as e2:
+                    logger.warning(f"[PAPER] ai_exits auto-enable failed for {ticker}: {e2}")
+
         except Exception as e:
             logger.warning(f"[PAPER] stagegate sync failed: {e}")
 
@@ -276,12 +413,28 @@ class PaperExecutor:
             logger.info(
                 f"[AI EXIT] SOLD {qty}× {ticker} @ ${price:.2f} = ${proceeds:,.2f} | {reason}"
             )
+            _model = self._model_label()
+            _tg(
+                f"🔴 <b>PAPER SELL (AI Exit)</b> [{_model}]\n"
+                f"<b>{ticker}</b>  {qty:.2f} shares @ ${price:.2f}\n"
+                f"Proceeds: ${proceeds:,.2f}  |  Reason: {reason}"
+            )
             return True
         except Exception as e:
             logger.error(f"[AI EXIT] execute_sell failed for {ticker}: {e}")
             return False
 
     def _latest_price(self, ticker: str) -> Optional[float]:
+        # Try live Schwab quote first
+        try:
+            from broker.market_data import SchwabMarketData
+            q = SchwabMarketData().get_quotes_batch([ticker]).get(ticker, {})
+            lp = q.get("last_price")
+            if lp:
+                return round(float(lp), 2)
+        except Exception:
+            pass
+        # EOD fallback
         if not self.main_Session:
             return None
         try:

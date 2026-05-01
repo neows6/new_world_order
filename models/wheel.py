@@ -14,9 +14,8 @@ To wire into dashboard.py:
 
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
-import json, os, time, threading
+import json, time, threading
 from datetime import date, timedelta
-from loguru import logger
 from typing import Optional
 
 # ── lazy import so module loads even if broker isn't on path yet ──────────
@@ -33,9 +32,9 @@ wheel_router = APIRouter()
 # Replace or expand as desired — full 500 list can be loaded from a CSV
 # ─────────────────────────────────────────────────────────────────────────────
 SP500_UNIVERSE = [
-    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","BAC",
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","BRK.B","JPM","V",
     "UNH","XOM","LLY","JNJ","MA","PG","HD","MRK","AVGO","CVX",
-    "ABBV","COST","PEP","KO","WMT","ORCL","CRM","TMO","ACN","MCD",
+    "ABBV","COST","PEP","KO","WMT","BAC","CRM","TMO","ACN","MCD",
     "ABT","CSCO","NKE","DHR","ADBE","TXN","NEE","PM","LIN","RTX",
     "BMY","AMGN","QCOM","HON","UPS","IBM","GE","CAT","SBUX","GS",
     "MS","BLK","SPGI","AXP","ISRG","PLD","DE","AMD","NOW","INTC",
@@ -55,113 +54,24 @@ _scan_running   = False
 _scan_ts        = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PERSISTENCE
-# ─────────────────────────────────────────────────────────────────────────────
-_POSITIONS_FILE = "data/wheel_positions.json"
-_SCAN_FILE      = "data/wheel_scan.json"
-
-
-def _save_positions():
-    os.makedirs("data", exist_ok=True)
-    try:
-        with open(_POSITIONS_FILE, "w") as f:
-            json.dump({"active": _wheel_positions, "completed": _completed_cycles}, f)
-    except Exception as e:
-        logger.warning(f"[wheel] save_positions error: {e}")
-
-
-def _save_scan():
-    os.makedirs("data", exist_ok=True)
-    try:
-        with open(_SCAN_FILE, "w") as f:
-            json.dump({"results": _scan_results, "scannedAt": _scan_ts}, f)
-    except Exception as e:
-        logger.warning(f"[wheel] save_scan error: {e}")
-
-
-def _load_state():
-    global _wheel_positions, _completed_cycles, _scan_results, _scan_ts
-    try:
-        if os.path.exists(_POSITIONS_FILE):
-            with open(_POSITIONS_FILE) as f:
-                d = json.load(f)
-                _wheel_positions  = d.get("active", [])
-                _completed_cycles = d.get("completed", [])
-            logger.info(f"[wheel] loaded {len(_wheel_positions)} active, {len(_completed_cycles)} completed positions")
-    except Exception as e:
-        logger.warning(f"[wheel] load_positions error: {e}")
-    try:
-        if os.path.exists(_SCAN_FILE):
-            with open(_SCAN_FILE) as f:
-                d = json.load(f)
-                _scan_results = d.get("results", [])
-                _scan_ts      = d.get("scannedAt")
-            logger.info(f"[wheel] loaded {len(_scan_results)} scan results from {_scan_ts}")
-    except Exception as e:
-        logger.warning(f"[wheel] load_scan error: {e}")
-
-
-_load_state()
-
-# ─────────────────────────────────────────────────────────────────────────────
 # SCREENING LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _compute_iv_rank_from_chain(chain: dict) -> Optional[float]:
-    """
-    Approximate IV rank (0-100) using only near-ATM puts (within 5% of underlying).
-    Using all strikes breaks the formula because deep-OTM puts have 200-2000% IV,
-    making the ATM vol look like 0th percentile on every ticker.
-    Falls back to absolute IV threshold when insufficient near-ATM data.
-    """
-    current_iv = chain.get("volatility", 0)
-    if not current_iv:
-        return None
-
-    underlying = chain.get("underlyingPrice", 0)
-    if underlying <= 0:
-        # Fallback: treat any IV > 20% as "elevated" (rank = 50+)
-        return 50.0 if current_iv >= 20 else 20.0
-
-    # Use only near-ATM puts (within 5% of spot) to avoid OTM skew distortion
-    atm_band = underlying * 0.05
-    near_atm_ivs = [
-        p["iv"] for p in chain.get("puts", [])
-        if p["iv"] > 0 and abs(p["strike"] - underlying) <= atm_band
-    ]
-
-    if len(near_atm_ivs) < 3:
-        # Not enough near-ATM data — use absolute IV level as proxy
-        # AAPL/MSFT "normal" IV ~18-22%, elevated >28%, high >40%
-        if current_iv >= 40:   return 80.0
-        if current_iv >= 30:   return 60.0
-        if current_iv >= 20:   return 40.0
-        return 20.0
-
-    iv_min, iv_max = min(near_atm_ivs), max(near_atm_ivs)
-    if iv_max <= iv_min:
-        # Flat curve — rank by absolute level
-        if current_iv >= 35:   return 70.0
-        if current_iv >= 25:   return 50.0
-        return 30.0
-
-    rank = round((current_iv - iv_min) / (iv_max - iv_min) * 100, 1)
-    return max(0.0, min(100.0, rank))
-
 
 def _screen_candidate(symbol: str) -> Optional[dict]:
     """
     Returns candidate dict if symbol passes wheel criteria, else None.
     Criteria:
-      - IV elevated: chain vol >= 20% OR computed IV rank >= 30
-        (avoid selling premium into low-vol, low-premium environments)
-      - Has liquid puts near 30 delta, 25-50 DTE, bid >= $0.05
-      - Bid/ask spread on target put < 15% of mid (liquidity gate)
-    Single chain fetch per symbol (45 DTE window).
+      - IV Rank > 50%
+      - Has liquid puts near 30 delta, 30-45 DTE
+      - Bid/ask spread on target put < 5% of mid (liquidity gate)
     """
     if _md is None:
         return None
     try:
+        iv_rank = _md.get_iv_rank(symbol)
+        if iv_rank is None or iv_rank < 50:
+            return None
+
         chain = _md.get_options_chain(symbol, days_to_expiry=45)
         if not chain:
             return None
@@ -170,20 +80,13 @@ def _screen_candidate(symbol: str) -> Optional[dict]:
         if underlying <= 0:
             return None
 
-        # chain["volatility"] returns VIX (market-wide), not per-ticker IV.
-        # Use it only as a market regime gate — if VIX < 15, skip (not worth selling premium).
-        vix_proxy = chain.get("volatility", 0) or 0
-        if vix_proxy > 0 and vix_proxy < 15:
-            return None
-
-        # Find best put: 25-50 DTE, delta closest to -0.30
-        # Require minimum bid of $0.05 to filter out penny/no-liquidity options
+        # Find best put: 30-45 DTE, delta closest to -0.30
         candidates = [
             p for p in chain["puts"]
             if 25 <= p["dte"] <= 50
-            and p["bid"] >= 0.05
+            and p["bid"] > 0
             and p["ask"] > 0
-            and 0.05 <= abs(p["delta"]) <= 0.50   # 5-50 delta range: avoids 0-delta junk
+            and abs(p["delta"]) <= 0.40   # allow up to 40 delta
         ]
         if not candidates:
             return None
@@ -192,29 +95,19 @@ def _screen_candidate(symbol: str) -> Optional[dict]:
         target = sorted(candidates, key=lambda p: abs(abs(p["delta"]) - 0.30))
         best = target[0]
 
-        # Use the option leg's own IV — this is the real per-ticker implied vol
-        option_iv = best["iv"]
-
-        # IV gate: don't sell premium when IV is too low (< 20%)
-        if option_iv < 20:
-            return None
-
-        # Liquidity gate: spread < 15% of mid
+        # Liquidity gate: spread < 5% of mid
         spread_pct = (best["ask"] - best["bid"]) / best["mid"] if best["mid"] > 0 else 99
-        if spread_pct > 0.15:
+        if spread_pct > 0.05:
             return None
 
         # Annualised premium yield estimate
         premium_yield = round((best["mid"] / underlying) * (365 / best["dte"]) * 100, 1)
 
-        iv_label = "HIGH" if option_iv >= 50 else ("ELEV" if option_iv >= 30 else "NORM")
-
         return {
             "symbol":        symbol,
             "price":         underlying,
-            "ivRank":        round(option_iv, 1),   # displayed as "IV%" in table
-            "ivLabel":       iv_label,
-            "iv":            round(option_iv, 1),
+            "ivRank":        iv_rank,
+            "iv":            chain["volatility"],
             "strike":        best["strike"],
             "expiry":        best["expiry"],
             "dte":           best["dte"],
@@ -228,7 +121,7 @@ def _screen_candidate(symbol: str) -> Optional[dict]:
             "scannedAt":     time.strftime("%H:%M:%S"),
         }
     except Exception as e:
-        logger.warning(f"[wheel] screen_candidate({symbol}) error: {e}")
+        print(f"[wheel] screen_candidate({symbol}) error: {e}")
         return None
 
 
@@ -244,8 +137,7 @@ def _run_scan():
     # Sort by IV rank descending
     _scan_results = sorted(results, key=lambda x: x["ivRank"], reverse=True)
     _scan_running = False
-    _scan_ts = time.strftime("%m/%d %H:%M")
-    _save_scan()
+    _scan_ts = time.strftime("%H:%M:%S")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,7 +162,6 @@ def _open_position(data: dict):
         "pnl":          None,
     }
     _wheel_positions.append(pos)
-    _save_positions()
     return pos
 
 
@@ -280,7 +171,6 @@ def _assign_position(pos_id: int):
             p["phase"]    = "SHARES"
             p["costBasis"] = round(p["strike"] - p["premium"] / 100 / p["contracts"], 2)
             p["notes"]    = f"Assigned at {p['strike']}. Net cost basis: {p['costBasis']}"
-            _save_positions()
             return p
     return None
 
@@ -295,7 +185,6 @@ def _sell_covered_call(pos_id: int, data: dict):
             call_premium = round(data["mid"] * 100 * p["contracts"], 2)
             p["premium"] += call_premium
             p["notes"]   = f"CC sold at {data['strike']} exp {data['expiry']}. Total premium: {p['premium']}"
-            _save_positions()
             return p
     return None
 
@@ -311,7 +200,6 @@ def _close_position(pos_id: int, called_away: bool = True):
                 p["pnl"] = round(p["premium"], 2)
             _completed_cycles.append(p)
             _wheel_positions.pop(i)
-            _save_positions()
             return p
     return None
 
@@ -456,42 +344,17 @@ WHEEL_HTML = '''<!DOCTYPE html>
 
   /* ── Empty state ── */
   .empty { padding: 32px; text-align: center; color: #8b949e; font-size: 12px; }
-  /* ── Shared nav buttons ── */
-  .brief-btn { display: flex; flex-direction: column; gap: 2px; padding: 6px 14px;
-               border-radius: 6px; border: 1px solid #30363d; background: #161b22;
-               text-decoration: none; color: #e6edf3; transition: background 0.15s; }
-  .brief-btn:hover { background: #1c2e50; }
-  .brief-btn-title { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
-  .brief-btn-preview { font-size: 10px; color: #8b949e; white-space: nowrap; }
-  /* ── Shared ticker tape ── */
-  .sh-tape-wrap  { overflow: hidden; background: #0a0f17; border-bottom: 1px solid #1f6feb; height: 26px; }
-  .sh-tape-track { display: flex; gap: 24px; white-space: nowrap; will-change: transform;
-                   animation: sh-tape 80s linear infinite; align-items: center; height: 100%; padding-left: 12px; }
-  .sh-tape-track:hover { animation-play-state: paused; }
-  @keyframes sh-tape { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
-  .sht-bull    { color: #3fb950; font-size: 12px; font-weight: 700; }
-  .sht-bear    { color: #f85149; font-size: 12px; font-weight: 700; }
-  .sht-chg-up  { color: #58a6ff; font-size: 12px; }
-  .sht-chg-dn  { color: #d29922; font-size: 12px; }
-  .sht-neu     { color: #8b949e; font-size: 12px; }
-  .sht-sep     { color: #30363d; font-size: 10px; }
 </style>
 </head>
 <body>
 <header>
-  <a href="/" class="brief-btn" style="flex-direction:row;align-items:center;gap:4px;padding:5px 10px">&#8592; NWO</a>
-  <a href="/morning-brief" class="brief-btn"><span class="brief-btn-title">&#128202; Morning Brief</span><span class="brief-btn-preview">Markets &middot; Futures &middot; Crypto</span></a>
-  <a href="/i-tool"        class="brief-btn"><span class="brief-btn-title">&#128225; I-Tool</span><span class="brief-btn-preview">S&amp;P 500 Scanner</span></a>
-  <a href="/paper"         class="brief-btn"><span class="brief-btn-title">&#127918; Paper Trade</span><span class="brief-btn-preview">$100k Account</span></a>
-  <a href="/wheel"         class="brief-btn" style="border-color:#58a6ff;background:rgba(88,166,255,0.1)"><span class="brief-btn-title">&#127905; Wheel</span><span class="brief-btn-preview" style="color:#58a6ff">Active page</span></a>
-  <a href="/signals"       class="brief-btn"><span class="brief-btn-title">&#128200; Signal Monitor</span><span class="brief-btn-preview">Composite &middot; RVOL</span></a>
-  <h1 style="margin-left:8px">&#127905; WHEEL <span style="font-size:11px;padding:2px 8px;border-radius:4px;background:#3d2b00;color:#d29922;font-weight:600;letter-spacing:1px;vertical-align:middle;margin-left:6px">PAPER / DRY RUN</span></h1>
+  <a href="/" class="back-btn">← Back</a>
+  <h1>🎡 WHEEL STRATEGY</h1>
   <div class="header-right">
     <span id="scan-status"></span>
-    <button class="scan-btn" id="scan-btn" onclick="startScan()">&#128269; Scan S&amp;P 500</button>
+    <button class="scan-btn" id="scan-btn" onclick="startScan()">🔍 Scan S&amp;P 500</button>
   </div>
 </header>
-<div class="sh-tape-wrap"><div class="sh-tape-track" id="sh-tape"><span class="sht-neu">Loading signals&#8230;</span></div></div>
 
 <main>
   <!-- Summary Cards -->
@@ -515,6 +378,29 @@ WHEEL_HTML = '''<!DOCTYPE html>
     <div class="card">
       <div class="card-label">Candidates Found</div>
       <div class="card-value" id="card-candidates">—</div>
+    </div>
+  </div>
+
+  <!-- Candidate Scanner Results -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">📡 Screened Candidates  <span class="muted" style="font-size:10px;">(IV Rank &gt;50% · 30Δ CSP · 30-45 DTE)</span></span>
+      <span class="panel-badge" id="scan-badge">Not scanned</span>
+    </div>
+    <div class="tbl-wrap">
+      <table id="candidates-table">
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Price</th><th>IV Rank</th><th>IV %</th>
+            <th>Strike</th><th>Expiry</th><th>DTE</th><th>Delta</th>
+            <th>Bid</th><th>Ask</th><th>Mid</th><th>Spread</th>
+            <th>Ann.Yield</th><th>OI</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="candidates-body">
+          <tr><td colspan="15" class="empty">Run a scan to find wheel candidates</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
@@ -556,29 +442,6 @@ WHEEL_HTML = '''<!DOCTYPE html>
         </thead>
         <tbody id="cycles-body">
           <tr><td colspan="7" class="empty">No completed cycles yet</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Candidate Scanner Results -->
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">📡 Screened Candidates  <span class="muted" style="font-size:10px;">(IV≥20% · 30Δ CSP · 25-50 DTE · spread≤15%)</span></span>
-      <span class="panel-badge" id="scan-badge">Not scanned</span>
-    </div>
-    <div class="tbl-wrap">
-      <table id="candidates-table">
-        <thead>
-          <tr>
-            <th>Ticker</th><th>Price</th><th title="Current implied vol % — HIGH≥40 ELEV≥25 NORM&lt;25">IV %</th><th title="IV level indicator">Level</th>
-            <th>Strike</th><th>Expiry</th><th>DTE</th><th>Delta</th>
-            <th>Bid</th><th>Ask</th><th>Mid</th><th>Spread</th>
-            <th>Ann.Yield</th><th>OI</th><th>Action</th>
-          </tr>
-        </thead>
-        <tbody id="candidates-body">
-          <tr><td colspan="15" class="empty">Run a scan to find wheel candidates</td></tr>
         </tbody>
       </table>
     </div>
@@ -631,8 +494,8 @@ function renderCandidates(rows){
     <tr>
       <td class="sym">${c.symbol}</td>
       <td>${fmt$(c.price)}</td>
-      <td class="${c.iv>=40?'orange':c.iv>=25?'green':'muted'}">${fmtPct(c.iv)}</td>
-      <td><span style="font-size:10px;padding:1px 5px;border-radius:3px;background:${c.ivLabel==='HIGH'?'#4a2800':c.ivLabel==='ELEV'?'#1a3a22':'#21262d'};color:${c.ivLabel==='HIGH'?'#ff9800':c.ivLabel==='ELEV'?'#3fb950':'#8b949e'}">${c.ivLabel||'NORM'}</span></td>
+      <td class="${c.ivRank>=70?'orange':c.ivRank>=50?'green':''}">${fmtPct(c.ivRank)}</td>
+      <td>${fmtPct(c.iv)}</td>
       <td class="blue">${fmt$(c.strike)}</td>
       <td>${c.expiry}</td>
       <td>${c.dte}</td>
@@ -754,58 +617,7 @@ async function closePos(id, calledAway){
   loadPositions();
 }
 
-// ── Restore scan results on page load ────────────────────────────────────────
-async function loadScanResults(){
-  const r = await fetch('/api/wheel/scan-results');
-  const d = await r.json();
-  if(d.results && d.results.length){
-    renderCandidates(d.results);
-    document.getElementById('card-candidates').textContent = d.results.length;
-    document.getElementById('scan-badge').textContent = d.results.length + ' candidates';
-  }
-  if(d.scannedAt){
-    document.getElementById('scan-status').textContent = 'Last scan: ' + d.scannedAt;
-  }
-  if(d.running){
-    document.getElementById('scan-btn').disabled = true;
-    document.getElementById('scan-status').innerHTML = '<span class="spinner">⟳</span> Scan in progress…';
-    scanPollTimer = setInterval(pollScan, 3000);
-  }
-}
-
 // ── Init ──────────────────────────────────────────────────────────────────────
 loadPositions();
-loadScanResults();
 setInterval(loadPositions, 30000);
-
-// ── Shared ticker tape ────────────────────────────────────────────────────────
-(async function() {
-  const track = document.getElementById('sh-tape');
-  if (!track) return;
-  try {
-    const sigs = await fetch('/api/signals').then(r => r.json());
-    const byT = new Map();
-    (sigs || []).forEach(s => { if (!byT.has(s.ticker)) byT.set(s.ticker, s); });
-    const items = [...byT.values()];
-    if (!items.length) { track.innerHTML = '<span class="sht-neu">No signals</span>'; return; }
-    const all = [...items, ...items];
-    track.innerHTML = all.map(s => {
-      const sig  = (s.signal || '').toUpperCase();
-      const bull = sig === 'BUY' || sig === 'STRONG_BUY';
-      const bear = sig === 'SELL' || sig === 'STRONG_SELL';
-      const chg  = s.change_pct;
-      const up   = chg != null ? chg > 0 : null;
-      let cls, arr;
-      if (bull)             { cls = 'sht-bull';    arr = '&#9650;'; }
-      else if (bear)        { cls = 'sht-bear';    arr = '&#9660;'; }
-      else if (up === true) { cls = 'sht-chg-up';  arr = '&#9650;'; }
-      else if (up === false){ cls = 'sht-chg-dn';  arr = '&#9660;'; }
-      else                  { cls = 'sht-neu';     arr = '&#8212;'; }
-      const p = s.current_price;
-      return '<span class="' + cls + '">' + arr + ' ' + s.ticker + (p ? ' $' + Number(p).toFixed(2) : '') + '</span>'
-           + '<span class="sht-sep">|</span>';
-    }).join('');
-    track.style.animationDuration = Math.max(40, items.length * 0.8) + 's';
-  } catch(e) {}
-})();
 '''

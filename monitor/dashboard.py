@@ -16,8 +16,9 @@ Endpoints:
 import os
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+import pytz
 
 # Resolve project root so this works whether called directly or via -m
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,10 +36,90 @@ app = FastAPI(title="NWO Monitor", docs_url=None, redoc_url=None)
 from monitor.wheel import wheel_router
 app.include_router(wheel_router)
 
+# ── Mount signals dashboard under /signals ────────────────────────────────────
+from monitor.signals_dashboard import app as _signals_app, _latest_signals as _get_live_signals
+app.mount("/signals", _signals_app)
+
 PAUSE_FLAG = ROOT / "data" / "paused.flag"
 LOG_FILE   = ROOT / config.log_file
 
 _, Session = init_db(config.database.url, echo=False)
+
+_ET = pytz.timezone("America/New_York")
+
+def _to_et_str(dt, fmt="%Y-%m-%d %H:%M:%S ET"):
+    """Convert a UTC datetime (naive or aware) to an ET-formatted string."""
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_ET).strftime(fmt)
+
+
+# ── Live price cache — Schwab quotes, refreshed every 5 min always ────────────
+import time as _time
+
+_live_price_cache: dict = {}   # ticker -> {price, change_pct, prev_close, ts}
+_live_cache_lock  = threading.Lock()
+_live_cache_ts: float = 0.0
+_LIVE_TTL = 300  # 5 minutes
+
+def _refresh_live_prices(force: bool = False) -> None:
+    """Fetch Schwab quotes for all stage gate + watchlist tickers. No market-hours gate —
+    Schwab returns lastPrice/mark 24/7 (after-hours, pre-market, extended hours)."""
+    global _live_cache_ts
+    if not force and (_time.time() - _live_cache_ts) < _LIVE_TTL:
+        return
+    try:
+        # Use a fresh SchwabMarketData — avoids waiting for scheduler init
+        from broker.market_data import SchwabMarketData as _SMD
+        md = _SMD()
+        import json as _json
+        _sgf = ROOT / "data" / "stagegate.json"
+        sg = _json.loads(_sgf.read_text()) if _sgf.exists() else {}
+        tickers = list({
+            t for stage in sg.values() for t in stage
+        } | set(config.watchlist))
+        if not tickers:
+            return
+        quotes = md.get_quotes_batch(tickers)
+        if not quotes:
+            return
+        with _live_cache_lock:
+            for ticker, q in quotes.items():
+                lp = q.get("last_price")
+                if lp:
+                    _live_price_cache[ticker] = {
+                        "price":      round(float(lp), 2),
+                        "change_pct": q.get("net_pct_change"),
+                        "net_change": q.get("net_change"),
+                        "prev_close": q.get("prev_close"),
+                        "ts":         _time.time(),
+                    }
+        _live_cache_ts = _time.time()
+    except Exception:
+        pass
+
+def _live_price(ticker: str) -> dict | None:
+    """Return live price dict for ticker. Triggers refresh if cache is stale."""
+    _refresh_live_prices()
+    with _live_cache_lock:
+        return _live_price_cache.get(ticker)
+
+def _start_live_price_refresher() -> None:
+    """Background thread: refresh every 5 min, always."""
+    def _loop():
+        _time.sleep(10)  # brief delay so server startup completes first
+        while True:
+            try:
+                _refresh_live_prices()
+            except Exception:
+                pass
+            _time.sleep(60)
+    t = threading.Thread(target=_loop, daemon=True, name="live-price-refresher")
+    t.start()
+
+_start_live_price_refresher()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -47,8 +128,18 @@ def _is_paused() -> bool:
     return PAUSE_FLAG.exists()
 
 
-def _price_change(session, company_id: int) -> dict:
-    """Return latest price and day-over-day % change from price_history."""
+def _price_change(session, company_id: int, ticker: str = "") -> dict:
+    """Return latest price and day-over-day % change.
+    Prefers live Schwab intraday quote; falls back to EOD PriceHistory."""
+    if ticker:
+        live = _live_price(ticker)
+        if live:
+            return {
+                "price":      live["price"],
+                "change_pct": live.get("change_pct"),
+                "prev_close": live.get("prev_close"),
+                "live":       True,
+            }
     candles = (
         session.query(PriceHistory)
         .filter_by(company_id=company_id)
@@ -80,22 +171,260 @@ def _recent_signals(limit: int = 50) -> list:
         )
         result = []
         for s, company in rows:
-            pc = _price_change(session, company.id)
+            pc = _price_change(session, company.id, ticker=company.ticker)
+            # Parse reasoning JSON to surface new signal fields for the dashboard
+            rsn = {}
+            try:
+                import json as _json
+                rsn = _json.loads(s.reasoning or "{}")
+            except Exception:
+                pass
+
+            # Resolve price at signal generation time + source label for UI:
+            #   "exact"  — stored in TradeSignal.current_price at generation time (live intraday)
+            #   "eod"    — best available: EOD close for the signal date (daily candle, not intraday)
+            #   None     — today's signal with no EOD yet → JS uses live_price with "now" badge
+            from datetime import timedelta as _td, datetime as _dt
+            hist_price   = None
+            price_source = None
+
+            if s.generated_at:
+                try:
+                    et_dt    = s.generated_at - _td(hours=4)
+                    et_date  = et_dt.date()
+                    today_et = (_dt.utcnow() - _td(hours=4)).date()
+
+                    if et_date < today_et:
+                        # Past-date signal: always use EOD close for that trading day
+                        ph = (
+                            session.query(PriceHistory)
+                            .filter(
+                                PriceHistory.company_id == company.id,
+                                PriceHistory.date <= et_date,
+                            )
+                            .order_by(PriceHistory.date.desc())
+                            .first()
+                        )
+                        if ph:
+                            hist_price   = float(ph.adjusted_close or ph.close or 0) or None
+                            price_source = "eod"
+                        else:
+                            hist_price   = s.current_price
+                            price_source = "stored" if hist_price else None
+                    else:
+                        # Today's signal — no EOD yet; JS will show live_price with "now" badge
+                        # Use stored live price if available (set by live_price param in decision engine)
+                        if s.current_price:
+                            hist_price   = s.current_price
+                            price_source = "exact"
+                except Exception:
+                    pass
+
             result.append({
                 "ticker":          company.ticker,
                 "signal":          s.signal,
                 "confidence":      round(s.confidence or 0, 3),
                 "margin_of_safety": round(s.margin_of_safety or 0, 3),
                 "fud_score":       round(s.fud_score or 0, 3),
-                "current_price":   pc["price"] or s.current_price,
+                "current_price":   hist_price,                # best historical price for this signal row
+                "price_source":    price_source,              # "exact" | "eod" | None
+                "live_price":      pc["price"],               # current live price for tape/card/buy modal
                 "change_pct":      pc["change_pct"],
                 "prev_close":      pc["prev_close"],
                 "intrinsic_value": s.intrinsic_value_estimate,
-                "generated_at":    s.generated_at.strftime("%Y-%m-%d %H:%M:%S") if s.generated_at else "",
+                "generated_at":    _to_et_str(s.generated_at, "%Y-%m-%d %H:%M:%S ET") if s.generated_at else "",
                 "acted_on":        s.acted_on,
                 "reasoning":       s.reasoning or "{}",
+                # New signal fields (populated by updated decision/engine.py)
+                "composite_score":      rsn.get("composite_score", 0.0),
+                "momentum_score":       rsn.get("momentum_score", 0.0),
+                "rvol":                 rsn.get("rvol", 1.0),
+                "is_52w_breakout":      rsn.get("is_52w_breakout", False),
+                "macd_direction":       rsn.get("macd_signal_direction", "neutral"),
+                # If signal IS a buy, it passed all gates — treat as approved regardless of stale JSON
+                "approved":             (s.signal or "").upper() in ("BUY", "STRONG_BUY") or rsn.get("approved", False),
+                "why_buy":              rsn.get("why_buy", ""),
+                "why_wait":             rsn.get("why_wait", ""),
             })
         return result
+
+
+_PAGE_INFO = {
+    'brief':   ('<b>Morning Brief</b> — AI-generated daily market summary, regenerated at 06:00 and 09:00 ET. '
+                'Covers S&amp;P 500 futures, VIX, oil, gold, BTC, 10yr yield, Nasdaq &amp; Dow. '
+                'Includes economic calendar events, top WSB tickers, congressional trades, and crypto sentiment.'),
+    'paper':   ('<b>Paper Trade</b> — $100k virtual account running the full 6-layer AI pipeline. '
+                'Stage&nbsp;1: Monitoring (no trades). Stage&nbsp;2: Active AI (auto-buys every 5&nbsp;min during market hours). '
+                'Stage&nbsp;3: Open positions with stop-loss &amp; take-profit monitoring every 60s. '
+                'AI exit toggle per position. Threshold model swim lanes.'),
+    'live':    ('<b>Live Trading</b> — <span style="color:#d29922">&#9888; Coming Soon.</span> '
+                'Will execute real orders through the Schwab Trader API using the same 6-layer pipeline as Paper Trade. '
+                'Dry-run mode remains ON until explicitly enabled by the account owner. All risk controls enforced: '
+                'max 5% position, 25% sector cap, 3% daily loss halt.'),
+    'wheel':   ('<b>Wheel Strategy</b> — Options income scanner targeting top-100 S&amp;P 500 names. '
+                'Screens for IV&nbsp;Rank&nbsp;&gt;50%, 30&Delta; cash-secured put at 30&ndash;45&nbsp;DTE, '
+                'bid/ask spread &lt;5% of mid. Phase progression: CSP &rarr; Shares (assigned) &rarr; Covered Call &rarr; Closed.'),
+    'itool':   ('<b>I-Tool</b> — S&amp;P 500 technical scanner using Fibonacci retracements, VWAP deviation, '
+                'RSI, MACD, and Bollinger Bands. Results sortable by any column. '
+                'Bullish/bearish rows link to Stage Gate via +S1/+S2 buttons. '
+                'Scan cache persists between visits. Does not run the AI fundamental pipeline.'),
+    'signals': ('<b>Signal Monitor</b> — Live per-ticker AI composite view showing current gate breakdown: '
+                'Reynolds filter, Quantum score, Ensemble, Risk/Reward, Kalman trend, momentum, RVOL. '
+                'One row per watchlist ticker — current state only. '
+                'Distinct from <i>AI Signal History</i> on the main page (that is a chronological event log; this shows now).'),
+}
+
+
+def _page_info_html(key: str) -> str:
+    text = _PAGE_INFO.get(key, '')
+    if not text:
+        return ''
+    return (
+        '<div class="page-info-bar pib-collapsed" id="page-info-bar">'
+        '<button class="page-info-toggle" '
+        r'onclick="var b=this.closest(\'.page-info-bar\');b.classList.toggle(\'pib-collapsed\')">'
+        'ℹ️ About this page'
+        '<span class="pib-arrow">&#9660;</span>'
+        '</button>'
+        f'<div class="page-info-content">{text}</div>'
+        '</div>'
+    )
+
+
+def _nav_html(active: str = '') -> str:
+    """Shared nav bar. active = 'brief'|'paper'|'r2000'|'live'|'wheel'|'itool'|'signals'"""
+    back = ('<a href="/" style="padding:5px 12px;border-radius:6px;border:1px solid #30363d;'
+            'background:#21262d;color:#8b949e;text-decoration:none;font-size:12px;'
+            'white-space:nowrap;align-self:center;">&#8592; NWO Monitor</a>')
+    def btn(key, href, emoji, label, preview_text):
+        hi = ' style="border-color:#58a6ff!important;background:rgba(88,166,255,0.15)!important;"' if key == active else ''
+        return (f'<a href="{href}" class="brief-btn" id="{key}-btn"{hi}>'
+                f'<span class="brief-btn-title">{emoji} {label}</span>'
+                f'<span class="brief-btn-preview" id="{key}-preview">{preview_text}</span></a>')
+    return (
+        back +
+        btn('brief',   '/morning-brief',    '&#128202;', 'Morning Brief', 'Markets &middot; Futures &middot; WSB &middot; Crypto') +
+        btn('paper',   '/paper',            '&#127918;', 'Paper Trade',   '$100k Virtual &middot; 3-Stage AI Gate') +
+        btn('r2000',   '/paper/russell2000','&#128202;', 'Russell 2000',  'Curated 49-stock small-cap watchlist') +
+        btn('live',    '/live-trading',     '&#128185;', 'Live Trading',  'Schwab API &middot; Coming Soon') +
+        btn('wheel',   '/wheel',            '&#127905;', 'Wheel',         'CSP &middot; Covered Call &middot; IV Rank') +
+        btn('itool',   '/i-tool',           '&#128225;', 'I-Tool',        'S&amp;P 500 Technical Scanner') +
+        btn('signals', '/signals',          '&#128200;', 'Signal Monitor','Gates &middot; Momentum &middot; RVOL &middot; Kalman')
+    )
+
+
+_NAV_CSS = """
+  /* ── Sticky top banner ──────────────────────────────────────── */
+  .sticky-banner { position: sticky; top: 0; z-index: 200; background: #0d1117; }
+  /* ── Shared nav buttons ─────────────────────────────────────── */
+  .brief-btn { display: flex; flex-direction: column; gap: 2px; padding: 6px 14px;
+               border-radius: 6px; border: 1px solid #30363d; background: #161b22;
+               text-decoration: none; color: #e6edf3; transition: background 0.15s; }
+  .brief-btn:hover { background: #1c2e50; }
+  .brief-btn-title { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
+  .brief-btn-preview { font-size: 10px; color: #8b949e; white-space: nowrap; }
+  /* ── Shared ticker tape ─────────────────────────────────────── */
+  .sh-tape-wrap  { overflow: hidden; background: #0a0f17; border-bottom: 1px solid #1f6feb; height: 26px; }
+  .sh-tape-track { display: flex; gap: 24px; white-space: nowrap; will-change: transform;
+                   animation: sh-tape 80s linear infinite; align-items: center; height: 100%;
+                   padding-left: 12px; }
+  .sh-tape-track:hover { animation-play-state: paused; }
+  @keyframes sh-tape { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
+  .sht-bull    { color: #3fb950; font-size: 12px; font-weight: 700; }
+  .sht-bear    { color: #f85149; font-size: 12px; font-weight: 700; }
+  .sht-neu     { color: #8b949e; font-size: 12px; }
+  .sht-chg-up  { color: rgba(63,185,80,0.75);  font-size: 12px; }
+  .sht-chg-dn  { color: rgba(248,81,73,0.75);  font-size: 12px; }
+  .sht-sep     { color: #30363d; font-size: 10px; }
+  /* ── Paper tape change classes ──────────────────────────────── */
+  .pt-chg-up { color: rgba(63,185,80,0.75);  font-size: 12px; }
+  .pt-chg-dn { color: rgba(248,81,73,0.75);  font-size: 12px; }
+  /* ── Page info bar ──────────────────────────────────────────── */
+  .page-info-bar { border-bottom: 1px solid #21262d; background: #0a0f17; }
+  .page-info-toggle { width: 100%; text-align: left; padding: 4px 16px;
+                      background: none; border: none; color: #8b949e; cursor: pointer;
+                      font-size: 11px; display: flex; align-items: center; gap: 6px; }
+  .page-info-toggle:hover { background: rgba(88,166,255,0.05); }
+  .page-info-content { padding: 6px 16px 10px; font-size: 12px; color: #8b949e; line-height: 1.75; }
+  .page-info-bar.pib-collapsed .page-info-content { display: none; }
+  .pib-arrow { display: inline-block; transition: transform 0.2s; font-size: 10px; margin-left: auto; }
+  .page-info-bar.pib-collapsed .pib-arrow { transform: rotate(-90deg); }
+"""
+
+_NAV_TAPE_HTML = (
+    '<div class="sh-tape-wrap">'
+    '<div class="sh-tape-track" id="sh-tape"><span class="sht-neu">Loading signals…</span></div>'
+    '</div>'
+)
+
+_NAV_TAPE_JS = """<script>
+// ── Sticky banner wrapper ─────────────────────────────────────────────────────
+(function() {
+  var h = document.querySelector('header');
+  if (!h || h.closest('.sticky-banner')) return;
+  var t = h.nextElementSibling;
+  var isTape = t && t.className && (t.className.indexOf('tape') >= 0);
+  var w = document.createElement('div'); w.className = 'sticky-banner';
+  h.parentNode.insertBefore(w, h); w.appendChild(h);
+  if (isTape) w.appendChild(t);
+})();
+// ── Page-info bar (per-page static description, collapsed by default) ─────────
+(function() {
+  var INFO = {
+    'brief-btn':   '<b>Morning Brief</b> \u2014 AI-generated daily market summary at 06:00 &amp; 09:00 ET. Covers S&amp;P futures, VIX, oil, gold, BTC, 10yr, Nasdaq, Dow; economic calendar; top WSB tickers; congressional trades; crypto sentiment.',
+    'paper-btn':   '<b>Paper Trade</b> \u2014 $100k virtual account. Stage\u00a01: Monitoring. Stage\u00a02: Active AI auto-buys every 5&nbsp;min (market hours). Stage\u00a03: Open positions with stop-loss &amp; take-profit every 60s. AI exit toggle per position.',
+    'live-btn':    '<b>Live Trading</b> \u2014 <span style="color:#d29922">&#9888; Coming Soon.</span> Real Schwab Trader API execution using the identical 6-layer pipeline. Dry-run stays ON until the account owner explicitly enables it. All risk controls enforced.',
+    'wheel-btn':   '<b>Wheel Strategy</b> \u2014 Options income scanner. Screens top-100 S&amp;P 500 for IV\u00a0Rank\u00a0&gt;50%, 30\u0394 CSP at 30\u201345\u00a0DTE, spread\u00a0&lt;5% of mid. Tracks CSP \u2192 Shares \u2192 Covered Call \u2192 Closed.',
+    'itool-btn':   '<b>I-Tool</b> \u2014 S&amp;P 500 technical scanner: Fibonacci, VWAP, RSI, MACD, Bollinger Bands. Sortable columns. +S1/+S2 buttons push directly to Stage Gate. Scan cache persists between visits. Does not run the AI fundamental pipeline.',
+    'signals-btn': '<b>Signal Monitor</b> \u2014 Live per-ticker AI gate breakdown: Reynolds, Quantum, Ensemble, R/R, Kalman, momentum, RVOL. One row per ticker \u2014 current state only. Distinct from AI Signal History on the main page (that is a chronological event log).'
+  };
+  var activeKey = '';
+  Object.keys(INFO).forEach(function(k) {
+    var el = document.getElementById(k);
+    if (el && (el.style.cssText || '').indexOf('58a6ff') >= 0) activeKey = k;
+  });
+  var text = INFO[activeKey];
+  if (!text) return;
+  var sb = document.querySelector('.sticky-banner') || document.querySelector('header');
+  if (!sb) return;
+  var bar = document.createElement('div');
+  bar.className = 'page-info-bar pib-collapsed';
+  bar.id = 'page-info-bar';
+  bar.innerHTML = '<button class="page-info-toggle" onclick="var b=this.closest(\\'.page-info-bar\\');b.classList.toggle(\\'pib-collapsed\\')">&#8505;&#65039; About this page<span class="pib-arrow">&#9660;</span></button>'
+    + '<div class="page-info-content">' + text + '</div>';
+  sb.insertAdjacentElement('afterend', bar);
+})();
+// ── Ticker tape with dedup + change_pct-based arrows ─────────────────────────
+(async function() {
+  const track = document.getElementById('sh-tape');
+  if (!track) return;
+  try {
+    const sigs = await fetch('/api/signals').then(r => r.json());
+    const byT = new Map();
+    (sigs || []).forEach(s => { if (!byT.has(s.ticker)) byT.set(s.ticker, s); });
+    const items = [...byT.values()];
+    if (!items.length) { track.innerHTML = '<span class="sht-neu">No signals</span>'; return; }
+    const all = [...items, ...items];
+    track.innerHTML = all.map(s => {
+      const sig = (s.signal || '').toUpperCase();
+      const bull = sig === 'BUY' || sig === 'STRONG_BUY';
+      const bear = sig === 'SELL' || sig === 'STRONG_SELL';
+      const chg  = s.change_pct;
+      const up   = chg != null ? chg > 0 : null;
+      let cls, arr;
+      if (bull)            { cls = 'sht-bull';   arr = '&#9650;'; }
+      else if (bear)       { cls = 'sht-bear';   arr = '&#9660;'; }
+      else if (up === true){ cls = 'sht-chg-up'; arr = '&#9650;'; }
+      else if (up===false) { cls = 'sht-chg-dn'; arr = '&#9660;'; }
+      else                 { cls = 'sht-neu';    arr = '&#8212;'; }
+      const p = s.current_price;
+      return '<span class="' + cls + '">' + arr + ' ' + s.ticker + (p ? ' $' + Number(p).toFixed(2) : '') + '</span>'
+           + '<span class="sht-sep">|</span>';
+    }).join('');
+    track.style.animationDuration = Math.max(40, items.length * 0.8) + 's';
+  } catch(e) {}
+})();
+</script>"""
 
 
 def _recent_trades(limit: int = 30) -> list:
@@ -115,7 +444,7 @@ def _recent_trades(limit: int = 30) -> list:
                 "total":     t.total_value,
                 "dry_run":   t.dry_run,
                 "status":    t.status,
-                "executed_at": t.executed_at.strftime("%Y-%m-%d %H:%M:%S") if t.executed_at else "",
+                "executed_at": _to_et_str(t.executed_at, "%Y-%m-%d %H:%M:%S ET") if t.executed_at else "",
                 "notes":     t.notes or "",
             }
             for t in rows
@@ -137,10 +466,11 @@ def _tail_log(lines: int = 80) -> list[str]:
 @app.get("/api/status")
 def api_status():
     return {
-        "paused":   _is_paused(),
-        "dry_run":  config.risk.dry_run,
-        "watchlist": config.watchlist,
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "paused":           _is_paused(),
+        "dry_run":          config.risk.dry_run,
+        "watchlist":        config.watchlist,
+        "ai_watch_tickers": getattr(config, "ai_watch_tickers", []),
+        "timestamp":        datetime.now(_ET).strftime("%Y-%m-%d %H:%M:%S ET"),
     }
 
 
@@ -303,6 +633,133 @@ def api_backfill_status():
     }
 
 
+# ── R2000 backfill ────────────────────────────────────────────────────────────
+
+_r2k_backfill_state: dict = {"running": False, "done": False, "log": [], "total": 0, "completed": 0}
+
+
+def _run_r2000_backfill(days: int):
+    import json
+    from pathlib import Path
+    from pipeline.ingestion import IngestionPipeline
+    from models.database import init_db
+    from config import config as _cfg
+
+    sg_path = Path("data/stagegate_russell2000.json")
+    if not sg_path.exists():
+        _r2k_backfill_state["log"].append("stagegate_russell2000.json not found")
+        _r2k_backfill_state["running"] = False
+        _r2k_backfill_state["done"] = True
+        return
+
+    universe = json.loads(sg_path.read_text(encoding="utf-8")).get("stage1", [])
+    _r2k_backfill_state["total"] = len(universe)
+    _r2k_backfill_state["completed"] = 0
+    _r2k_backfill_state["log"] = [f"Starting R2000 backfill: {len(universe)} tickers × {days} days"]
+
+    try:
+        _, Session = init_db(_cfg.database.url, echo=False)
+        pipeline = IngestionPipeline(db_session_factory=Session)
+        for i, ticker in enumerate(universe, 1):
+            try:
+                ok = pipeline.ingest_price_history(ticker, days=days)
+                _r2k_backfill_state["log"].append(f"[{i}/{len(universe)}] {ticker}: {'✓' if ok else '✗'}")
+            except Exception as e:
+                _r2k_backfill_state["log"].append(f"[{i}/{len(universe)}] {ticker}: error — {e}")
+            _r2k_backfill_state["completed"] = i
+        _r2k_backfill_state["log"].append("R2000 backfill complete.")
+    except Exception as e:
+        _r2k_backfill_state["log"].append(f"R2000 backfill failed: {e}")
+    finally:
+        _r2k_backfill_state["running"] = False
+        _r2k_backfill_state["done"] = True
+
+
+@app.post("/api/backfill/r2000")
+def api_backfill_r2000(days: int = 365):
+    if _r2k_backfill_state["running"]:
+        return {"started": False, "message": "R2000 backfill already in progress"}
+    _r2k_backfill_state.update({"running": True, "done": False, "log": [], "completed": 0})
+    threading.Thread(target=_run_r2000_backfill, args=(days,), daemon=True).start()
+    return {"started": True, "message": f"R2000 backfill started ({days} days)"}
+
+
+@app.get("/api/backfill/r2000/status")
+def api_backfill_r2000_status():
+    return {k: _r2k_backfill_state[k] for k in ("running", "done", "total", "completed", "log")}
+
+
+# ── TipRanks API endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/tipranks/all")
+def api_tipranks_all():
+    """Return entire tipranks_scan.json results dict for bulk JS use."""
+    import json
+    from pathlib import Path
+    try:
+        data = json.loads(Path("data/tipranks_scan.json").read_text(encoding="utf-8"))
+        return data.get("results", {})
+    except Exception:
+        return {}
+
+
+@app.get("/api/tipranks/ticker/{ticker}")
+def api_tipranks_ticker(ticker: str):
+    """Return cached TipRanks data for a single ticker."""
+    from monitor.tipranks_scanner import get_cached_signal
+    d = get_cached_signal(ticker.upper())
+    return d if d else {"error": "not_cached"}
+
+
+@app.get("/api/tipranks/status")
+def api_tipranks_status():
+    """Return TipRanks scanner status + cookie availability."""
+    from monitor.tipranks_scanner import get_status
+    from data_sources.tipranks_client import TipRanksClient
+    d = get_status()
+    d["cookies_ok"] = TipRanksClient.cookies_available()
+    return d
+
+
+@app.post("/api/tipranks/reload-cookies")
+def api_tipranks_reload_cookies():
+    """Re-read cookie file after user exports fresh cookies from browser."""
+    from data_sources.tipranks_client import get_client, TipRanksClient
+    if not TipRanksClient.cookies_available():
+        return {"ok": False, "error": "data/tipranks_cookies.json not found"}
+    try:
+        get_client().reload_cookies()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/tipranks/scan")
+def api_tipranks_scan_now(background_tasks=None):
+    """Trigger an immediate TipRanks scan for all watchlist + stagegate tickers."""
+    import threading, json
+    from pathlib import Path as _Path
+    from config import config as _cfg
+    from paper.executor import PAPER_MODEL_CONFIGS
+    from monitor.tipranks_scanner import run_scan
+
+    tickers: set = set(_cfg.watchlist)
+    for model, cfg in PAPER_MODEL_CONFIGS.items():
+        try:
+            sg = json.loads(_Path(cfg["stagegate"]).read_text(encoding="utf-8"))
+            for k in ("stage1", "stage2", "stage3"):
+                tickers.update(sg.get(k, []))
+        except Exception:
+            pass
+    r2k = _Path("data/stagegate_russell2000.json")
+    if r2k.exists():
+        tickers.update(json.loads(r2k.read_text(encoding="utf-8")).get("stage1", []))
+
+    t = threading.Thread(target=run_scan, args=(list(tickers),), daemon=True, name="tipranks-manual")
+    t.start()
+    return {"status": "started", "tickers": len(tickers)}
+
+
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -314,22 +771,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', monospace; font-size: 14px; }
-  header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;
-           display: flex; align-items: center; gap: 16px; }
-  header h1 { font-size: 18px; letter-spacing: 2px; color: #58a6ff; white-space: nowrap; }
-  .brief-btn { display: flex; flex-direction: column; gap: 2px; padding: 6px 14px;
-               border-radius: 8px; border: 1px solid #1f6feb; background: #0d1e36;
-               color: #58a6ff; text-decoration: none; line-height: 1.3;
-               transition: background 0.15s; }
+  header { background: #161b22; padding: 10px 16px 0; border-bottom: 1px solid #30363d;
+           display: flex; flex-direction: column; gap: 0; }
+  .header-top { display: flex; align-items: center; gap: 12px; padding-bottom: 8px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; letter-spacing: 2px; color: #58a6ff; white-space: nowrap; }
+  .header-nav { display: flex; gap: 6px; flex-wrap: wrap; padding-bottom: 8px; }
+  .brief-btn { display: flex; align-items: center; gap: 5px; padding: 5px 10px;
+               border-radius: 6px; border: 1px solid #1f6feb; background: #0d1e36;
+               color: #58a6ff; text-decoration: none; font-size: 12px; font-weight: 600;
+               white-space: nowrap; transition: background 0.15s; }
   .brief-btn:hover { background: #1c2e50; }
-  .brief-btn-title { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
-  .brief-btn-preview { font-size: 10px; color: #8b949e; white-space: nowrap; }
-  .brief-btn-preview .up  { color: #3fb950; }
-  .brief-btn-preview .dn  { color: #f85149; }
-  .brief-btn-preview .neu { color: #8b949e; }
+  .brief-btn-title { font-size: 12px; font-weight: 700; }
+  .brief-btn-preview { display: none; }
   .header-spacer { flex: 1; }
-  .badges { display: flex; gap: 10px; align-items: center; }
-  .badges { display: flex; gap: 10px; align-items: center; }
+  .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .badge { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
   .badge-green  { background: #1a4731; color: #3fb950; }
   .badge-yellow { background: #3d2b00; color: #d29922; }
@@ -340,7 +795,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #pause-btn:hover { background: #30363d; }
   #pause-btn.paused { background: #4a1519; color: #f85149; border-color: #f85149; }
   main { padding: 16px; display: grid; gap: 16px;
-         grid-template-columns: 3fr 1fr; grid-template-rows: auto auto auto; }
+         grid-template-columns: 1fr; }
   section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
   section.full-width { grid-column: 1 / -1; }
   h2 { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px;
@@ -410,50 +865,157 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #backfill-log { background: #0d1117; border: 1px solid #21262d; border-radius: 4px;
                   padding: 10px; max-height: 200px; overflow-y: auto;
                   font-family: monospace; font-size: 12px; line-height: 1.6; color: #8b949e; }
+  /* ── Sticky banner ───────────────────────────────────────────────── */
+  .sticky-banner { position: sticky; top: 0; z-index: 200; background: #0d1117; }
+  /* ── Ticker tape (main dashboard) ──────────────────────────────── */
+  .tape-wrap  { overflow: hidden; background: #0a0f17;
+                border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0; }
+  .tape-track { display: flex; gap: 24px; white-space: nowrap; will-change: transform;
+                animation: main-tape 80s linear infinite; align-items: center; height: 100%;
+                padding-left: 12px; }
+  .tape-track:hover { animation-play-state: paused; }
+  @keyframes main-tape { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
+  .mt-bull   { color: #3fb950; font-size: 12px; font-weight: 700; }   /* BUY signal */
+  .mt-bear   { color: #f85149; font-size: 12px; font-weight: 700; }   /* SELL signal */
+  .mt-chg-up { color: #7ee8a2; font-size: 12px; }                     /* price up, neutral signal */
+  .mt-chg-dn { color: #ff8a80; font-size: 12px; }                     /* price down, neutral signal */
+  .mt-neu    { color: #8b949e; font-size: 12px; }
+  .mt-sep    { color: #30363d; font-size: 10px; }
+  /* ── Info modal (main page) ─────────────────────────────────────── */
+  .nwo-info-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8);
+                      display: none; align-items: center; justify-content: center; z-index: 9999; }
+  .nwo-info-overlay.open { display: flex; }
+  .nwo-info-modal { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+                    padding: 24px; max-width: 600px; width: 92%; max-height: 88vh; overflow-y: auto; }
+  .nwo-info-modal h2 { font-size: 15px; color: #58a6ff; margin-bottom: 4px; }
+  .nwo-info-modal h3 { font-size: 11px; color: #8b949e; text-transform: uppercase;
+                       letter-spacing: 1px; margin: 14px 0 8px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+  .nwo-info-row { display: flex; gap: 10px; margin-bottom: 9px; align-items: flex-start; }
+  .nwo-info-tag { font-size: 10px; font-weight: 700; color: #e6edf3; min-width: 110px;
+                  background: #21262d; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; }
+  .nwo-info-desc { font-size: 12px; color: #8b949e; line-height: 1.5; }
+  .nwo-info-close { float: right; background: none; border: 1px solid #30363d;
+                    color: #8b949e; cursor: pointer; padding: 4px 10px; border-radius: 4px; font-size: 12px; }
+  .nwo-info-close:hover { color: #f85149; }
+  /* ── Hero grid (landing page) ────────────────────────────────── */
+  .hero-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+  .hero-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+  .hero-card-title { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px;
+                     display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .hero-card-snap  { font-size: 11px; color: #8b949e; margin-bottom: 8px; }
+  .hero-card-text  { font-size: 12px; color: #c9d1d9; line-height: 1.5; }
+  .hero-pos-row, .hero-trade-row { display: flex; justify-content: space-between;
+                                   padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 11px; }
+  .hero-trade-row  { gap: 8px; }
   @media (max-width: 900px) {
     main { grid-template-columns: 1fr; }
     section.full-width { grid-column: 1; }
-    header { flex-wrap: wrap; gap: 8px; }
-    .brief-btn-preview { display: none; }
     table { font-size: 11px; }
     th, td { padding: 4px 5px; }
     .conf-bar { width: 50px; }
     .score-bar { width: 40px; }
     .model-bar { flex-wrap: wrap; gap: 6px; }
     .model-indicator { display: none; }
+    .hero-grid { grid-template-columns: 1fr; }
+    .badges { gap: 4px; }
   }
 </style>
 </head>
 <body>
+<!-- NWO info modal -->
+<div class="nwo-info-overlay" id="nwo-info-overlay" onclick="if(event.target===this)document.getElementById('nwo-info-overlay').classList.remove('open')">
+  <div class="nwo-info-modal">
+    <button class="nwo-info-close" onclick="document.getElementById('nwo-info-overlay').classList.remove('open')">&#x2715; Close</button>
+    <h2>&#9432; How NWO AI Works</h2>
+    <h3>6-Layer Pipeline</h3>
+    <div class="nwo-info-row"><span class="nwo-info-tag">L1 Ingestion</span><span class="nwo-info-desc">EDGAR fundamentals + Schwab price history → SQLite DB. Runs daily at 6am ET + intraday every 5 min.</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">L2 Analysis</span><span class="nwo-info-desc">First-principles valuation: ROIC, moat score, DCF intrinsic value, owner earnings.</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Signals</span><span class="nwo-info-desc">FFT cycle detection · Fibonacci levels · Insider flow · VWAP · Volume profile · VIX regime · Momentum (RVOL/MACD/MA stack/ATR/52W breakout).</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">L3 FUD Filter</span><span class="nwo-info-desc">News quality scoring + FUD attack detection. Articles scored for relevance, credibility, and manipulation signals. Blocks trades on coordinated FUD.</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">L4 Decision</span><span class="nwo-info-desc">7-gate engine: Reynolds turbulence · Ensemble BMA (P(bull) &gt;50%) · Quantum state · Kalman innovation · Risk/reward · FUD gate · Signal threshold.</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">L5 Risk</span><span class="nwo-info-desc">Behavioral psychology filters · Kelly criterion position sizing · Max $500/trade · Max 5% position · Max 5 trades/day.</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">L6 Executor</span><span class="nwo-info-desc">Order placement via Schwab API. DRY RUN = True by default — trades are logged but not sent.</span></div>
+    <h3>Signal Weights (Composite Score)</h3>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Fundamentals</span><span class="nwo-info-desc">25% — ROIC, moat, DCF valuation</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Momentum</span><span class="nwo-info-desc">20% — RVOL, MACD, MA stack, ATR, 52W breakout</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Insider Flow</span><span class="nwo-info-desc">20% — SEC Form 4 insider buy/sell activity</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Technical</span><span class="nwo-info-desc">15% — VWAP position, Fibonacci levels</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Cycle</span><span class="nwo-info-desc">10% — FFT cycle phase</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Volume</span><span class="nwo-info-desc">10% — Volume profile, RVOL confirmation</span></div>
+    <h3>AI Watch (Priority Tickers)</h3>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Scan frequency</span><span class="nwo-info-desc">Every 1 minute during market hours (vs 5 min for standard watchlist)</span></div>
+    <div class="nwo-info-row"><span class="nwo-info-tag">Breakout override</span><span class="nwo-info-desc">When RVOL ≥1.5× + momentum confirmed: fundamentals score floored at 0 (premium valuation can't block a breakout), Reynolds + Kalman gates relaxed.</span></div>
+  </div>
+</div>
 <header>
-  <h1>NWO MONITOR</h1>
-  <a href="/morning-brief" class="brief-btn" id="brief-btn">
-    <span class="brief-btn-title">📊 Morning Brief</span>
-    <span class="brief-btn-preview" id="brief-preview">Markets · Futures · WSB · Congress · Crypto</span>
-  </a>
-  <a href="/i-tool" class="brief-btn" id="itool-btn">
-    <span class="brief-btn-title">📡 I-Tool</span>
-    <span class="brief-btn-preview" id="itool-preview">S&amp;P 500 Technical Scanner</span>
-  </a>
-  <a href="/paper" class="brief-btn" id="paper-btn">
-    <span class="brief-btn-title">🎮 Paper Trade</span>
-    <span class="brief-btn-preview" id="paper-preview">$100k Faux Account · Loading...</span>
-  </a>
-  <a href="/wheel" class="brief-btn" id="wheel-btn">
-    <span class="brief-btn-title">🎡 Wheel</span>
-    <span class="brief-btn-preview">CSP · Covered Call · Premium</span>
-  </a>
-  <div class="header-spacer"></div>
-  <div class="badges">
-    <span id="status-badge" class="badge badge-blue">Loading...</span>
-    <span id="mode-badge"   class="badge badge-yellow">DRY RUN</span>
-    <button id="pause-btn" onclick="togglePause()">Pause</button>
-    <span id="refresh-ts"></span>
+  <div class="header-top">
+    <h1>NWO MONITOR</h1>
+    <div class="header-spacer"></div>
+    <div class="badges">
+      <span id="hdr-daily-pnl" style="padding:3px 8px;border-radius:6px;border:1px solid #30363d;background:#0d1117;font-size:11px;color:#8b949e;white-space:nowrap" title="Paper account daily P&amp;L">Daily: —</span>
+      <span id="hdr-total-pnl" style="padding:3px 8px;border-radius:6px;border:1px solid #30363d;background:#0d1117;font-size:11px;color:#8b949e;white-space:nowrap" title="Paper account total P&amp;L">Total: —</span>
+      <span id="status-badge" class="badge badge-blue">Loading...</span>
+      <span id="mode-badge"   class="badge badge-yellow">DRY RUN</span>
+      <button id="pause-btn" onclick="togglePause()">Pause</button>
+      <button style="padding:4px 8px;border-radius:6px;border:1px solid #30363d;background:transparent;color:#58a6ff;cursor:pointer;font-size:11px;" onclick="document.getElementById('nwo-info-overlay').classList.add('open')" title="How NWO AI works">&#9432; AI Logic</button>
+      <span id="refresh-ts"></span>
+    </div>
+  </div>
+  <div class="header-nav">
+    <a href="/morning-brief" class="brief-btn" id="brief-btn">&#128202; Morning Brief</a>
+    <a href="/i-tool"        class="brief-btn" id="itool-btn">&#128225; I-Tool</a>
+    <a href="/paper"         class="brief-btn" id="paper-btn">&#127918; Paper Trade</a>
+    <a href="/paper/russell2000" class="brief-btn" id="r2000-btn">&#128202; Russell 2000</a>
+    <a href="/wheel"         class="brief-btn" id="wheel-btn">&#127905; Wheel</a>
+    <a href="/signals"       class="brief-btn" id="signals-btn">&#128200; Signal Monitor</a>
+    <a href="/paper/compare" class="brief-btn" style="border-color:#30363d;background:#161b22;color:#8b949e;">&#128300; Compare</a>
   </div>
 </header>
+<div class="tape-wrap"><div class="tape-track" id="main-tape"><span class="mt-neu">Loading signals...</span></div></div>
+<script>
+(function(){var h=document.querySelector('header');if(!h||h.closest('.sticky-banner'))return;
+var t=h.nextElementSibling;var isTape=t&&t.className&&t.className.indexOf('tape')>=0;
+var w=document.createElement('div');w.className='sticky-banner';
+h.parentNode.insertBefore(w,h);w.appendChild(h);if(isTape)w.appendChild(t);})();
+</script>
 <main>
+  <!-- ── Hero dashboard cards ──────────────────────────────────────── -->
+  <div class="hero-grid">
+    <div class="hero-card">
+      <div class="hero-card-title">
+        <span>&#128202; Morning Brief</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <a href="/morning-brief" style="color:#58a6ff;font-size:10px;text-decoration:none;">View Full &#8594;</a>
+          <button onclick="loadHeroBrief()" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:14px;padding:0;line-height:1" title="Refresh">&#8635;</button>
+        </div>
+      </div>
+      <div id="hc-brief-markets" style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;margin-bottom:8px;font-size:11px;"></div>
+      <div id="hc-brief-text" class="hero-card-text" style="margin-bottom:8px;">Loading brief...</div>
+      <div id="hc-brief-wsb" style="font-size:10px;color:#8b949e;"></div>
+    </div>
+    <div class="hero-card">
+      <div class="hero-card-title">
+        <span>&#128200; Live Positions</span>
+        <a href="/paper" style="color:#58a6ff;font-size:10px;text-decoration:none;">Paper Trade &#8594;</a>
+      </div>
+      <div style="margin-bottom:8px">
+        <div style="font-size:10px;color:#8b949e;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.5px">Paper Account</div>
+        <div id="hc-paper-equity" style="font-size:20px;font-weight:700">&#8212;</div>
+        <div id="hc-paper-pnl" style="font-size:11px;color:#8b949e;margin-top:2px">&#8212; Total P&amp;L</div>
+        <div id="hc-paper-daily" style="font-size:11px;color:#8b949e;margin-top:1px">&#8212; Daily P&amp;L</div>
+      </div>
+      <div id="hc-pos-list"></div>
+    </div>
+    <div class="hero-card">
+      <div class="hero-card-title">
+        <span>&#128221; Trade Log</span>
+        <span style="font-size:10px;color:#8b949e">[P] Paper &middot; [L] Live</span>
+      </div>
+      <div id="hc-trade-list"><span style="color:#8b949e;font-size:11px">Loading...</span></div>
+    </div>
+  </div>
   <section>
-    <h2>Recent Signals</h2>
+    <h2>AI Signal History <span style="font-size:11px;font-weight:400;color:#8b949e;margin-left:10px;">Chronological event log &mdash; for live per-ticker status &#8594; <a href="/signals" style="color:#58a6ff;text-decoration:none;">Signal Monitor</a></span></h2>
     <div class="model-bar">
       <span class="model-label">Threshold model:</span>
       <button class="model-btn active-0" id="mbtn-0" onclick="setModel(0)">Standard (100%)</button>
@@ -494,6 +1056,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </main>
 <script>
 let paused = false;
+let _aiWatchTickers = [];
 
 // ── Morning Brief preview in header ──────────────────────────
 async function fetchBriefPreview() {
@@ -542,6 +1105,14 @@ const MODELS = [
 let _activeModel = 0;
 let _cachedSignals = [];
 let _cycleTimer = null;
+let _tipranksData = {};   // ticker -> {smart_score, buy_pct, composite, ...}
+
+async function _loadTipranksData() {
+  try {
+    const d = await fetch('/api/tipranks/all').then(r => r.json());
+    if (d && typeof d === 'object') _tipranksData = d;
+  } catch(e) {}
+}
 
 function setModel(idx) {
   _activeModel = idx;
@@ -581,6 +1152,7 @@ async function fetchStatus() {
     const r = await fetch('/api/status');
     const d = await r.json();
     paused = d.paused;
+    _aiWatchTickers = d.ai_watch_tickers || [];
     const btn = document.getElementById('pause-btn');
     const badge = document.getElementById('status-badge');
     const modeBadge = document.getElementById('mode-badge');
@@ -608,14 +1180,16 @@ function renderSignals(signals) {
   let html = `<table><tr>
     <th>Ticker</th>
     <th>Signal${modelTag}</th>
+    <th title="Weighted composite score from all signals (-1 to +1). ≥+0.15 = BUY threshold.">Composite ?</th>
+    <th title="Momentum score + Relative Volume. RVOL ≥1.5× green = institutional breakout volume.">Momentum / RVOL ?</th>
     <th title="Latest close price and day-over-day % change vs previous close">Price / Day</th>
     <th title="Model confidence (ensemble agreement). Need >${(m.conf*100).toFixed(1)}% under current model.">Conf ?</th>
     <th title="Margin of Safety vs intrinsic value. Need >${(m.mos*100).toFixed(2)}% under current model.">MoS ?</th>
     <th title="News quality score. Need >${m.fud.toFixed(2)} under current model.">FUD ?</th>
     <th title="Gate score under current model (${MODELS[_activeModel].name}). C=Confidence M=MoS F=FUD. Bar = composite proximity to BUY.">Score (${MODELS[_activeModel].name}) ?</th>
     <th title="Reynolds fluid dynamics regime: laminar=calm, transient=ok, turbulent=blocked">Regime ?</th>
-    <th title="Quantum probability state and P(Bull). Need P(Bull)>55% to pass ensemble gate.">Quantum ?</th>
-    <th title="What blocked the trade (if anything)">Blocker</th>
+    <th title="Quantum probability state and P(Bull). Need P(Bull)>50% to pass ensemble gate.">Quantum ?</th>
+    <th title="What blocked the trade (if anything), or APPROVED if all gates passed">Blocker</th>
     <th>Time (local)</th>
   </tr>`;
 
@@ -690,37 +1264,67 @@ function renderSignals(signals) {
       return `<small style="color:${col};display:block;font-size:10px">${arrow} ${label} to gate</small>`;
     }
 
-    // Reasoning
-    let regime = '—', regimeImpact = '', quantum = '—', quantumImpact = '', blocker = '—';
+    // Reasoning — parse both raw JSON and pre-extracted fields from server
+    let regime = '—', quantum = '—', blocker = '—';
+    let compositeCell = '—', momentumCell = '—';
     try {
       const rsn = JSON.parse(s.reasoning || '{}');
       const regRaw   = rsn.reynolds_regime || '—';
-      const regPasses = regRaw === 'laminar' || regRaw === 'transient';
       const regCls    = regRaw === 'laminar' ? 'mos-good' : regRaw === 'transient' ? 'mos-warn' : 'mos-bad';
       const regImpStr = regRaw === 'laminar'   ? '<small style="color:#3fb950;display:block;font-size:10px">▲ unlocks execution</small>'
                       : regRaw === 'transient' ? '<small style="color:#d29922;display:block;font-size:10px">~ reduces sizing</small>'
                       :                          '<small style="color:#f85149;display:block;font-size:10px">▼ blocks execution</small>';
       regime = `<span class="${regCls}">${regRaw}</span>${regImpStr}`;
 
-      const pbullNum  = rsn.p_bull || 0;
-      const pbull     = rsn.p_bull != null ? (pbullNum*100).toFixed(0)+'%' : '—';
-      const pbullCls  = pbullNum >= 0.55 ? 'mos-good' : pbullNum >= 0.45 ? 'mos-warn' : 'mos-bad';
-      const pbullDelta = pbullNum - 0.55;
+      const pbullNum   = rsn.p_bull || 0;
+      const pbull      = rsn.p_bull != null ? (pbullNum*100).toFixed(0)+'%' : '—';
+      const pbullCls   = pbullNum >= 0.50 ? 'mos-good' : pbullNum >= 0.42 ? 'mos-warn' : 'mos-bad';
+      const pbullDelta = pbullNum - 0.50;   // gate is now 50%, down from 55%
       const pbullSign  = pbullDelta >= 0 ? '+' : '';
       const pbullImpCl = pbullDelta >= 0 ? '#3fb950' : '#f85149';
       const pbullArr   = pbullDelta >= 0 ? '▲' : '▼';
       const pbullImp   = rsn.p_bull != null
-        ? `<small style="color:${pbullImpCl};display:block;font-size:10px">${pbullArr} ${pbullSign}${(pbullDelta*100).toFixed(0)}pp to 55% gate</small>`
+        ? `<small style="color:${pbullImpCl};display:block;font-size:10px">${pbullArr} ${pbullSign}${(pbullDelta*100).toFixed(0)}pp to 50% gate</small>`
         : '';
       quantum = `<span class="${pbullCls}">${rsn.quantum_state||'—'} ${pbull}</span>${pbullImp}`;
 
-      blocker = rsn.blocking_reason
-        ? `<span style="color:#f85149;font-size:11px">${rsn.blocking_reason.substring(0,45)}</span>`
-        : `<span style="color:#3fb950;font-size:11px">—</span>`;
+      // Approved badge or blocker text
+      const isApproved = s.approved || rsn.approved;
+      blocker = isApproved
+        ? `<span style="background:#00c853;color:#000;font-size:10px;font-weight:700;padding:2px 6px;border-radius:3px">✓ APPROVED</span>`
+        : (rsn.blocking_reason
+            ? `<span style="color:#f85149;font-size:11px">${rsn.blocking_reason.substring(0,45)}</span>`
+            : `<span style="color:#3fb950;font-size:11px">—</span>`);
+
+      // Composite score bar
+      const comp     = typeof s.composite_score === 'number' ? s.composite_score : (rsn.composite_score || 0);
+      const compPct  = Math.min(100, Math.max(0, ((comp + 1) / 2) * 100));
+      const compCol  = comp >= 0.15 ? '#3fb950' : comp >= 0 ? '#d29922' : '#f85149';
+      const compSign = comp >= 0 ? '+' : '';
+      compositeCell  = `<div style="display:flex;align-items:center;gap:5px">
+        <div style="width:60px;background:#21262d;border-radius:3px;height:6px">
+          <div style="width:${compPct.toFixed(0)}%;background:${compCol};height:6px;border-radius:3px"></div>
+        </div>
+        <span style="font-size:11px;color:${compCol};font-weight:600">${compSign}${comp.toFixed(3)}</span>
+      </div>`;
+
+      // Momentum + RVOL
+      const mom     = typeof s.momentum_score === 'number' ? s.momentum_score : (rsn.momentum_score || 0);
+      const rvol    = typeof s.rvol === 'number' ? s.rvol : (rsn.rvol || 1.0);
+      const macdDir = s.macd_direction || rsn.macd_signal_direction || 'neutral';
+      const brk52w  = s.is_52w_breakout || rsn.is_52w_breakout;
+      const rvolCol = rvol >= 1.5 ? '#3fb950' : rvol >= 1.0 ? '#d29922' : '#8b949e';
+      const momSign = mom >= 0 ? '+' : '';
+      const macdCol = macdDir === 'bullish' ? '#3fb950' : macdDir === 'bearish' ? '#f85149' : '#8b949e';
+      const brkBadge = brk52w ? ' <span style="background:#e65100;color:#fff;font-size:9px;padding:1px 4px;border-radius:2px">52W↑</span>' : '';
+      momentumCell  = `<span style="color:${momSign==='-'?'#f85149':'#3fb950'};font-size:11px;font-weight:600">${momSign}${mom.toFixed(2)}</span>
+        <small style="color:${rvolCol};display:block;font-size:10px">RVOL ${rvol.toFixed(2)}×${brkBadge}</small>
+        <small style="color:${macdCol};display:block;font-size:10px">${macdDir}</small>`;
     } catch(e) {}
 
-    // Price
-    const price  = s.current_price != null ? '$' + s.current_price.toFixed(2) : '—';
+    // Price — Signal Monitor shows live price (current state view)
+    const _dispPrice = s.live_price != null ? s.live_price : s.current_price;
+    const price  = _dispPrice != null ? '$' + Number(_dispPrice).toFixed(2) : '—';
     const chg    = s.change_pct;
     const chgStr = chg != null ? (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%' : '—';
     const chgCls = chg == null ? '' : chg > 0 ? 'mos-good' : chg < 0 ? 'mos-bad' : '';
@@ -729,13 +1333,27 @@ function renderSignals(signals) {
       ? `<small style="color:${Math.abs(chg)>3?(chg>0?'#3fb950':'#f85149'):'#555'};display:block;font-size:10px">${Math.abs(chg)>3?(chg>0?'▲ bullish signal':'▼ bearish pressure'):'~ neutral move'}</small>`
       : '';
 
-    // UTC → local
+    // UTC → ET
     const utcStr   = s.generated_at.replace(' ', 'T') + 'Z';
-    const localTime = new Date(utcStr).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const localTime = new Date(utcStr).toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
+    const isAiWatch = _aiWatchTickers.includes(s.ticker);
+    const aiWatchBadge = isAiWatch ? ' <span style="background:#7c4dff;color:#fff;font-size:9px;padding:1px 5px;border-radius:2px;vertical-align:middle">AI</span>' : '';
+
+    const _tr = _tipranksData[s.ticker] || {};
+    const _ss  = _tr.smart_score;
+    const _ssBg = _ss >= 8 ? '#1a4731' : _ss >= 4 ? '#3d2b00' : _ss != null ? '#4a1519' : null;
+    const _ssCol = _ss >= 8 ? '#3fb950' : _ss >= 4 ? '#d29922' : _ss != null ? '#f85149' : null;
+    const _ssTip = _tr.buy_pct != null ? `Smart Score ${_ss}/10 | Buy ${_tr.buy_pct.toFixed(0)}% Sell ${(_tr.sell_pct||0).toFixed(0)}%` : `Smart Score ${_ss}/10`;
+    const trBadge = _ss != null
+      ? ` <span style="background:${_ssBg};color:${_ssCol};border:1px solid ${_ssCol};font-size:9px;padding:1px 5px;border-radius:3px;vertical-align:middle;font-weight:700" title="${_ssTip}">&#9733;${_ss}</span>`
+      : '';
 
     html += `<tr${!_isPrimary ? ` class="sig-hist-row" data-ticker="${s.ticker}" style="display:none;opacity:0.75"` : ''}>
-      <td><strong>${s.ticker}</strong>${acted}${_isPrimary && _hasHistory ? `<span onclick="toggleSigHistory('${s.ticker}')" style="cursor:pointer;color:#8b949e;font-size:10px;margin-left:5px;user-select:none" title="${_grp[_tk].length-1} older entr${_grp[_tk].length>2?'ies':'y'}">&#9654;</span>` : ''}</td>
+      <td><strong>${s.ticker}</strong>${aiWatchBadge}${trBadge}${acted}${_isPrimary && _hasHistory ? `<span onclick="toggleSigHistory('${s.ticker}')" style="cursor:pointer;color:#8b949e;font-size:10px;margin-left:5px;user-select:none" title="${_grp[_tk].length-1} older entr${_grp[_tk].length>2?'ies':'y'}">&#9654;</span>` : ''}</td>
       <td class="${origCls}">${dispSignal}</td>
+      <td style="min-width:110px">${compositeCell}</td>
+      <td style="min-width:100px">${momentumCell}</td>
       <td>
         <span style="font-weight:600">${price}</span>
         <small class="${chgCls}" style="display:block">${chgStr}</small>
@@ -775,11 +1393,44 @@ function toggleSigHistory(ticker) {
   rows.forEach(r => { r.style.display = r.style.display === 'none' ? '' : 'none'; });
 }
 
+function buildMainTape(signals) {
+  const track = document.getElementById('main-tape');
+  if (!track) return;
+  // Deduplicate: keep only the latest signal row per ticker
+  const byTicker = new Map();
+  (signals || []).forEach(s => { if (!byTicker.has(s.ticker)) byTicker.set(s.ticker, s); });
+  const items = [...byTicker.values()];
+  if (!items.length) { track.innerHTML = '<span class="mt-neu">No signals yet</span>'; return; }
+  const all = [...items, ...items];
+  track.innerHTML = all.map(s => {
+    const sig  = (s.signal || '').toUpperCase();
+    const isBuy  = sig === 'BUY' || sig === 'STRONG_BUY';
+    const isSell = sig === 'SELL' || sig === 'STRONG_SELL';
+    const chg  = s.change_pct;          // daily price change — drives arrow direction
+    const priceUp = chg != null ? chg >= 0 : null;
+    // Arrow: BUY/SELL signals use bright colors; neutral signals use price change direction
+    let cls, arr;
+    if (isBuy)       { cls = 'mt-bull'; arr = '&#9650;'; }
+    else if (isSell) { cls = 'mt-bear'; arr = '&#9660;'; }
+    else if (priceUp === true)  { cls = 'mt-chg-up';   arr = '&#9650;'; }
+    else if (priceUp === false) { cls = 'mt-chg-dn';   arr = '&#9660;'; }
+    else                        { cls = 'mt-neu';       arr = '&#8212;'; }
+    const p = s.current_price;
+    const chgStr = chg != null ? ' ' + (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%' : '';
+    const price  = p ? ' $' + Number(p).toFixed(2) : '';
+    return '<span class="' + cls + '">' + arr + ' ' + s.ticker + price + chgStr + '</span>'
+         + '<span class="mt-sep">|</span>';
+  }).join('');
+  track.style.animationDuration = Math.max(40, items.length * 0.8) + 's';
+}
+
 async function fetchSignals() {
   try {
     const r = await fetch('/api/signals');
     _cachedSignals = await r.json();
+    await _loadTipranksData();
     renderSignals(_cachedSignals);
+    buildMainTape(_cachedSignals);
   } catch(e) {
     const el = document.getElementById('signals-table');
     if (el && !_cachedSignals.length) el.innerHTML = '<p class="empty">Could not reach server.</p>';
@@ -925,7 +1576,7 @@ async function fetchPositions() {
 
 async function refresh() {
   await Promise.allSettled([fetchStatus(), fetchSignals(), fetchTrades(), fetchLogs(), fetchPositions()]);
-  document.getElementById('refresh-ts').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  document.getElementById('refresh-ts').textContent = 'Updated ' + new Date().toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit'}) + ' ET';
 }
 
 async function fetchIToolPreview() {
@@ -955,6 +1606,109 @@ async function fetchPaperPreview() {
 fetchBriefPreview();
 fetchIToolPreview();
 fetchPaperPreview();
+
+// ── Hero card loaders ─────────────────────────────────────────────────────────
+async function loadHeroBrief() {
+  try {
+    const d = await fetch('/api/morning-brief').then(r => r.json());
+    if (d.error) { document.getElementById('hc-brief-text').textContent = 'Brief not yet available.'; return; }
+    const idx = d.indices || {}, fut = d.futures || {}, com = d.commodities || {},
+          cry = d.crypto  || {}, rat = d.rates   || {};
+    const fmtPct = (v) => v == null ? null : (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+    const fmtPrice = (v) => v == null ? null : v.toFixed(2);
+    const items = [
+      { label: 'S&P Fut',  val: fmtPct(fut['ES (S&P)']?.pct),           pct: fut['ES (S&P)']?.pct },
+      { label: 'VIX',      val: fmtPrice(idx['VIX']?.price),             pct: -(idx['VIX']?.price - 20) },
+      { label: 'Oil',      val: fmtPct(com['Oil WTI']?.pct),             pct: com['Oil WTI']?.pct },
+      { label: 'Gold',     val: fmtPct(com['Gold']?.pct),                pct: com['Gold']?.pct },
+      { label: 'BTC',      val: fmtPct(cry['Bitcoin']?.pct),             pct: cry['Bitcoin']?.pct },
+      { label: '10yr',     val: fmtPrice(rat['10yr Yield']?.price) ? fmtPrice(rat['10yr Yield']?.price) + '%' : null, pct: 0 },
+      { label: 'Nasdaq',   val: fmtPct(idx['Nasdaq']?.pct),              pct: idx['Nasdaq']?.pct },
+      { label: 'Dow',      val: fmtPct(idx['Dow Jones']?.pct),           pct: idx['Dow Jones']?.pct },
+    ].filter(i => i.val != null);
+    const marketsEl = document.getElementById('hc-brief-markets');
+    marketsEl.innerHTML = items.map(i => {
+      const col = i.pct == null ? '#8b949e' : i.pct > 0 ? '#3fb950' : i.pct < 0 ? '#f85149' : '#8b949e';
+      return `<span style="display:flex;justify-content:space-between;gap:4px"><span style="color:#8b949e">${i.label}</span><span style="color:${col};font-weight:600">${i.val}</span></span>`;
+    }).join('');
+    const txt = d.narrative || d.summary || '';
+    document.getElementById('hc-brief-text').textContent = txt.slice(0, 380) + (txt.length > 380 ? '…' : '');
+    const wsb = (d.wsb || []).slice(0, 4).map(t => typeof t === 'string' ? t : t.ticker || t).filter(Boolean);
+    const wsbEl = document.getElementById('hc-brief-wsb');
+    if (wsb.length) wsbEl.innerHTML = '&#x1F4AC; WSB: ' + wsb.map(t => `<span style="color:#d29922;font-weight:700">${t}</span>`).join(' &middot; ');
+  } catch(e) { document.getElementById('hc-brief-text').textContent = 'Brief unavailable.'; }
+}
+
+async function loadHeroPositions() {
+  try {
+    const acct = await fetch('/api/paper/account').then(r => r.json());
+    const eq   = acct.total_equity || 0;
+    const pnl  = acct.total_pnl    || 0, pct  = acct.total_pnl_pct    || 0;  // return on invested
+    const lpnl = acct.lifetime_pnl || 0, lpct = acct.lifetime_pnl_pct || 0;  // vs $100k
+    const dpnl = acct.daily_pnl    || 0, dpct = acct.daily_pnl_pct    || 0;
+    document.getElementById('hc-paper-equity').textContent =
+      '$' + eq.toLocaleString('en-US', {minimumFractionDigits:0, maximumFractionDigits:0});
+    const pnlEl = document.getElementById('hc-paper-pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(0) + ' Return (' + pct.toFixed(1) + '%)';
+    pnlEl.style.color = pnl >= 0 ? '#3fb950' : '#f85149';
+    const dCardEl = document.getElementById('hc-paper-daily');
+    if (dCardEl) {
+      dCardEl.textContent = (dpnl >= 0 ? '+' : '') + '$' + Math.abs(dpnl).toFixed(0) + ' Daily (' + dpct.toFixed(1) + '%)';
+      dCardEl.style.color = dpnl >= 0 ? '#3fb950' : '#f85149';
+    }
+    // Header P&L badges — show return-on-invested for Total, daily for Daily
+    const fmtBadge = (v, p, label) => {
+      const col = v >= 0 ? '#3fb950' : '#f85149';
+      const sign = v >= 0 ? '+' : '';
+      return `${label}: <span style="color:${col};font-weight:700">${sign}$${Math.abs(v).toFixed(0)} (${sign}${p.toFixed(1)}%)</span>`;
+    };
+    const dEl = document.getElementById('hdr-daily-pnl');
+    const tEl = document.getElementById('hdr-total-pnl');
+    if (dEl) { dEl.innerHTML = fmtBadge(dpnl, dpct, 'Daily');  dEl.style.borderColor = dpnl >= 0 ? '#1a4731' : '#4a1519'; }
+    if (tEl) { tEl.innerHTML = fmtBadge(pnl,  pct,  'Return'); tEl.style.borderColor = pnl  >= 0 ? '#1a4731' : '#4a1519'; }
+    const pos = (acct.positions || []).slice(0, 4);
+    const el = document.getElementById('hc-pos-list');
+    if (!pos.length) { el.innerHTML = '<span style="color:#8b949e;font-size:11px">No open positions</span>'; return; }
+    el.innerHTML = pos.map(p => {
+      const pc = p.pnl_pct || 0;
+      return '<div class="hero-pos-row"><span style="font-weight:700">' + p.ticker + '</span>'
+           + '<span style="color:' + (pc >= 0 ? '#3fb950' : '#f85149') + '">'
+           + (pc >= 0 ? '+' : '') + pc.toFixed(1) + '%</span></div>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function loadHeroTrades() {
+  try {
+    const [live, paper] = await Promise.all([
+      fetch('/api/trades').then(r => r.json()).catch(() => []),
+      fetch('/api/paper/trades').then(r => r.json()).catch(() => []),
+    ]);
+    const merged = [
+      ...(paper || []).slice(0, 5).map(t => ({...t, _src: 'P'})),
+      ...(live  || []).slice(0, 3).map(t => ({...t, _src: 'L'})),
+    ].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')).slice(0, 6);
+    const el = document.getElementById('hc-trade-list');
+    if (!merged.length) { el.innerHTML = '<span style="color:#8b949e;font-size:11px">No trades yet</span>'; return; }
+    el.innerHTML = merged.map(t => {
+      const dt = t.timestamp
+        ? new Date(t.timestamp + 'Z').toLocaleDateString('en-US', {timeZone:'America/New_York',month:'2-digit',day:'2-digit'})
+          + ' ' + new Date(t.timestamp + 'Z').toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'})
+        : '\u2014';
+      return '<div class="hero-trade-row">'
+           + '<span style="color:#8b949e;font-size:10px;white-space:nowrap">' + dt + '</span>'
+           + '<span style="font-weight:700">' + t.ticker + '</span>'
+           + '<span style="color:' + (t.action === 'BUY' ? '#3fb950' : '#f85149') + '">' + t.action + '</span>'
+           + '<span style="color:#8b949e;margin-left:auto">[' + t._src + ']</span>'
+           + '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
+loadHeroBrief();
+loadHeroPositions();
+loadHeroTrades();
+setInterval(() => { loadHeroPositions(); loadHeroTrades(); }, 30000);
 
 refresh();
 setInterval(refresh, 15000);
@@ -1002,25 +1756,32 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
          grid-template-columns: 2fr 1fr; gap: 16px; }
   .full { grid-column: 1 / -1; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
-  h2 { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px;
-       border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 10px; }
+  h2 { font-size: 12px; color: #adb5bd; text-transform: uppercase; letter-spacing: 1px;
+       border-bottom: 1px solid #30363d; padding-bottom: 6px; margin-bottom: 10px; font-weight: 700; }
   /* Narrative HTML from Claude */
-  #narrative h3 { font-size: 14px; color: #e6edf3; margin: 16px 0 8px; }
+  #narrative h3 { font-size: 14px; color: #e6edf3; margin: 16px 0 8px; font-weight: 700; }
   #narrative h3:first-child { margin-top: 0; }
   #narrative ul { padding-left: 18px; margin: 6px 0; }
   #narrative li { margin-bottom: 4px; color: #c9d1d9; }
   #narrative p  { color: #c9d1d9; margin-bottom: 8px; }
+  #narrative strong { color: #e6edf3; }
   #narrative table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; }
-  #narrative th { color: #8b949e; text-align: left; padding: 3px 8px; border-bottom: 1px solid #21262d; }
-  #narrative td { padding: 4px 8px; border-top: 1px solid #161b22; }
+  #narrative th { color: #adb5bd; text-align: left; padding: 5px 8px;
+                  border-bottom: 2px solid #30363d; background: #1c2128; font-weight: 600; }
+  #narrative td { padding: 5px 8px; border-top: 1px solid #21262d; color: #c9d1d9; }
+  #narrative tr:nth-child(even) td { background: #161b22; }
+  #narrative tr:nth-child(odd)  td { background: #0d1117; }
+  #narrative tr:hover td { background: #1f2937; }
   .up   { color: #3fb950; font-weight: 600; }
   .down { color: #f85149; font-weight: 600; }
-  /* Data tables */
+  /* Data tables (right-panel structured data) */
   table.data { width: 100%; border-collapse: collapse; font-size: 12px; }
-  table.data th { color: #8b949e; text-align: left; padding: 3px 6px;
-                  font-weight: 500; border-bottom: 1px solid #21262d; font-size: 11px; }
-  table.data td { padding: 4px 6px; border-top: 1px solid #161b22; }
-  table.data tr:hover td { background: #1c2128; }
+  table.data th { color: #adb5bd; text-align: left; padding: 4px 6px;
+                  font-weight: 600; border-bottom: 2px solid #30363d;
+                  background: #1c2128; font-size: 11px; }
+  table.data td { padding: 5px 6px; border-top: 1px solid #21262d; color: #c9d1d9; }
+  table.data tr:nth-child(even) td { background: #161b22; }
+  table.data tr:hover td { background: #1f2937; }
   .pos { color: #3fb950; } .neg { color: #f85149; } .neu { color: #8b949e; }
   /* WSB pips */
   .wsb-row { display: flex; align-items: center; gap: 6px; padding: 4px 0;
@@ -1066,9 +1827,48 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
   .mb-toast.show { opacity: 1; }
   .mb-toast.ok  { background: #1a3a1a; color: #3fb950; border: 1px solid #238636; }
   .mb-toast.err { background: #3a1a1a; color: #f85149; border: 1px solid #da3633; }
+  /* ── Ticker tape (morning brief) ──────────────────────────── */
+  .mb-tape-wrap  { overflow: hidden; background: #0a0f17;
+                   border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0; }
+  .mb-tape-track { display: flex; gap: 24px; white-space: nowrap; will-change: transform;
+                   animation: mb-tape 80s linear infinite; align-items: center; height: 100%;
+                   padding-left: 12px; }
+  .mb-tape-track:hover { animation-play-state: paused; }
+  @keyframes mb-tape { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
+  .mbt-bull { color: #3fb950; font-size: 12px; font-weight: 700; }
+  .mbt-bear { color: #f85149; font-size: 12px; font-weight: 700; }
+  .mbt-neu  { color: #8b949e; font-size: 12px; }
+  .mbt-sep  { color: #30363d; font-size: 10px; }
+  /* ── Brief info modal ─────────────────────────────────────── */
+  .mb-info-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8);
+                     display: none; align-items: center; justify-content: center; z-index: 9999; }
+  .mb-info-overlay.open { display: flex; }
+  .mb-info-modal { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+                   padding: 24px; max-width: 520px; width: 92%; max-height: 88vh; overflow-y: auto; }
+  .mb-info-modal h2 { font-size: 15px; color: #58a6ff; margin-bottom: 14px; }
+  .mb-info-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: flex-start; }
+  .mb-info-tag { font-size: 10px; font-weight: 700; color: #e6edf3; min-width: 110px;
+                 background: #21262d; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; }
+  .mb-info-desc { font-size: 12px; color: #8b949e; line-height: 1.5; }
+  .mb-info-close { float: right; background: none; border: 1px solid #30363d;
+                   color: #8b949e; cursor: pointer; padding: 4px 10px; border-radius: 4px; font-size: 12px; }
+  .mb-info-close:hover { color: #f85149; }
 </style>
 </head>
 <body>
+<!-- Brief info modal -->
+<div class="mb-info-overlay" id="mb-info-overlay" onclick="if(event.target===this)document.getElementById('mb-info-overlay').classList.remove('open')">
+  <div class="mb-info-modal">
+    <button class="mb-info-close" onclick="document.getElementById('mb-info-overlay').classList.remove('open')">&#x2715; Close</button>
+    <h2>&#9432; About the Morning Brief</h2>
+    <div class="mb-info-row"><span class="mb-info-tag">AI Narrator</span><span class="mb-info-desc">Market narrative generated by Google Gemini Flash (primary) with Claude Haiku as fallback. Synthesizes macro data, futures, indices, rates, and watchlist fundamentals.</span></div>
+    <div class="mb-info-row"><span class="mb-info-tag">Data sources</span><span class="mb-info-desc">Pre-market futures + indices via yfinance · News headlines via RSS feeds · WSB trending via Reddit API · Congressional trades via house.gov / senate.gov disclosures.</span></div>
+    <div class="mb-info-row"><span class="mb-info-tag">Refresh schedule</span><span class="mb-info-desc">Auto-generated at 6:00am and 9:00am ET Monday–Friday. Click "Regenerate" to force a fresh brief at any time.</span></div>
+    <div class="mb-info-row"><span class="mb-info-tag">Ticker tape</span><span class="mb-info-desc">Shows current BUY/SELL signals from the NWO pipeline with latest DB close prices.</span></div>
+    <div class="mb-info-row"><span class="mb-info-tag">+S1 / +S2 buttons</span><span class="mb-info-desc">Add a ticker to Stage 1 (monitoring only) or Stage 2 (active AI pipeline + paper trading) in the Stage Gate. Use on WSB trending tickers or any stock in the headlines.</span></div>
+    <div class="mb-info-row"><span class="mb-info-tag">Top Headlines</span><span class="mb-info-desc">Financial news headlines aggregated from major sources. Click any headline to open full article. Shown at top for quick daily scanning.</span></div>
+  </div>
+</div>
 <header>
   <a class="back-btn" href="/">← Dashboard</a>
   <h1>📊 Morning Market Brief</h1>
@@ -1081,10 +1881,18 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
     <button class="mb-add-s1" onclick="mbAddToStage(document.getElementById('mb-ticker-input').value,'1')" title="Add to Stage 1 (Monitoring)">+S1</button>
     <button class="mb-add-s2" onclick="mbAddToStage(document.getElementById('mb-ticker-input').value,'2')" title="Add to Stage 2 (Active AI)">+S2</button>
   </div>
+  <button style="padding:5px 10px;border-radius:6px;border:1px solid #30363d;background:transparent;color:#58a6ff;cursor:pointer;font-size:12px;white-space:nowrap;" onclick="document.getElementById('mb-info-overlay').classList.add('open')" title="About this brief">&#9432; About</button>
   <button class="refresh-btn" id="refresh-btn" onclick="loadBrief(true)">&#8635; Regenerate</button>
 </header>
+<div class="mb-tape-wrap"><div class="mb-tape-track" id="mb-tape"><span class="mbt-neu">Loading signals...</span></div></div>
 
 <main id="main-grid" style="display:none">
+  <!-- Headlines first — quick scan at top -->
+  <div class="card full">
+    <h2>Top Headlines</h2>
+    <div id="headlines-panel" style="columns:2;column-gap:20px"></div>
+  </div>
+
   <!-- Left: AI narrative (full width if no API key, else 2/3) -->
   <div class="card" id="narrative-card">
     <h2>Market Narrative <span id="spinner">⟳ Generating...</span></h2>
@@ -1129,12 +1937,6 @@ MORNING_BRIEF_HTML = """<!DOCTYPE html>
   <div class="card">
     <h2>Capitol Hill Trades</h2>
     <div id="congress-panel"></div>
-  </div>
-
-  <!-- Headlines full width -->
-  <div class="card full">
-    <h2>Top Headlines</h2>
-    <div id="headlines-panel" style="columns:2;column-gap:20px"></div>
   </div>
 </main>
 <div id="loading-screen" style="padding:40px;text-align:center;color:#8b949e">
@@ -1207,7 +2009,7 @@ let _pollTimer = null;
 let _lastGenTime = null;
 
 function renderBrief(d) {
-  const gt = d.generated_at ? new Date(d.generated_at + 'Z').toLocaleString() : '—';
+  const gt = d.generated_at ? new Date(d.generated_at + 'Z').toLocaleString('en-US', {timeZone:'America/New_York',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) + ' ET' : '—';
   document.getElementById('gen-time').textContent = 'Generated: ' + gt;
 
   document.getElementById('futures-table').innerHTML     = buildTable(d.futures);
@@ -1305,10 +2107,9 @@ async function loadBrief(forceRefresh = false) {
 let _hbOk = false;
 function _nextBriefTime() {
   const now = new Date();
-  // Brief auto-regenerates at 06:00 and 09:00 ET — approximate with local time offsets
-  const etOffset = -5 * 60;  // ET = UTC-5 (approximate; ignores DST)
-  const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
-  const etMins  = ((utcMins + etOffset) % (24 * 60) + 24 * 60) % (24 * 60);
+  // Brief auto-regenerates at 06:00 and 09:00 ET
+  const etNow  = new Date(now.toLocaleString('en-US', {timeZone: 'America/New_York'}));
+  const etMins = etNow.getHours() * 60 + etNow.getMinutes();
   const slots   = [6 * 60, 9 * 60];
   let next = null;
   for (const s of slots) { if (etMins < s) { next = s; break; } }
@@ -1366,6 +2167,38 @@ async function mbAddToStage(ticker, stage) {
 }
 
 loadBrief();
+
+// ── Morning Brief ticker tape ─────────────────────────────────────────────────
+(async function buildMbTape() {
+  try {
+    const sigs = await fetch('/api/signals').then(r => r.json());
+    const track = document.getElementById('mb-tape');
+    if (!track) return;
+    const items = (sigs || []).filter(s => {
+      const sig = (s.signal || '').toUpperCase();
+      return sig === 'BUY' || sig === 'STRONG_BUY' || sig === 'SELL' || sig === 'STRONG_SELL';
+    });
+    if (!items.length) { track.innerHTML = '<span class="mbt-neu">No active signals</span>'; return; }
+    const all = [...items, ...items];
+    track.innerHTML = all.map(s => {
+      const sig  = (s.signal || '').toUpperCase();
+      const bull = sig === 'BUY' || sig === 'STRONG_BUY';
+      const cls  = bull ? 'mbt-bull' : 'mbt-bear';
+      const arr  = bull ? '&#9650;' : '&#9660;';
+      const _lp = s.live_price || s.current_price;
+      const price = _lp ? ' $' + Number(_lp).toFixed(2) : '';
+      return '<span class="' + cls + '">' + arr + ' ' + s.ticker + price + '</span>'
+           + '<span class="mbt-sep">|</span>';
+    }).join('');
+    track.style.animationDuration = Math.max(40, items.length * 0.8) + 's';
+  } catch(e) {}
+})();
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('mb-info-overlay').classList.remove('open');
+  }
+});
 </script>
 </body>
 </html>
@@ -1460,7 +2293,7 @@ async function loadStatus() {
     const dryRun  = d.dry_run;
     const vix     = d.vix_level != null ? d.vix_level.toFixed(1) : '—';
     const regime  = d.market_regime || '—';
-    const lastCyc = d.last_cycle ? new Date(d.last_cycle.replace(' ','T')+'Z').toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '—';
+    const lastCyc = d.last_cycle ? new Date(d.last_cycle.replace(' ','T')+'Z').toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'}) + ' ET' : '—';
     document.getElementById('status-bar').innerHTML =
       `<span class="dot ${paused?'dot-red':'dot-green'}"></span>`+
       `<span class="pill ${paused?'pill-red':'pill-green'}">${paused?'PAUSED':'LIVE'}</span>`+
@@ -1510,15 +2343,28 @@ async function loadSignals() {
       const fudDelta = (fudVal-0.60).toFixed(2);
       const fudCls   = fudVal>=0.60?'good':'bad';
 
-      // Price
-      const price  = s.current_price!=null?'$'+s.current_price.toFixed(2):'—';
+      // Price — AI Signal History: label depends on source
+      //   "exact" = stored live price at signal time  → plain price
+      //   "eod"   = EOD close for signal date (approx) → amber "~EOD" badge
+      //   null    = no historical data                 → live price with blue "now" badge
+      const _histP  = s.current_price;
+      const _liveP  = s.live_price;
+      const _src    = s.price_source;
+      const price   = _histP != null
+        ? '$' + Number(_histP).toFixed(2)
+          + (_src === 'eod'
+              ? '<small style="color:#d29922;font-size:9px" title="EOD close for signal date — intraday price not available"> ~EOD</small>'
+              : '')
+        : (_liveP != null
+            ? '$' + Number(_liveP).toFixed(2) + '<small style="color:#58a6ff;font-size:9px"> now</small>'
+            : '—');
       const chg    = s.change_pct;
       const chgStr = chg!=null?(chg>=0?'+':'')+chg.toFixed(2)+'%':'—';
       const chgCls = chg==null?'dim':chg>0?'good':'bad';
 
-      // Time
+      // Time (ET)
       const utcStr = s.generated_at.replace(' ','T')+'Z';
-      const t = new Date(utcStr).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      const t = new Date(utcStr).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'});
 
       html += `<tr>
         <td><strong>${s.ticker}</strong></td>
@@ -1677,7 +2523,86 @@ def _trigger_brief_generation():
 
 @app.get("/morning-brief", response_class=HTMLResponse)
 def morning_brief_page():
-    return MORNING_BRIEF_HTML
+    html = MORNING_BRIEF_HTML
+    html = html.replace('</style>', _NAV_CSS + '</style>', 1)
+    html = html.replace('<a class="back-btn" href="/">&#8592; Dashboard</a>', _nav_html('brief'), 1)
+    html = html.replace('<a class="back-btn" href="/">← Dashboard</a>', _nav_html('brief'), 1)
+    return html
+
+
+@app.get("/live-trading", response_class=HTMLResponse)
+def live_trading_page():
+    nav = _nav_html('live')
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Trading — NWO Monitor</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  body {{ margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+  header {{ padding: 10px 16px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+  .header-right {{ margin-left: auto; display: flex; gap: 8px; align-items: center; }}
+  {_NAV_CSS}
+  .lt-hero {{ display: flex; flex-direction: column; align-items: center; justify-content: center;
+               padding: 80px 24px; text-align: center; }}
+  .lt-badge {{ background: rgba(210,153,34,0.15); border: 1px solid #d29922; color: #d29922;
+                border-radius: 20px; padding: 4px 16px; font-size: 12px; font-weight: 700;
+                letter-spacing: 1px; text-transform: uppercase; margin-bottom: 24px; }}
+  .lt-title {{ font-size: 32px; font-weight: 800; margin-bottom: 12px; }}
+  .lt-sub   {{ font-size: 14px; color: #8b949e; max-width: 560px; line-height: 1.75; margin-bottom: 32px; }}
+  .lt-grid  {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; max-width: 780px; width: 100%; }}
+  .lt-card  {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px;
+               text-align: left; }}
+  .lt-card-title {{ font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 8px; }}
+  .lt-card-val   {{ font-size: 14px; font-weight: 600; color: #8b949e; }}
+  .lt-card-val.ready {{ color: #3fb950; }}
+</style>
+</head>
+<body>
+<div class="sticky-banner">
+  <header>
+    <h1 style="font-size:16px;margin:0;font-weight:700;">&#128185; Live Trading</h1>
+    <div class="header-right">{nav}</div>
+  </header>
+  <div class="sh-tape-wrap"><div class="sh-tape-track" id="sh-tape"><span class="sht-neu">Loading…</span></div></div>
+</div>
+<div class="lt-hero">
+  <div class="lt-badge">&#9888; Coming Soon</div>
+  <div class="lt-title">&#128185; Live Trading</div>
+  <div class="lt-sub">
+    Real order execution through the Schwab Trader API using the identical 6-layer AI pipeline as Paper Trade.
+    This page will mirror the Paper Trade interface once live trading is enabled.<br><br>
+    <b style="color:#d29922">Dry-run mode remains ON</b> until the account owner explicitly flips the switch.
+    All risk controls — max 5% position, 25% sector cap, 3% daily loss halt — are enforced at all times.
+  </div>
+  <div class="lt-grid">
+    <div class="lt-card">
+      <div class="lt-card-title">&#128274; Auth / OAuth</div>
+      <div class="lt-card-val ready">&#10003; Ready</div>
+    </div>
+    <div class="lt-card">
+      <div class="lt-card-title">&#128202; AI Pipeline</div>
+      <div class="lt-card-val ready">&#10003; Ready (Paper)</div>
+    </div>
+    <div class="lt-card">
+      <div class="lt-card-title">&#128176; Live Execution</div>
+      <div class="lt-card-val">&#9711; Pending sign-off</div>
+    </div>
+    <div class="lt-card">
+      <div class="lt-card-title">&#128737; Risk Controls</div>
+      <div class="lt-card-val ready">&#10003; Enforced</div>
+    </div>
+    <div class="lt-card">
+      <div class="lt-card-title">&#127919; Stop / Target Monitor</div>
+      <div class="lt-card-val ready">&#10003; Ready</div>
+    </div>
+    <div class="lt-card">
+      <div class="lt-card-title">&#128483; Multi-user Scope</div>
+      <div class="lt-card-val">&#9711; In design</div>
+    </div>
+  </div>
+</div>
+{_NAV_TAPE_JS}
+</body></html>""")
 
 
 @app.get("/jstest", response_class=HTMLResponse)
@@ -2123,7 +3048,8 @@ async function loadScan() {
 
     const gt = new Date(d.generated_at + 'Z');
     document.getElementById('scan-info').textContent =
-      'Scanned ' + gt.toLocaleDateString() + ' ' + gt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+      'Scanned ' + gt.toLocaleDateString('en-US', {timeZone:'America/New_York',month:'2-digit',day:'2-digit'})
+      + ' ' + gt.toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'}) + ' ET';
 
     const c = d.counts || {};
     document.getElementById('status-bar').innerHTML =
@@ -2230,6 +3156,13 @@ function renderTable(results) {
     const cls = active ? (_sortDir === 1 ? 'sort-asc' : 'sort-desc') : '';
     return '<th class="sortable ' + cls + '" onclick="setSort(\\'' + col + '\\')">' + label + '<span class="sort-arrow">' + arrow + '</span></th>';
   }
+  const scanTs = (_scanData && _scanData.generated_at)
+    ? new Date(_scanData.generated_at + 'Z').toLocaleString('en-US', {
+        timeZone: 'America/New_York',
+        month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit'
+      }) + ' ET'
+    : '&#8212;';
   let html = '<table><tr>' +
     '<th>Ticker</th>' +
     sortTh('price','Price') +
@@ -2237,7 +3170,7 @@ function renderTable(results) {
     sortTh('sma50','SMA50') +
     sortTh('macd_hist','MACD Hist') +
     sortTh('stoch_k','Stoch %K') +
-    '<th>Signal</th><th>Chart</th>' +
+    '<th>Signal</th><th>Scanned</th><th>Chart</th>' +
     '</tr>';
   for (const r of results) {
     const sigCls  = r.signal === 'bullish' ? 'sig-bull' : 'sig-bear';
@@ -2252,6 +3185,7 @@ function renderTable(results) {
       '<td class="' + mCls + '">' + r.macd_hist.toFixed(4) + '</td>' +
       '<td class="' + kCls + '">' + r.stoch_k.toFixed(1) + '</td>' +
       '<td class="' + sigCls + '">' + sigIcon + ' ' + r.signal.toUpperCase() + '</td>' +
+      '<td style="font-size:11px;color:#8b949e;white-space:nowrap;">' + scanTs + '</td>' +
       '<td><button class="chart-btn" onclick="event.stopPropagation();openChart(\\'' +
         r.ticker + '\\')">Chart</button>' +
       ' <button class="it-add-btn it-add-s1" onclick="event.stopPropagation();itAddToStage(\\'' + r.ticker + '\\',\\'1\\')" title="Add to Stage 1">+S1</button>' +
@@ -2498,19 +3432,35 @@ def api_itool_refresh():
 @app.get("/i-tool", response_class=HTMLResponse)
 def itool_page():
     from fastapi.responses import HTMLResponse as HR
-    return HR(content=ITOOL_HTML, headers={"Cache-Control": "no-store"})
+    html = ITOOL_HTML
+    html = html.replace('</style>', _NAV_CSS + '</style>', 1)
+    html = html.replace('<a href="/" class="back-btn">&#8592; Dashboard</a>', _nav_html('itool'), 1)
+    # Sticky wrapper + tape arrow fix (I-Tool has its own tape, not sh-tape)
+    sticky_js = ('<script>(function(){var h=document.querySelector("header");'
+                 'if(!h||h.closest(".sticky-banner"))return;'
+                 'var t=h.nextElementSibling;var isTape=t&&t.className&&t.className.indexOf("tape")>=0;'
+                 'var w=document.createElement("div");w.className="sticky-banner";'
+                 'h.parentNode.insertBefore(w,h);w.appendChild(h);if(isTape)w.appendChild(t);})();</script>')
+    html = html.replace('</body>', sticky_js + '\n</body>', 1)
+    return HR(content=html, headers={"Cache-Control": "no-store"})
 
 
 
 # ── Paper Trading Dashboard ───────────────────────────────────────────────────
 
 
+def _get_paper_executor(model: str = "standard"):
+    from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS
+    from models.database import init_db as _init_db
+    _, _Session = _init_db(config.database.url, echo=False)
+    cfg = PAPER_MODEL_CONFIGS.get(model, PAPER_MODEL_CONFIGS["standard"])
+    return PaperExecutor(main_db_session_factory=_Session, db_path=cfg["db"],
+                         stagegate_file=cfg["stagegate"])
 
-# ── Paper Trading Dashboard ───────────────────────────────────────────────────
 
-PAPER_HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>Paper Trading \\u2014 NWO</title>\n<style>\n  * { box-sizing: border-box; margin: 0; padding: 0; }\n  body { background: #0d1117; color: #e6edf3; font-family: \'Segoe UI\', monospace; font-size: 14px; }\n  header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;\n           display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }\n  .back-btn { padding: 5px 12px; border-radius: 6px; border: 1px solid #30363d;\n              background: #21262d; color: #8b949e; text-decoration: none; font-size: 12px; }\n  header h1 { font-size: 17px; letter-spacing: 1px; color: #58a6ff; }\n  .header-right { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }\n  .run-btn   { padding: 6px 16px; border-radius: 6px; border: 1px solid #3fb950;\n               background: #1a4731; color: #3fb950; cursor: pointer; font-size: 12px; font-weight: 600; }\n  .run-btn:hover { background: #1e5c3a; }\n  .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }\n  .reset-btn { padding: 5px 14px; border-radius: 6px; border: 1px solid #f85149;\n               background: transparent; color: #f85149; cursor: pointer; font-size: 12px; }\n  .reset-btn:hover { background: rgba(248,81,73,0.1); }\n  .refresh-btn { padding: 5px 14px; border-radius: 6px; border: 1px solid #30363d;\n                 background: #21262d; color: #8b949e; cursor: pointer; font-size: 12px; }\n  #run-status { font-size: 11px; color: #d29922; }\n  main { padding: 16px; display: grid; gap: 16px; }\n  /* Summary cards */\n  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }\n  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }\n  .card-label { font-size: 10px; color: #8b949e; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }\n  .card-value { font-size: 22px; font-weight: 700; }\n  .card-sub { font-size: 11px; color: #8b949e; margin-top: 4px; }\n  .up { color: #3fb950; } .dn { color: #f85149; } .neu { color: #8b949e; }\n  /* Swim lanes */\n  .swim-wrap { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }\n  .lane { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; min-width: 0; }\n  .lane-header { padding: 10px 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;\n                 text-transform: uppercase; border-bottom: 1px solid #21262d; }\n  .lane-0 .lane-header { color: #58a6ff; border-top: 3px solid #58a6ff; }\n  .lane-1 .lane-header { color: #d29922; border-top: 3px solid #d29922; }\n  .lane-2 .lane-header { color: #3fb950; border-top: 3px solid #3fb950; }\n  .lane-sub { font-size: 10px; color: #8b949e; font-weight: 400; margin-top: 2px; }\n  .lane-body { padding: 8px; display: flex; flex-direction: column; gap: 6px; min-height: 80px; }\n  .signal-card { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;\n                 padding: 8px 10px; font-size: 12px; }\n  .sig-ticker { font-weight: 700; font-size: 13px; }\n  .sig-bull { color: #3fb950; } .sig-bear { color: #f85149; }\n  .sig-meta { font-size: 10px; color: #8b949e; margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; }\n  .lane-empty { color: #8b949e; font-size: 12px; font-style: italic; padding: 12px; text-align: center; }\n  /* Tables */\n  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }\n  .section-title { padding: 10px 14px; font-size: 12px; font-weight: 600; letter-spacing: 1px;\n                   color: #8b949e; border-bottom: 1px solid #21262d; text-transform: uppercase; }\n  table { width: 100%; border-collapse: collapse; }\n  th { padding: 8px 12px; text-align: left; font-size: 11px; color: #8b949e;\n       font-weight: 600; letter-spacing: 0.5px; border-bottom: 1px solid #21262d; }\n  td { padding: 8px 12px; font-size: 13px; border-bottom: 1px solid #161b22; }\n  tr:last-child td { border-bottom: none; }\n  tr:hover td { background: #1c2128; }\n  .empty { color: #8b949e; font-style: italic; padding: 20px; text-align: center; display: block; }\n  @media (max-width: 800px) {\n    .swim-wrap { grid-template-columns: 1fr; }\n    .cards { grid-template-columns: 1fr 1fr; }\n    th:nth-child(n+5), td:nth-child(n+5) { display: none; }\n  }\n</style>\n</head>\n<body>\n<header>\n  <a href="/" class="back-btn">&#8592; Dashboard</a>\n  <h1>&#127918; Paper Trading</h1>\n  <div class="header-right">\n    <span id="run-status"></span>\n    <button class="run-btn" id="run-btn" onclick="runNow()">&#9654; Run Now</button>\n    <button class="refresh-btn" onclick="load()">&#8635; Refresh</button>\n    <button class="reset-btn" onclick="resetAccount()">&#x21BA; Reset</button>\n  </div>\n</header>\n<div id="sched-bar" style="background:#0d1117;border-bottom:1px solid #21262d;padding:4px 20px;font-size:11px;color:#8b949e;display:flex;gap:16px;flex-wrap:wrap;">\n  <span id="sched-mode">&#9711; Auto: loading...</span>\n  <span id="sched-last"></span>\n  <span id="sched-next"></span>\n  <span id="sched-stops"></span>\n  <button id="sched-toggle" onclick="toggleScheduler()" style="margin-left:auto;background:none;border:1px solid #30363d;color:#8b949e;font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer">Pause</button>\n</div>\n<main>\n  <!-- Summary cards -->\n  <div class="cards">\n    <div class="card"><div class="card-label">Total Equity</div><div class="card-value" id="c-equity">\\u2014</div><div class="card-sub">Starting: $100,000</div></div>\n    <div class="card"><div class="card-label">Cash</div><div class="card-value" id="c-cash">\\u2014</div><div class="card-sub" id="c-cash-sub">&nbsp;</div></div>\n    <div class="card"><div class="card-label">Invested</div><div class="card-value" id="c-invested">\\u2014</div><div class="card-sub" id="c-invested-sub">&nbsp;</div></div>\n    <div class="card"><div class="card-label">Total P&amp;L</div><div class="card-value" id="c-pnl">\\u2014</div><div class="card-sub" id="c-pnl-sub">&nbsp;</div></div>\n  </div>\n  <!-- Three model swim lanes -->\n  <div class="swim-wrap" id="swim-wrap">\n    <div class="lane lane-0"><div class="lane-header">&#9899; Standard<div class="lane-sub">Conf &gt;50% &middot; MoS &gt;15% &middot; FUD &gt;0.60</div></div><div class="lane-body" id="lane-0"><span class="lane-empty">Loading...</span></div></div>\n    <div class="lane lane-1"><div class="lane-header">&#9898; Relaxed \\u221225%<div class="lane-sub">Conf &gt;37.5% &middot; MoS &gt;11.25% &middot; FUD &gt;0.45</div></div><div class="lane-body" id="lane-1"><span class="lane-empty">Loading...</span></div></div>\n    <div class="lane lane-2"><div class="lane-header">&#9711; Relaxed \\u221250%<div class="lane-sub">Conf &gt;25% &middot; MoS &gt;7.5% &middot; FUD &gt;0.30</div></div><div class="lane-body" id="lane-2"><span class="lane-empty">Loading...</span></div></div>\n  </div>\n  <!-- Open Positions -->\n  <div class="section">\n    <div class="section-title">Open Positions</div>\n    <div id="positions-wrap"><span class="empty">Loading...</span></div>\n  </div>\n  <!-- Trade History -->\n  <div class="section">\n    <div class="section-title">Trade History</div>\n    <div id="trades-wrap"><span class="empty">Loading...</span></div>\n  </div>\n</main>\n<script src="/paper.js"></script>\n</body>\n</html>'
+PAPER_HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>Paper Trading \\u2014 NWO</title>\n<style>\n  * { box-sizing: border-box; margin: 0; padding: 0; }\n  body { background: #0d1117; color: #e6edf3; font-family: \'Segoe UI\', monospace; font-size: 14px; }\n  header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;\n           display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }\n  .back-btn { padding: 5px 12px; border-radius: 6px; border: 1px solid #30363d;\n              background: #21262d; color: #8b949e; text-decoration: none; font-size: 12px; }\n  header h1 { font-size: 17px; letter-spacing: 1px; color: #58a6ff; }\n  .header-right { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }\n  .run-btn   { padding: 6px 16px; border-radius: 6px; border: 1px solid #3fb950;\n               background: #1a4731; color: #3fb950; cursor: pointer; font-size: 12px; font-weight: 600; }\n  .run-btn:hover { background: #1e5c3a; }\n  .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }\n  .reset-btn { padding: 5px 14px; border-radius: 6px; border: 1px solid #f85149;\n               background: transparent; color: #f85149; cursor: pointer; font-size: 12px; }\n  .reset-btn:hover { background: rgba(248,81,73,0.1); }\n  .refresh-btn { padding: 5px 14px; border-radius: 6px; border: 1px solid #30363d;\n                 background: #21262d; color: #8b949e; cursor: pointer; font-size: 12px; }\n  #run-status { font-size: 11px; color: #d29922; }\n  main { padding: 16px; display: grid; gap: 16px; }\n  /* Summary cards */\n  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }\n  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }\n  .card-label { font-size: 10px; color: #8b949e; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }\n  .card-value { font-size: 22px; font-weight: 700; }\n  .card-sub { font-size: 11px; color: #8b949e; margin-top: 4px; }\n  .up { color: #3fb950; } .dn { color: #f85149; } .neu { color: #8b949e; }\n  /* Swim lanes */\n  .swim-wrap { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }\n  .lane { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; min-width: 0; }\n  .lane-header { padding: 10px 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;\n                 text-transform: uppercase; border-bottom: 1px solid #21262d; }\n  .lane-0 .lane-header { color: #58a6ff; border-top: 3px solid #58a6ff; }\n  .lane-1 .lane-header { color: #d29922; border-top: 3px solid #d29922; }\n  .lane-2 .lane-header { color: #3fb950; border-top: 3px solid #3fb950; }\n  .lane-sub { font-size: 10px; color: #8b949e; font-weight: 400; margin-top: 2px; }\n  .lane-body { padding: 8px; display: flex; flex-direction: column; gap: 6px; min-height: 80px; }\n  .signal-card { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;\n                 padding: 8px 10px; font-size: 12px; }\n  .sig-ticker { font-weight: 700; font-size: 13px; }\n  .sig-bull { color: #3fb950; } .sig-bear { color: #f85149; }\n  .sig-meta { font-size: 10px; color: #8b949e; margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; }\n  .lane-empty { color: #8b949e; font-size: 12px; font-style: italic; padding: 12px; text-align: center; }\n  /* Tables */\n  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }\n  .section-title { padding: 10px 14px; font-size: 12px; font-weight: 600; letter-spacing: 1px;\n                   color: #8b949e; border-bottom: 1px solid #21262d; text-transform: uppercase; }\n  table { width: 100%; border-collapse: collapse; }\n  th { padding: 8px 12px; text-align: left; font-size: 11px; color: #8b949e;\n       font-weight: 600; letter-spacing: 0.5px; border-bottom: 1px solid #21262d; }\n  td { padding: 8px 12px; font-size: 13px; border-bottom: 1px solid #161b22; }\n  tr:last-child td { border-bottom: none; }\n  tr:hover td { background: #1c2128; }\n  .empty { color: #8b949e; font-style: italic; padding: 20px; text-align: center; display: block; }\n  /* Side-by-side layout for positions + trade history */\n  .side-by-side { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }\n  .side-by-side .section { overflow: hidden; }\n  .side-by-side #positions-wrap, .side-by-side #trades-wrap { overflow-x: auto; }\n  .side-by-side table { min-width: 480px; font-size: 12px; }\n  .side-by-side th, .side-by-side td { padding: 6px 8px; }\n  @media (max-width: 900px) { .side-by-side { grid-template-columns: 1fr; } }\n  @media (max-width: 800px) {\n    .swim-wrap { grid-template-columns: 1fr; }\n    .cards { grid-template-columns: 1fr 1fr; }\n    th:nth-child(n+5), td:nth-child(n+5) { display: none; }\n  }\n</style>\n</head>\n<body>\n<header>\n  <a href="/" class="back-btn">&#8592; Dashboard</a>\n  <h1>&#127918; Paper Trading</h1>\n  <div class="header-right">\n    <span id="run-status"></span>\n    <button class="run-btn" id="run-btn" onclick="runNow()">&#9654; Run Now</button>\n    <button class="refresh-btn" onclick="load()">&#8635; Refresh</button>\n    <button class="reset-btn" onclick="resetAccount()">&#x21BA; Reset</button>\n  </div>\n</header>\n<div id="sched-bar" style="background:#0d1117;border-bottom:1px solid #21262d;padding:4px 20px;font-size:11px;color:#8b949e;display:flex;gap:16px;flex-wrap:wrap;">\n  <span id="sched-mode">&#9711; Auto: loading...</span>\n  <span id="sched-last"></span>\n  <span id="sched-next"></span>\n  <span id="sched-stops"></span>\n  <button id="sched-toggle" onclick="toggleScheduler()" style="margin-left:auto;background:none;border:1px solid #30363d;color:#8b949e;font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer">Pause</button>\n</div>\n<main>\n  <!-- Summary cards -->\n  <div class="cards">\n    <div class="card"><div class="card-label">Total Equity</div><div class="card-value" id="c-equity">\\u2014</div><div class="card-sub">Starting: $100,000</div></div>\n    <div class="card"><div class="card-label">Cash</div><div class="card-value" id="c-cash">\\u2014</div><div class="card-sub" id="c-cash-sub">&nbsp;</div></div>\n    <div class="card"><div class="card-label">Invested</div><div class="card-value" id="c-invested">\\u2014</div><div class="card-sub" id="c-invested-sub">&nbsp;</div></div>\n    <div class="card"><div class="card-label">Total P&amp;L</div><div class="card-value" id="c-pnl">\\u2014</div><div class="card-sub" id="c-pnl-sub">&nbsp;</div></div>\n    <div class="card"><div class="card-label">Daily P&amp;L</div><div class="card-value" id="c-daily-pnl">\\u2014</div><div class="card-sub" id="c-daily-pnl-sub">&nbsp;</div></div>\n  </div>\n  <!-- Three model swim lanes -->\n  <div class="swim-wrap" id="swim-wrap">\n    <div class="lane lane-0"><div class="lane-header">&#9899; Standard<div class="lane-sub">Conf &gt;50% &middot; MoS &gt;15% &middot; FUD &gt;0.60</div></div><div class="lane-body" id="lane-0"><span class="lane-empty">Loading...</span></div></div>\n    <div class="lane lane-1"><div class="lane-header">&#9898; Relaxed \\u221225%<div class="lane-sub">Conf &gt;37.5% &middot; MoS &gt;11.25% &middot; FUD &gt;0.45</div></div><div class="lane-body" id="lane-1"><span class="lane-empty">Loading...</span></div></div>\n    <div class="lane lane-2"><div class="lane-header">&#9711; Relaxed \\u221250%<div class="lane-sub">Conf &gt;25% &middot; MoS &gt;7.5% &middot; FUD &gt;0.30</div></div><div class="lane-body" id="lane-2"><span class="lane-empty">Loading...</span></div></div>\n  </div>\n  <!-- Open Positions + Trade History side by side -->\n  <div class="side-by-side">\n    <div class="section">\n      <div class="section-title">Open Positions</div>\n      <div id="positions-wrap"><span class="empty">Loading...</span></div>\n    </div>\n    <div class="section">\n      <div class="section-title">Trade History</div>\n      <div id="trades-wrap"><span class="empty">Loading...</span></div>\n    </div>\n  </div>\n</main>\n<script src="/paper.js"></script>\n</body>\n</html>'
 
-PAPER_JS = '\n// ── Model thresholds (mirror main dashboard) ─────────────────────────────────\nconst MODELS = [\n  { name: \'Standard\',    conf: 0.50,  mos: 0.15,   fud: 0.60 },\n  { name: \'Relaxed -25%\', conf: 0.375, mos: 0.1125, fud: 0.45 },\n  { name: \'Relaxed -50%\', conf: 0.25,  mos: 0.075,  fud: 0.30 },\n];\n\n// ── Formatters ────────────────────────────────────────────────────────────────\nfunction fmt(n, d) {\n  if (d === undefined) d = 2;\n  if (n == null) return \'\\u2014\';\n  return \'$\' + Math.abs(n).toLocaleString(\'en-US\', {minimumFractionDigits: d, maximumFractionDigits: d});\n}\nfunction fmtPct(n) { return n == null ? \'\' : (n >= 0 ? \'+\' : \'\') + n.toFixed(2) + \'%\'; }\nfunction cls(n)    { return n > 0 ? \'up\' : n < 0 ? \'dn\' : \'neu\'; }\n\n// ── Account + trades ──────────────────────────────────────────────────────────\nasync function load() {\n  try {\n    const [acct, trades] = await Promise.all([\n      fetch(\'/api/paper/account\').then(r => r.json()),\n      fetch(\'/api/paper/trades\').then(r => r.json()),\n    ]);\n\n    document.getElementById(\'c-equity\').textContent = fmt(acct.total_equity, 0);\n    document.getElementById(\'c-cash\').textContent = fmt(acct.cash, 0);\n    document.getElementById(\'c-cash-sub\').textContent =\n      ((acct.cash / acct.total_equity) * 100).toFixed(1) + \'% of portfolio\';\n    document.getElementById(\'c-invested\').textContent = fmt(acct.positions_value, 0);\n    document.getElementById(\'c-invested-sub\').textContent =\n      ((acct.positions_value / acct.total_equity) * 100).toFixed(1) + \'% of portfolio\';\n\n    const pnlEl = document.getElementById(\'c-pnl\');\n    pnlEl.textContent = (acct.total_pnl >= 0 ? \'+\' : \'\') + fmt(acct.total_pnl, 0);\n    pnlEl.className = \'card-value \' + cls(acct.total_pnl);\n    document.getElementById(\'c-pnl-sub\').innerHTML =\n      \'<span class="\' + cls(acct.total_pnl_pct) + \'">\' + fmtPct(acct.total_pnl_pct) + \'</span> vs $100k start\';\n\n    // Positions\n    const pw = document.getElementById(\'positions-wrap\');\n    if (!acct.positions || !acct.positions.length) {\n      pw.innerHTML = \'<span class="empty">No open positions yet.</span>\';\n    } else {\n      let h = \'<table><tr><th>Ticker</th><th>Qty</th><th>Avg Cost</th><th>Price</th><th>Mkt Value</th><th>P&amp;L</th><th>%</th></tr>\';\n      for (const p of acct.positions) {\n        h += \'<tr><td><strong>\' + p.ticker + \'</strong></td><td>\' + p.qty + \'</td><td>\' +\n          fmt(p.avg_cost) + \'</td><td>\' + fmt(p.cur_price) + \'</td><td>\' + fmt(p.mkt_val, 0) +\n          \'</td><td class="\' + cls(p.pnl) + \'">\' + (p.pnl >= 0 ? \'+\' : \'\') + fmt(p.pnl) +\n          \'</td><td class="\' + cls(p.pnl_pct) + \'">\' + fmtPct(p.pnl_pct) + \'</td></tr>\';\n      }\n      pw.innerHTML = h + \'</table>\';\n    }\n\n    // Trades\n    const tw = document.getElementById(\'trades-wrap\');\n    if (!trades || !trades.length) {\n      tw.innerHTML = \'<span class="empty">No trades yet \\u2014 click Run Now or start python -m paper.runner</span>\';\n    } else {\n      let h = \'<table><tr><th>Time</th><th>Ticker</th><th>Action</th><th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th></tr>\';\n      for (const t of trades) {\n        const dt = t.timestamp\n          ? new Date(t.timestamp + \'Z\').toLocaleString([], {month:\'2-digit\',day:\'2-digit\',hour:\'2-digit\',minute:\'2-digit\'})\n          : \'\\u2014\';\n        h += \'<tr><td class="neu" style="font-size:11px">\' + dt + \'</td><td><strong>\' + t.ticker +\n          \'</strong></td><td class="\' + (t.action===\'BUY\'?\'up\':\'dn\') + \'">\' + t.action +\n          \'</td><td>\' + t.qty + \'</td><td>\' + fmt(t.price) + \'</td><td>\' + fmt(t.total, 0) +\n          \'</td><td class="neu">\' + fmt(t.cash_after, 0) + \'</td></tr>\';\n      }\n      tw.innerHTML = h + \'</table>\';\n    }\n  } catch(e) { console.error(\'Paper load error:\', e); }\n}\n\n// ── Swim lanes ────────────────────────────────────────────────────────────────\nasync function loadSwimLanes() {\n  try {\n    const signals = await fetch(\'/api/signals\').then(r => r.json());\n    if (!signals || !signals.length) {\n      for (let i = 0; i < 3; i++)\n        document.getElementById(\'lane-\' + i).innerHTML =\n          \'<span class="lane-empty">No signals yet.</span>\';\n      return;\n    }\n\n    MODELS.forEach((m, idx) => {\n      // Tickers that pass this model\'s gates\n      const passing = signals.filter(s => {\n        const conf = s.confidence || 0;\n        const mos  = s.margin_of_safety || 0;\n        const fud  = s.fud_score || 0;\n        const sig  = (s.signal || \'\').toUpperCase();\n        return conf >= m.conf && mos >= m.mos && fud >= m.fud\n               && (sig === \'BUY\' || sig === \'STRONG_BUY\');\n      });\n\n      const el = document.getElementById(\'lane-\' + idx);\n      if (!passing.length) {\n        el.innerHTML = \'<span class="lane-empty">No tickers clear this threshold.</span>\';\n        return;\n      }\n\n      // Sort by confidence desc\n      passing.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));\n\n      el.innerHTML = passing.map(s => {\n        const conf   = ((s.confidence || 0) * 100).toFixed(0);\n        const mos    = ((s.margin_of_safety || 0) * 100).toFixed(1);\n        const fud    = (s.fud_score || 0).toFixed(2);\n        const price  = s.current_price ? \'$\' + s.current_price.toFixed(2) : \'\';\n        const chg    = s.change_pct != null\n          ? \'<span class="\' + cls(s.change_pct) + \'">\' + (s.change_pct >= 0 ? \'+\' : \'\') + s.change_pct.toFixed(1) + \'%</span>\'\n          : \'\';\n        return \'<div class="signal-card">\' +\n          \'<div class="sig-ticker sig-bull">&#9650; \' + s.ticker +\n            (price ? \' <span class="neu" style="font-weight:400">\' + price + \'</span>\' : \'\') +\n            (chg ? \' \' + chg : \'\') +\n          \'</div>\' +\n          \'<div class="sig-meta">\' +\n            \'<span>Conf \' + conf + \'%</span>\' +\n            \'<span>MoS \' + mos + \'%</span>\' +\n            \'<span>FUD \' + fud + \'</span>\' +\n          \'</div>\' +\n        \'</div>\';\n      }).join(\'\');\n    });\n  } catch(e) { console.error(\'Swim lanes error:\', e); }\n}\n\n// ── Run Now ───────────────────────────────────────────────────────────────────\nlet _runPollTimer = null;\n\nasync function runNow() {\n  const btn = document.getElementById(\'run-btn\');\n  const status = document.getElementById(\'run-status\');\n  btn.disabled = true;\n  status.textContent = \'\\u29d7 Cycle running...\';\n\n  try {\n    const r = await fetch(\'/api/paper/run\', {method: \'POST\'}).then(r => r.json());\n    if (r.status === \'started\') {\n      status.textContent = \'\\u29d7 Running pipeline...\';\n      // Poll every 5s until done\n      _runPollTimer = setInterval(async () => {\n        const s = await fetch(\'/api/paper/run/status\').then(r => r.json());\n        if (!s.running) {\n          clearInterval(_runPollTimer);\n          btn.disabled = false;\n          status.textContent = \'\\u2713 Done \\u2014 \' + new Date().toLocaleTimeString([], {hour:\'2-digit\',minute:\'2-digit\'});\n          load();\n          loadSwimLanes();\n          if (typeof sg3Boot === \'function\') sg3Boot();\n          setTimeout(() => { status.textContent = \'\'; }, 8000);\n        }\n      }, 5000);\n    } else {\n      status.textContent = r.status || \'Already running\';\n      btn.disabled = false;\n    }\n  } catch(e) {\n    status.textContent = \'Error: \' + e.message;\n    btn.disabled = false;\n  }\n}\n\nasync function resetAccount() {\n  if (!confirm(\'Reset paper account to $100,000? This erases all trades and positions.\')) return;\n  await fetch(\'/api/paper/reset\', {method: \'POST\'});\n  load();\n}\n\n// ── Init ──────────────────────────────────────────────────────────────────────\nload();\nloadSwimLanes();\nsetInterval(() => { load(); loadSwimLanes(); }, 30000);\n\n// ── Auto-scheduler status bar ────────────────────────────────────────────────\nlet _schedPaused = false;\n\nasync function loadSchedStatus() {\n  try {\n    const s = await fetch(\'/api/paper/scheduler\').then(r => r.json());\n    _schedPaused = s.paused;\n    const modeEl   = document.getElementById(\'sched-mode\');\n    const lastEl   = document.getElementById(\'sched-last\');\n    const nextEl   = document.getElementById(\'sched-next\');\n    const stopsEl  = document.getElementById(\'sched-stops\');\n    const toggleEl = document.getElementById(\'sched-toggle\');\n    if (!modeEl) return;\n\n    if (s.paused) {\n      modeEl.innerHTML = \'&#9899; Auto: <span style="color:#f85149">PAUSED</span>\';\n      if (toggleEl) { toggleEl.textContent = \'Resume\'; toggleEl.style.color = \'#3fb950\'; }\n    } else if (!s.market_hours) {\n      modeEl.innerHTML = \'&#9711; Auto: market closed (runs 9:30\u20134pm ET Mon\u2013Fri)\';\n      if (toggleEl) { toggleEl.textContent = \'Pause\'; toggleEl.style.color = \'#8b949e\'; }\n    } else if (s.running) {\n      modeEl.innerHTML = \'&#9899; Auto: <span style="color:#d29922">cycle running\u2026</span>\';\n    } else {\n      modeEl.innerHTML = \'&#9898; Auto: <span style="color:#3fb950">active</span> \u00b7 every 5 min\';\n      if (toggleEl) { toggleEl.textContent = \'Pause\'; toggleEl.style.color = \'#8b949e\'; }\n    }\n    lastEl.textContent  = s.last_cycle  ? \'Last: \' + s.last_cycle  : \'\';\n    nextEl.textContent  = s.next_cycle  ? \'Next: \' + s.next_cycle  : \'\';\n    stopsEl.textContent = s.stop_exits  ? \'Stop exits: \' + s.stop_exits : \'\';\n  } catch(e) {}\n}\n\nasync function toggleScheduler() {\n  const action = _schedPaused ? \'resume\' : \'pause\';\n  await fetch(\'/api/paper/scheduler/\' + action, {method: \'POST\'});\n  loadSchedStatus();\n}\n\nloadSchedStatus();\nsetInterval(loadSchedStatus, 15000);\n'
+PAPER_JS = '\n// ── Model thresholds (mirror main dashboard) ─────────────────────────────────\nconst MODELS = [\n  { name: \'Standard\',    conf: 0.50,  mos: 0.15,   fud: 0.60 },\n  { name: \'Relaxed -25%\', conf: 0.375, mos: 0.1125, fud: 0.45 },\n  { name: \'Relaxed -50%\', conf: 0.25,  mos: 0.075,  fud: 0.30 },\n];\n\n// ── Formatters ────────────────────────────────────────────────────────────────\nfunction fmt(n, d) {\n  if (d === undefined) d = 2;\n  if (n == null) return \'\\u2014\';\n  return \'$\' + Math.abs(n).toLocaleString(\'en-US\', {minimumFractionDigits: d, maximumFractionDigits: d});\n}\nfunction fmtPct(n) { return n == null ? \'\' : (n >= 0 ? \'+\' : \'\') + n.toFixed(2) + \'%\'; }\nfunction cls(n)    { return n > 0 ? \'up\' : n < 0 ? \'dn\' : \'neu\'; }\n\n// ── Account + trades ──────────────────────────────────────────────────────────\nasync function load() {\n  try {\n    const [acct, trades] = await Promise.all([\n      fetch(\'/api/paper/account\').then(r => r.json()),\n      fetch(\'/api/paper/trades\').then(r => r.json()),\n    ]);\n\n    document.getElementById(\'c-equity\').textContent = fmt(acct.total_equity, 0);\n    document.getElementById(\'c-cash\').textContent = fmt(acct.cash, 0);\n    document.getElementById(\'c-cash-sub\').textContent =\n      ((acct.cash / acct.total_equity) * 100).toFixed(1) + \'% of portfolio\';\n    document.getElementById(\'c-invested\').textContent = fmt(acct.positions_value, 0);\n    document.getElementById(\'c-invested-sub\').textContent =\n      ((acct.positions_value / acct.total_equity) * 100).toFixed(1) + \'% of portfolio\';\n\n    const pnlEl = document.getElementById(\'c-pnl\');\n    pnlEl.textContent = (acct.total_pnl >= 0 ? \'+\' : \'\') + fmt(acct.total_pnl, 0);\n    pnlEl.className = \'card-value \' + cls(acct.total_pnl);\n    document.getElementById(\'c-pnl-sub\').innerHTML =\n      \'<span class="\' + cls(acct.total_pnl_pct) + \'">\' + fmtPct(acct.total_pnl_pct) + \'</span> on invested\';\n\n    const dailyEl = document.getElementById(\'c-daily-pnl\');\n    if (dailyEl && acct.daily_pnl != null) {\n      dailyEl.textContent = (acct.daily_pnl >= 0 ? \'+\' : \'\') + fmt(acct.daily_pnl, 0);\n      dailyEl.className = \'card-value \' + cls(acct.daily_pnl);\n      const dailySub = document.getElementById(\'c-daily-pnl-sub\');\n      if (dailySub) dailySub.innerHTML =\n        \'<span class="\' + cls(acct.daily_pnl_pct) + \'">\' + fmtPct(acct.daily_pnl_pct) + \'</span> today\';\n    }\n\n    // Positions\n    const pw = document.getElementById(\'positions-wrap\');\n    if (!acct.positions || !acct.positions.length) {\n      pw.innerHTML = \'<span class="empty">No open positions yet.</span>\';\n    } else {\n      let h = \'<table><tr><th>Ticker</th><th>Qty</th><th>Avg Cost</th><th>Price</th><th>Mkt Value</th><th>P&amp;L</th><th>%</th></tr>\';\n      for (const p of acct.positions) {\n        h += \'<tr data-ticker="\' + p.ticker + \'"><td><strong>\' + p.ticker + \'</strong></td><td>\' + p.qty + \'</td><td>\' +\n          fmt(p.avg_cost) + \'</td><td>\' + fmt(p.cur_price) + \'</td><td>\' + fmt(p.mkt_val, 0) +\n          \'</td><td class="\' + cls(p.pnl) + \'">\' + (p.pnl >= 0 ? \'+\' : \'\') + fmt(p.pnl) +\n          \'</td><td class="\' + cls(p.pnl_pct) + \'">\' + fmtPct(p.pnl_pct) + \'</td></tr>\';\n      }\n      pw.innerHTML = h + \'</table>\';\n    }\n\n    // Trades\n    const tw = document.getElementById(\'trades-wrap\');\n    if (!trades || !trades.length) {\n      tw.innerHTML = \'<span class="empty">No trades yet \\u2014 click Run Now or start python -m paper.runner</span>\';\n    } else {\n      let h = \'<table><tr><th>Time</th><th>Ticker</th><th>Action</th><th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th><th>Source</th></tr>\';\n      for (const t of trades) {\n        const dt = t.timestamp\n          ? new Date(t.timestamp + \'Z\').toLocaleString([], {month:\'2-digit\',day:\'2-digit\',hour:\'2-digit\',minute:\'2-digit\'})\n          : \'\\u2014\';\n        const srcHtml = t.signal === \'MANUAL\'\n          ? \'<span style="color:#8b949e">\\ud83d\\udc64 Manual</span>\'\n          : \'<span style="color:#58a6ff" title="\' + (t.signal || \'AI\') + \'">\\ud83e\\udd16 AI</span>\';\n        h += \'<tr><td class="neu" style="font-size:11px">\' + dt + \'</td><td><strong>\' + t.ticker +\n          \'</strong></td><td class="\' + (t.action===\'BUY\'?\'up\':\'dn\') + \'">\' + t.action +\n          \'</td><td>\' + t.qty + \'</td><td>\' + fmt(t.price) + \'</td><td>\' + fmt(t.total, 0) +\n          \'</td><td class="neu">\' + fmt(t.cash_after, 0) + \'</td><td style="font-size:11px">\' + srcHtml + \'</td></tr>\';\n      }\n      tw.innerHTML = h + \'</table>\';\n    }\n  } catch(e) { console.error(\'Paper load error:\', e); }\n}\n\n// ── Swim lanes ────────────────────────────────────────────────────────────────\nasync function loadSwimLanes() {\n  try {\n    const signals = await fetch(\'/api/signals\').then(r => r.json());\n    if (!signals || !signals.length) {\n      for (let i = 0; i < 3; i++)\n        document.getElementById(\'lane-\' + i).innerHTML =\n          \'<span class="lane-empty">No signals yet.</span>\';\n      return;\n    }\n\n    MODELS.forEach((m, idx) => {\n      // Tickers that pass this model\'s gates\n      const passing = signals.filter(s => {\n        const conf = s.confidence || 0;\n        const mos  = s.margin_of_safety || 0;\n        const fud  = s.fud_score || 0;\n        const sig  = (s.signal || \'\').toUpperCase();\n        return conf >= m.conf && mos >= m.mos && fud >= m.fud\n               && (sig === \'BUY\' || sig === \'STRONG_BUY\');\n      });\n\n      const el = document.getElementById(\'lane-\' + idx);\n      if (!passing.length) {\n        el.innerHTML = \'<span class="lane-empty">No tickers clear this threshold.</span>\';\n        return;\n      }\n\n      // Sort by confidence desc\n      passing.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));\n\n      el.innerHTML = passing.map(s => {\n        const conf   = ((s.confidence || 0) * 100).toFixed(0);\n        const mos    = ((s.margin_of_safety || 0) * 100).toFixed(1);\n        const fud    = (s.fud_score || 0).toFixed(2);\n        const price  = s.current_price ? \'$\' + s.current_price.toFixed(2) : \'\';\n        const chg    = s.change_pct != null\n          ? \'<span class="\' + cls(s.change_pct) + \'">\' + (s.change_pct >= 0 ? \'+\' : \'\') + s.change_pct.toFixed(1) + \'%</span>\'\n          : \'\';\n        return \'<div class="signal-card">\' +\n          \'<div class="sig-ticker sig-bull">&#9650; \' + s.ticker +\n            (price ? \' <span class="neu" style="font-weight:400">\' + price + \'</span>\' : \'\') +\n            (chg ? \' \' + chg : \'\') +\n          \'</div>\' +\n          \'<div class="sig-meta">\' +\n            \'<span>Conf \' + conf + \'%</span>\' +\n            \'<span>MoS \' + mos + \'%</span>\' +\n            \'<span>FUD \' + fud + \'</span>\' +\n          \'</div>\' +\n        \'</div>\';\n      }).join(\'\');\n    });\n  } catch(e) { console.error(\'Swim lanes error:\', e); }\n}\n\n// ── Run Now ───────────────────────────────────────────────────────────────────\nlet _runPollTimer = null;\n\nasync function runNow() {\n  const btn = document.getElementById(\'run-btn\');\n  const status = document.getElementById(\'run-status\');\n  btn.disabled = true;\n  status.textContent = \'\\u29d7 Cycle running...\';\n\n  try {\n    const r = await fetch(\'/api/paper/run\', {method: \'POST\'}).then(r => r.json());\n    if (r.status === \'started\') {\n      status.textContent = \'\\u29d7 Running pipeline...\';\n      // Poll every 5s until done\n      _runPollTimer = setInterval(async () => {\n        const s = await fetch(\'/api/paper/run/status\').then(r => r.json());\n        if (!s.running) {\n          clearInterval(_runPollTimer);\n          btn.disabled = false;\n          status.textContent = \'\\u2713 Done \\u2014 \' + new Date().toLocaleTimeString([], {hour:\'2-digit\',minute:\'2-digit\'});\n          load();\n          loadSwimLanes();\n          if (typeof sg3Boot === \'function\') sg3Boot();\n          setTimeout(() => { status.textContent = \'\'; }, 8000);\n        }\n      }, 5000);\n    } else {\n      status.textContent = r.status || \'Already running\';\n      btn.disabled = false;\n    }\n  } catch(e) {\n    status.textContent = \'Error: \' + e.message;\n    btn.disabled = false;\n  }\n}\n\nasync function resetAccount() {\n  if (!confirm(\'Reset paper account to $100,000? This erases all trades and positions.\')) return;\n  await fetch(\'/api/paper/reset\', {method: \'POST\'});\n  load();\n}\n\n// ── Init ──────────────────────────────────────────────────────────────────────\nload();\nloadSwimLanes();\n\nasync function refreshPrices() {\n  const model = window._PAPER_MODEL || \'standard\';\n  try {\n    const prices = await fetch(\'/api/paper/live-prices?model=\' + model).then(r => r.json());\n    if (!prices || prices.error) return;\n    for (const [ticker, d] of Object.entries(prices)) {\n      const row = document.querySelector(\'#positions-wrap tr[data-ticker="\' + ticker + \'"]\');\n      if (!row) continue;\n      const tds = row.querySelectorAll(\'td\');\n      if (tds.length < 7) continue;\n      tds[3].textContent = \'$\' + d.price.toFixed(2);\n      tds[4].textContent = \'$\' + Math.abs(d.mkt_val).toLocaleString(\'en-US\',{maximumFractionDigits:0});\n      tds[5].textContent = (d.pnl >= 0 ? \'+$\' : \'-$\') + Math.abs(d.pnl).toFixed(2);\n      tds[5].className = cls(d.pnl);\n      tds[6].textContent = fmtPct(d.pnl_pct);\n      tds[6].className = cls(d.pnl_pct);\n    }\n  } catch(e) {}\n}\nsetInterval(refreshPrices, 10000);\n\nsetInterval(() => { load(); loadSwimLanes(); }, 30000);\n\n// ── Auto-scheduler status bar ────────────────────────────────────────────────\nlet _schedPaused = false;\n\nasync function loadSchedStatus() {\n  try {\n    const s = await fetch(\'/api/paper/scheduler\').then(r => r.json());\n    _schedPaused = s.paused;\n    const modeEl   = document.getElementById(\'sched-mode\');\n    const lastEl   = document.getElementById(\'sched-last\');\n    const nextEl   = document.getElementById(\'sched-next\');\n    const stopsEl  = document.getElementById(\'sched-stops\');\n    const toggleEl = document.getElementById(\'sched-toggle\');\n    if (!modeEl) return;\n\n    if (s.paused) {\n      modeEl.innerHTML = \'&#9899; Auto: <span style="color:#f85149">PAUSED</span>\';\n      if (toggleEl) { toggleEl.textContent = \'Resume\'; toggleEl.style.color = \'#3fb950\'; }\n    } else if (!s.market_hours) {\n      modeEl.innerHTML = \'&#9711; Auto: market closed (runs 9:30\u20134pm ET Mon\u2013Fri)\';\n      if (toggleEl) { toggleEl.textContent = \'Pause\'; toggleEl.style.color = \'#8b949e\'; }\n    } else if (s.running) {\n      modeEl.innerHTML = \'&#9899; Auto: <span style="color:#d29922">cycle running\u2026</span>\';\n    } else {\n      modeEl.innerHTML = \'&#9898; Auto: <span style="color:#3fb950">active</span> \u00b7 every 5 min\';\n      if (toggleEl) { toggleEl.textContent = \'Pause\'; toggleEl.style.color = \'#8b949e\'; }\n    }\n    lastEl.textContent  = s.last_cycle  ? \'Last: \' + s.last_cycle  : \'\';\n    nextEl.textContent  = s.next_cycle  ? \'Next: \' + s.next_cycle  : \'\';\n    stopsEl.textContent = s.stop_exits  ? \'Stop exits: \' + s.stop_exits : \'\';\n  } catch(e) {}\n}\n\nasync function toggleScheduler() {\n  const action = _schedPaused ? \'resume\' : \'pause\';\n  await fetch(\'/api/paper/scheduler/\' + action, {method: \'POST\'});\n  loadSchedStatus();\n}\n\nloadSchedStatus();\nsetInterval(loadSchedStatus, 15000);\n'
 
 
 @app.get("/paper", response_class=HTMLResponse)
@@ -2526,31 +3476,772 @@ def paper_js_route():
                     headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/paper/account")
-def api_paper_account():
-    try:
-        from paper.executor import PaperExecutor
-        from models.database import init_db as _init_db
-        _, _Session = _init_db(config.database.url, echo=False)
-        ex = PaperExecutor(main_db_session_factory=_Session)
-        summary = ex.get_account_summary()
-        # Enrich open positions with live Schwab prices
+def _paper_model_page(model_key: str, label: str, nav_key: str = 'paper'):
+    from fastapi.responses import HTMLResponse as HR
+    html = PAPER_HTML
+    # Update title and heading for this model variant
+    html = html.replace('Paper Trading \u2014 NWO', f'Paper {label} \u2014 NWO', 1)
+    html = html.replace('&#127918; Paper Trading', f'&#127918; Paper {label}', 1)
+    # Swap nav highlight if this page needs a different active key
+    if nav_key != 'paper':
+        html = html.replace(_nav_html('paper'), _nav_html(nav_key), 1)
+    # Inject model variable before paper.js loads
+    html = html.replace(
+        '<script src="/paper.js"></script>',
+        f'<script>window._PAPER_MODEL = {repr(model_key)};</script><script src="/paper.js"></script>',
+        1
+    )
+    return HR(content=html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/paper/relaxed", response_class=HTMLResponse)
+def paper_relaxed_page():
+    return _paper_model_page("relaxed", "Relaxed \u221225%")
+
+
+@app.get("/paper/very-relaxed", response_class=HTMLResponse)
+def paper_very_relaxed_page():
+    return _paper_model_page("very_relaxed", "Relaxed \u221250%")
+
+
+@app.get("/paper/claude", response_class=HTMLResponse)
+def paper_claude_page():
+    return _paper_model_page("claude", "Claude \U0001F916")
+
+
+_R2000_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>R2000 Watchlist \u2014 NWO</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0d1117; color:#e6edf3; font-family:'Segoe UI',monospace; font-size:14px; }
+  a { color:inherit; text-decoration:none; }
+  .nav-bar { background:#161b22; border-bottom:1px solid #30363d; padding:8px 14px;
+             display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+             position:sticky; top:0; z-index:200; }
+  /* Model tabs */
+  .model-tabs { background:#161b22; border-bottom:1px solid #30363d; padding:0 14px;
+                display:flex; align-items:center; gap:0; overflow-x:auto; }
+  .mtab { padding:10px 16px; font-size:12px; font-weight:600; color:#8b949e; cursor:pointer;
+          border-bottom:2px solid transparent; white-space:nowrap; background:none; border-top:none;
+          border-left:none; border-right:none; letter-spacing:.3px; transition:color .15s; }
+  .mtab:hover { color:#e6edf3; }
+  .mtab.active { color:#58a6ff; border-bottom-color:#58a6ff; }
+  /* Page header */
+  .page-hd { background:#0d1117; padding:10px 16px; border-bottom:1px solid #21262d;
+             display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .page-title { font-size:15px; font-weight:700; }
+  .page-sub { font-size:11px; color:#8b949e; }
+  .scan-note { font-size:10px; color:#484f58; margin-left:4px; }
+  .refresh-btn { margin-left:auto; padding:4px 12px; border-radius:5px; border:1px solid #30363d;
+                 background:#21262d; color:#8b949e; cursor:pointer; font-size:12px; }
+  .refresh-btn:hover { color:#e6edf3; border-color:#8b949e; }
+  main { padding:14px; display:grid; gap:10px; }
+  .section { background:#161b22; border:1px solid #30363d; border-radius:8px; overflow:hidden; }
+  .section-hd { padding:9px 14px; font-size:11px; font-weight:700; letter-spacing:1px;
+                color:#8b949e; border-bottom:1px solid #21262d; text-transform:uppercase;
+                display:flex; align-items:center; gap:8px; }
+  .section-hd.s3-hd { border-top:3px solid #3fb950; }
+  .section-hd.s2-hd { border-top:3px solid #58a6ff; }
+  .section-hd.s1-hd { border-top:3px solid #484f58; }
+  .badge { font-size:10px; font-weight:400; letter-spacing:0; }
+  .badge-green { color:#3fb950; } .badge-blue { color:#58a6ff; } .badge-grey { color:#8b949e; }
+  /* Chip grids */
+  .chip-grid { display:flex; flex-wrap:wrap; gap:6px; padding:10px 14px 12px; }
+  .chip { border-radius:5px; padding:5px 11px; font-size:12px; font-weight:700; cursor:default; }
+  .chip-s3 { background:#1a2e1a; color:#3fb950; border:1px solid #2ea043; }
+  .chip-s2 { background:#0d1f38; color:#58a6ff; border:1px solid #1f6feb; }
+  .chip-s1 { background:#0d1117; color:#8b949e; border:1px solid #21262d; }
+  .chip-sub { font-size:9px; font-weight:400; margin-left:4px; opacity:.8; }
+  .empty-note { font-size:12px; color:#484f58; font-style:italic; padding:10px 14px 12px; }
+  /* Legend */
+  .legend { display:flex; gap:14px; flex-wrap:wrap; padding:0 14px 10px; }
+  .leg { font-size:10px; color:#8b949e; display:flex; align-items:center; gap:4px; }
+  .leg-dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
+  /* Compare grid */
+  .cmp-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:0; }
+  .cmp-col { border-right:1px solid #21262d; padding:10px 12px; }
+  .cmp-col:last-child { border-right:none; }
+  .cmp-title { font-size:11px; font-weight:700; color:#8b949e; margin-bottom:8px;
+               text-transform:uppercase; letter-spacing:.5px; }
+  .cmp-section { margin-bottom:12px; }
+  .cmp-label { font-size:9px; color:#484f58; text-transform:uppercase; letter-spacing:.5px;
+               margin-bottom:4px; font-weight:700; }
+  .cmp-chips { display:flex; flex-wrap:wrap; gap:4px; }
+  .cmp-chip-s3 { background:#1a2e1a; color:#3fb950; border:1px solid #2ea043;
+                 border-radius:4px; padding:2px 7px; font-size:11px; font-weight:700; }
+  .cmp-chip-s2 { background:#0d1f38; color:#58a6ff; border:1px solid #1f6feb;
+                 border-radius:4px; padding:2px 7px; font-size:11px; font-weight:700; }
+  .cmp-none { font-size:11px; color:#484f58; font-style:italic; }
+  @media(max-width:800px) { .cmp-grid { grid-template-columns:1fr 1fr; } }
+  @media(max-width:500px) { .cmp-grid { grid-template-columns:1fr; } }
+__NAV_CSS__</style>
+</head>
+<body>
+<div class="nav-bar">__NAV__</div>
+<!-- Model tabs -->
+<div class="model-tabs">
+  <button class="mtab active" data-model="standard"   onclick="setModel('standard')">&#9899; Standard</button>
+  <button class="mtab"        data-model="relaxed"    onclick="setModel('relaxed')">&#9898; Relaxed &minus;25%</button>
+  <button class="mtab"        data-model="very_relaxed" onclick="setModel('very_relaxed')">&#9711; Very Relaxed &minus;50%</button>
+  <button class="mtab"        data-model="claude"     onclick="setModel('claude')">&#129302; Claude</button>
+  <button class="mtab"        data-model="compare"    onclick="setModel('compare')">&#9776; Compare</button>
+</div>
+<div class="page-hd">
+  <span class="page-title">&#128202; R2000 Watchlist</span>
+  <span class="page-sub">Small-cap universe &mdash; scanned 3&times;/day by all 4 models</span>
+  <span class="scan-note">9:00 AM &middot; 12:00 PM &middot; 3:30 PM ET</span>
+  <button class="refresh-btn" onclick="loadAll()">\u27f3 Refresh</button>
+</div>
+<main id="main-content">
+  <!-- Stage 3 -->
+  <div class="section" id="s3-section">
+    <div class="section-hd s3-hd">&#128200; Stage 3 &mdash; Held Positions
+      <span class="badge badge-green" id="s3-badge"></span>
+    </div>
+    <div id="s3-body"><div class="empty-note">Loading\u2026</div></div>
+  </div>
+  <!-- Stage 2 -->
+  <div class="section" id="s2-section">
+    <div class="section-hd s2-hd">&#129302; Stage 2 &mdash; Active AI Pipeline
+      <span class="badge badge-blue" id="s2-badge"></span>
+    </div>
+    <div id="s2-body"><div class="empty-note">Loading\u2026</div></div>
+  </div>
+  <!-- Monitoring Universe -->
+  <div class="section" id="s1-section">
+    <div class="section-hd s1-hd">&#127758; Monitoring Universe
+      <span class="badge badge-grey" id="s1-badge"></span>
+    </div>
+    <div class="legend">
+      <span class="leg"><span class="leg-dot" style="background:#484f58;border:1px solid #30363d;"></span>Monitoring</span>
+      <span class="leg"><span class="leg-dot" style="background:#0d1f38;border:1px solid #1f6feb;"></span>In pipeline</span>
+      <span class="leg"><span class="leg-dot" style="background:#1a2e1a;border:1px solid #2ea043;"></span>Held</span>
+    </div>
+    <div class="chip-grid" id="s1-body"><span style="color:#8b949e;font-size:12px">Loading\u2026</span></div>
+  </div>
+</main>
+<script>
+const ML = {
+  standard:     'Standard',
+  relaxed:      'Relaxed \u221225%',
+  very_relaxed: 'Very Relaxed \u221250%',
+  claude:       '&#129302; Claude',
+};
+let _currentModel = 'standard';
+let _data = null;
+let _r2TrData = {};
+
+function setModel(m) {
+  _currentModel = m;
+  document.querySelectorAll('.mtab').forEach(b => b.classList.toggle('active', b.dataset.model === m));
+  if (_data) render(_data);
+}
+
+async function loadAll() {
+  try {
+    _data = await fetch('/api/paper/r2000-universe').then(r => r.json());
+    try { _r2TrData = await fetch('/api/tipranks/all').then(r => r.json()); } catch(e) {}
+    render(_data);
+  } catch(e) { console.error(e); }
+}
+
+function r2TrBadge(t) {
+  const d = _r2TrData[t] || {};
+  const ss = d.smart_score;
+  if (ss == null) return '';
+  const bg  = ss >= 8 ? '#1a4731' : ss >= 4 ? '#3d2b00' : '#4a1519';
+  const col = ss >= 8 ? '#3fb950' : ss >= 4 ? '#d29922' : '#f85149';
+  return ' <span style="background:' + bg + ';color:' + col + ';border:1px solid ' + col + ';font-size:9px;padding:1px 4px;border-radius:3px;font-weight:700">&#9733;' + ss + '</span>';
+}
+
+function render(d) {
+  const ms2 = d.model_stage2 || {};
+  const ms3 = d.model_stage3 || {};
+  const universe = d.universe || [];
+
+  if (_currentModel === 'compare') {
+    renderCompare(d);
+    return;
+  }
+
+  const s2 = ms2[_currentModel] || [];
+  const s3 = ms3[_currentModel] || [];
+  const s2set = new Set(s2);
+  const s3set = new Set(s3);
+
+  // Stage 3
+  document.getElementById('s3-badge').textContent = s3.length ? '(' + s3.length + ')' : '';
+  document.getElementById('s3-body').innerHTML = s3.length
+    ? '<div class="chip-grid">' + s3.map(t => '<div class="chip chip-s3">' + t + r2TrBadge(t) + '</div>').join('') + '</div>'
+    : '<div class="empty-note">No R2000 positions held by ' + (ML[_currentModel]||_currentModel) + '.</div>';
+
+  // Stage 2
+  document.getElementById('s2-badge').textContent = s2.length ? '(' + s2.length + ')' : '';
+  document.getElementById('s2-body').innerHTML = s2.length
+    ? '<div class="chip-grid">' + s2.map(t => '<div class="chip chip-s2">' + t + r2TrBadge(t) + '</div>').join('') + '</div>'
+    : '<div class="empty-note">No R2000 tickers in active AI pipeline for ' + (ML[_currentModel]||_currentModel) + '.</div>';
+
+  // Universe
+  const monCount = universe.filter(t => !s2set.has(t) && !s3set.has(t)).length;
+  document.getElementById('s1-badge').textContent = '(' + universe.length + ' tickers \u00b7 ' + monCount + ' monitoring)';
+  document.getElementById('s1-body').innerHTML = universe.map(t => {
+    if (s3set.has(t)) return '<div class="chip chip-s3" style="font-size:11px;padding:3px 7px" title="Held">' + t + r2TrBadge(t) + '</div>';
+    if (s2set.has(t)) return '<div class="chip chip-s2" style="font-size:11px;padding:3px 7px" title="Active pipeline">' + t + r2TrBadge(t) + '</div>';
+    return '<div class="chip chip-s1" style="font-size:11px;padding:3px 7px">' + t + r2TrBadge(t) + '</div>';
+  }).join('');
+
+  // Show normal sections
+  ['s3-section','s2-section','s1-section'].forEach(id => {
+    document.getElementById(id).style.display = '';
+  });
+  const cmp = document.getElementById('compare-section');
+  if (cmp) cmp.remove();
+}
+
+function renderCompare(d) {
+  const ms2 = d.model_stage2 || {};
+  const ms3 = d.model_stage3 || {};
+  const universe = d.universe || [];
+  const models = ['standard','relaxed','very_relaxed','claude'];
+
+  // Hide per-model sections, show compare
+  ['s3-section','s2-section','s1-section'].forEach(id => {
+    document.getElementById(id).style.display = 'none';
+  });
+
+  let existing = document.getElementById('compare-section');
+  if (!existing) {
+    existing = document.createElement('div');
+    existing.id = 'compare-section';
+    existing.className = 'section';
+    document.getElementById('main-content').appendChild(existing);
+  }
+
+  const cols = models.map(m => {
+    const s2 = (ms2[m] || []);
+    const s3 = (ms3[m] || []);
+    const s2html = s2.length
+      ? s2.map(t => '<div class="cmp-chip-s2">' + t + r2TrBadge(t) + '</div>').join('')
+      : '<span class="cmp-none">None</span>';
+    const s3html = s3.length
+      ? s3.map(t => '<div class="cmp-chip-s3">' + t + r2TrBadge(t) + '</div>').join('')
+      : '<span class="cmp-none">None</span>';
+    return '<div class="cmp-col">'
+      + '<div class="cmp-title">' + (ML[m]||m) + '</div>'
+      + '<div class="cmp-section"><div class="cmp-label">&#128200; Stage 3 &mdash; Held (' + s3.length + ')</div>'
+      + '<div class="cmp-chips">' + s3html + '</div></div>'
+      + '<div class="cmp-section"><div class="cmp-label">&#129302; Stage 2 &mdash; Pipeline (' + s2.length + ')</div>'
+      + '<div class="cmp-chips">' + s2html + '</div></div>'
+      + '</div>';
+  }).join('');
+
+  existing.innerHTML = '<div class="section-hd">&#9776; All Models &mdash; R2000 Activity</div>'
+    + '<div class="cmp-grid">' + cols + '</div>';
+}
+
+loadAll();
+setInterval(loadAll, 60000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/paper/russell2000", response_class=HTMLResponse)
+def paper_russell2000_page():
+    from fastapi.responses import HTMLResponse as HR
+    html = _R2000_PAGE_HTML
+    html = html.replace('__NAV_CSS__', _NAV_CSS, 1)
+    html = html.replace('__NAV__', _nav_html('r2000'), 1)
+    return HR(content=html, headers={"Cache-Control": "no-store"})
+
+
+_COMPARE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paper Compare &mdash; NWO</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', monospace; font-size: 14px; }
+  header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;
+           display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .back-btn { padding: 5px 12px; border-radius: 6px; border: 1px solid #30363d;
+              background: #21262d; color: #8b949e; text-decoration: none; font-size: 12px; }
+  header h1 { font-size: 17px; letter-spacing: 1px; color: #58a6ff; }
+  .header-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .refresh-btn { padding: 5px 14px; border-radius: 6px; border: 1px solid #30363d;
+                 background: #21262d; color: #8b949e; cursor: pointer; font-size: 12px; }
+  main { padding: 16px; display: flex; flex-direction: column; gap: 20px; }
+  .model-cols { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; }
+  .model-col  { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .col-head   { padding: 12px 16px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 10px; }
+  .col-standard   .col-head { border-top: 3px solid #8b949e; }
+  .col-relaxed    .col-head { border-top: 3px solid #d29922; }
+  .col-very-relaxed .col-head { border-top: 3px solid #3fb950; }
+  .col-claude     .col-head { border-top: 3px solid #58a6ff; }
+  .col-title  { font-size: 13px; font-weight: 700; }
+  .col-standard .col-title     { color: #8b949e; }
+  .col-relaxed .col-title      { color: #d29922; }
+  .col-very-relaxed .col-title { color: #3fb950; }
+  .col-claude .col-title       { color: #58a6ff; }
+  .col-sub    { font-size: 10px; color: #8b949e; margin-top: 2px; }
+  .col-link   { margin-left: auto; font-size: 11px; color: #58a6ff; text-decoration: none; }
+  .col-link:hover { text-decoration: underline; }
+  .col-body   { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .stat-row   { display: flex; justify-content: space-between; align-items: baseline; }
+  .stat-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-val   { font-size: 15px; font-weight: 700; }
+  .up { color: #3fb950; } .dn { color: #f85149; } .neu { color: #8b949e; }
+  .divider    { border: none; border-top: 1px solid #21262d; margin: 4px 0; }
+  .pos-mini   { font-size: 11px; color: #c9d1d9; }
+  .pos-mini td { padding: 3px 6px; }
+  .pos-mini td:first-child { color: #8b949e; font-size: 10px; }
+  .empty-note { font-size: 12px; color: #8b949e; font-style: italic; text-align: center; padding: 8px; }
+  @media (max-width: 1100px) { .model-cols { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 600px)  { .model-cols { grid-template-columns: 1fr; } }
+  .info-toggle { background: none; border: 1px solid #30363d; border-radius: 6px; color: #8b949e;
+                 padding: 5px 12px; cursor: pointer; font-size: 12px; }
+  .info-toggle:hover { color: #e6edf3; border-color: #58a6ff; }
+  .model-info  { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
+  .model-info h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 12px; }
+  .info-grid   { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; }
+  .info-card   { background: #0d1117; border-radius: 6px; padding: 12px 14px; border-left: 3px solid #30363d; }
+  .info-card.c-std  { border-left-color: #8b949e; }
+  .info-card.c-rel  { border-left-color: #d29922; }
+  .info-card.c-vrel { border-left-color: #3fb950; }
+  .info-card.c-ai   { border-left-color: #58a6ff; }
+  .info-name   { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+  .c-std  .info-name { color: #8b949e; }
+  .c-rel  .info-name { color: #d29922; }
+  .c-vrel .info-name { color: #3fb950; }
+  .c-ai   .info-name { color: #58a6ff; }
+  .info-tag    { display: inline-block; font-size: 10px; background: #21262d; color: #8b949e;
+                 border-radius: 3px; padding: 1px 5px; margin-bottom: 6px; }
+  .info-desc   { font-size: 11px; color: #8b949e; line-height: 1.5; }
+  .info-weights { font-size: 10px; color: #6e7681; margin-top: 6px; font-family: monospace; }
+  @media (max-width: 1100px) { .info-grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 600px)  { .info-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <a href="/paper" class="back-btn">&#8592; Paper Trading</a>
+  <h1>&#128202; Model Comparison</h1>
+  <div class="header-right">
+    <a href="/paper/daily-report" class="refresh-btn" style="text-decoration:none;">&#128196; Daily Report</a>
+    <button class="info-toggle" onclick="toggleInfo()" id="info-btn">&#8505; Model Info</button>
+    <button class="refresh-btn" onclick="load()">&#8635; Refresh</button>
+  </div>
+</header>
+<main>
+  <div class="model-info" id="model-info" style="display:none">
+    <h2>Model Philosophies</h2>
+    <div class="info-grid">
+      <div class="info-card c-std">
+        <div class="info-name">Standard</div>
+        <div class="info-tag">Threshold &times;1.00</div>
+        <div class="info-desc">The baseline — full 6-layer pipeline with all gates at their designed levels. Requires strong fundamentals, solid composite score (&ge;0.10), ensemble bull probability &ge;45%, and passing Kalman/Reynolds filters. Trades only when the evidence is unambiguous. The control group in this experiment.</div>
+        <div class="info-weights">Weights: fundamentals 25% &middot; momentum 20% &middot; insider 15% &middot; technical 15% &middot; supertrend 10% &middot; cycle 10% &middot; volume 5%</div>
+      </div>
+      <div class="info-card c-rel">
+        <div class="info-name">Relaxed &minus;25%</div>
+        <div class="info-tag">Threshold &times;0.75</div>
+        <div class="info-desc">Same signal pipeline as Standard but all decision gates reduced by 25%. Accepts moderate conviction setups that Standard would reject. Useful for testing whether the Standard model is overfitting its thresholds to caution. Trades more frequently; higher expected variance.</div>
+        <div class="info-weights">Same weights as Standard &middot; looser gates only</div>
+      </div>
+      <div class="info-card c-vrel">
+        <div class="info-name">Very Relaxed &minus;50%</div>
+        <div class="info-tag">Threshold &times;0.50</div>
+        <div class="info-desc">Half the Standard thresholds. Acts more like a high-frequency trend follower — enters on weak signals and exits on stop-loss discipline. Stress-tests whether the AI pipeline produces any alpha at all when thresholds are minimal. High drawdown expected; useful as a lower bound.</div>
+        <div class="info-weights">Same weights as Standard &middot; gates halved</div>
+      </div>
+      <div class="info-card c-ai">
+        <div class="info-name">&#129302; Claude (AI Momentum)</div>
+        <div class="info-tag">Threshold &times;0.85 &middot; Custom weights</div>
+        <div class="info-desc">Purpose-built momentum &amp; trend model. Heavy weight on SuperTrend (35%) and momentum (30%); fundamentals deliberately de-emphasised (5%). Non-investable tickers penalised only &minus;10% max — momentum stocks like TSLA/PLTR are not disqualified by value metrics. Hard VIX gate: no trades above VIX 30; reduced size above 25. Designed to capture trending breakouts that pure value models miss.</div>
+        <div class="info-weights">ST 35% &middot; Mom 30% &middot; Insider 20% &middot; Technical 10% &middot; Fundamentals 5%</div>
+      </div>
+    </div>
+  </div>
+  <div class="model-cols" id="cols">
+    <div class="model-col col-standard" id="col-standard"><div class="col-head"><div><div class="col-title">Standard</div><div class="col-sub">Thresholds &times;1.00</div></div><a class="col-link" href="/paper">Open &rarr;</a></div><div class="col-body" id="body-standard"><span class="empty-note">Loading&hellip;</span></div></div>
+    <div class="model-col col-relaxed"  id="col-relaxed"><div class="col-head"><div><div class="col-title">Relaxed &minus;25%</div><div class="col-sub">Thresholds &times;0.75</div></div><a class="col-link" href="/paper/relaxed">Open &rarr;</a></div><div class="col-body" id="body-relaxed"><span class="empty-note">Loading&hellip;</span></div></div>
+    <div class="model-col col-very-relaxed" id="col-very-relaxed"><div class="col-head"><div><div class="col-title">Very Relaxed &minus;50%</div><div class="col-sub">Thresholds &times;0.50</div></div><a class="col-link" href="/paper/very-relaxed">Open &rarr;</a></div><div class="col-body" id="body-very-relaxed"><span class="empty-note">Loading&hellip;</span></div></div>
+    <div class="model-col col-claude" id="col-claude"><div class="col-head"><div><div class="col-title">&#129302; Claude</div><div class="col-sub">ST&times;0.35 &middot; Mom&times;0.30 &middot; VIX gate</div></div><a class="col-link" href="/paper/claude">Open &rarr;</a></div><div class="col-body" id="body-claude"><span class="empty-note">Loading&hellip;</span></div></div>
+  </div>
+  <div style="margin-top:4px;padding:12px 16px;background:#161b22;border:1px solid #30363d;border-radius:8px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+    <div style="font-size:12px;color:#8b949e;">Separate Universe</div>
+    <a href="/paper/russell2000" style="padding:5px 14px;border-radius:6px;border:1px solid #58a6ff;color:#58a6ff;text-decoration:none;font-size:12px;">&#128202; Russell 2000 &rarr;</a>
+    <span style="font-size:11px;color:#8b949e;">Curated 49-stock small-cap watchlist &middot; reviewed by all 4 models</span>
+  </div>
+</main>
+<script>
+function toggleInfo() {
+  var el = document.getElementById('model-info');
+  var btn = document.getElementById('info-btn');
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    btn.textContent = '\u2715 Hide Info';
+  } else {
+    el.style.display = 'none';
+    btn.textContent = '\u2139 Model Info';
+  }
+}
+
+const MODELS = [
+  { key: 'standard',     bodyId: 'body-standard' },
+  { key: 'relaxed',      bodyId: 'body-relaxed' },
+  { key: 'very_relaxed', bodyId: 'body-very-relaxed' },
+  { key: 'claude',       bodyId: 'body-claude' },
+];
+
+function fmt(n, d=2) {
+  if (n == null) return '\u2014';
+  return '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d});
+}
+function fmtPct(n) { return n == null ? '' : (n >= 0 ? '+' : '') + n.toFixed(2) + '%'; }
+function cls(n) { return n > 0 ? 'up' : n < 0 ? 'dn' : 'neu'; }
+
+function renderModel(m, acct) {
+  const el = document.getElementById(m.bodyId);
+  const pnlCls  = cls(acct.total_pnl);
+  const dayCls  = cls(acct.daily_pnl);
+  const lifeCls = cls(acct.lifetime_pnl);
+  const invested = acct.total_invested || 0;
+  let html = `
+    <div class="stat-row"><span class="stat-label">Equity</span><span class="stat-val">${fmt(acct.total_equity, 0)}</span></div>
+    <div class="stat-row"><span class="stat-label">Cash</span><span class="stat-val neu">${fmt(acct.cash, 0)}</span></div>
+    <div class="stat-row"><span class="stat-label">Invested</span><span class="stat-val neu">${fmt(invested, 0)}</span></div>
+    <div class="stat-row"><span class="stat-label">Return on Invested</span><span class="stat-val ${pnlCls}">${(acct.total_pnl||0) >= 0 ? '+' : ''}${fmt(acct.total_pnl||0, 0)} <small>(${fmtPct(acct.total_pnl_pct||0)})</small></span></div>
+    <div class="stat-row"><span class="stat-label">Daily P&L</span><span class="stat-val ${dayCls}">${(acct.daily_pnl||0) >= 0 ? '+' : ''}${fmt(acct.daily_pnl||0, 0)} <small>(${fmtPct(acct.daily_pnl_pct||0)})</small></span></div>
+    <div class="stat-row"><span class="stat-label">Lifetime P&L</span><span class="stat-val ${lifeCls}" style="font-size:12px">${(acct.lifetime_pnl||0) >= 0 ? '+' : ''}${fmt(acct.lifetime_pnl||0, 0)} <small>(${fmtPct(acct.lifetime_pnl_pct||0)})</small></span></div>
+    <hr class="divider">
+  `;
+  if (acct.positions && acct.positions.length) {
+    html += '<table class="pos-mini"><tr><td>Ticker</td><td>P&L</td><td>%</td></tr>';
+    for (const p of acct.positions.slice(0, 8)) {
+      html += `<tr><td><strong>${p.ticker}</strong></td><td class="${cls(p.pnl)}">${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</td><td class="${cls(p.pnl_pct)}">${fmtPct(p.pnl_pct)}</td></tr>`;
+    }
+    html += '</table>';
+    if (acct.positions.length > 8) html += `<div class="empty-note">+${acct.positions.length - 8} more</div>`;
+  } else {
+    html += '<div class="empty-note">No open positions</div>';
+  }
+  el.innerHTML = html;
+}
+
+async function load() {
+  await Promise.all(MODELS.map(async m => {
+    try {
+      const acct = await fetch('/api/paper/account?model=' + m.key).then(r => r.json());
+      renderModel(m, acct);
+    } catch(e) {
+      document.getElementById(m.bodyId).innerHTML = '<span class="empty-note">Error loading</span>';
+    }
+  }));
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/paper/compare", response_class=HTMLResponse)
+def paper_compare_page():
+    from fastapi.responses import HTMLResponse as HR
+    return HR(content=_COMPARE_HTML, headers={"Cache-Control": "no-store"})
+
+
+# ── Daily Activity Report ─────────────────────────────────────────────────────
+
+@app.get("/api/paper/daily-activity")
+def api_daily_activity(date: str = ""):
+    """
+    Return all paper trades across all 4 models for a given date (YYYY-MM-DD).
+    Defaults to today (ET).
+    """
+    import json as _j
+    from datetime import date as _date, timedelta
+    import pytz
+    ET = pytz.timezone("America/New_York")
+
+    if date:
         try:
-            from paper.auto_scheduler import get_scheduler
-            sched = get_scheduler()
-            if sched and sched._market_data and summary.get("positions"):
-                tickers = [p["ticker"] for p in summary["positions"]]
-                quotes = sched._market_data.get_quotes_batch(tickers)
-                for p in summary["positions"]:
-                    q = quotes.get(p["ticker"])
-                    if q and q.get("last_price"):
-                        live = round(float(q["last_price"]), 2)
-                        p["cur_price"] = live
-                        p["mkt_val"]   = round(live * p["qty"], 2)
-                        p["pnl"]       = round(p["mkt_val"] - p["avg_cost"] * p["qty"], 2)
-                        p["pnl_pct"]   = round(p["pnl"] / (p["avg_cost"] * p["qty"]) * 100, 2) if p["avg_cost"] else 0
-        except Exception:
-            pass  # fall back to DB values already in summary
+            target = _date.fromisoformat(date)
+        except ValueError:
+            return JSONResponse({"error": "Invalid date"}, status_code=400)
+    else:
+        target = datetime.now(ET).date()
+
+    from paper.executor import PAPER_MODEL_CONFIGS
+    from paper.account import init_paper_db, PaperTrade, PaperAccount, PaperEquitySnapshot
+
+    result = {}
+    for model_name, cfg in PAPER_MODEL_CONFIGS.items():
+        try:
+            _, Sess = init_paper_db(cfg["db"])
+            with Sess() as s:
+                # Trades on target date (UTC stored, compare by date)
+                trades = (
+                    s.query(PaperTrade)
+                    .filter(PaperTrade.timestamp >= f"{target}T00:00:00")
+                    .filter(PaperTrade.timestamp <  f"{target + timedelta(days=1)}T00:00:00")
+                    .order_by(PaperTrade.timestamp)
+                    .all()
+                )
+                acct = s.query(PaperAccount).first()
+                snap = (
+                    s.query(PaperEquitySnapshot)
+                    .filter(PaperEquitySnapshot.snap_date == target)
+                    .first()
+                )
+                result[model_name] = {
+                    "trades": [
+                        {
+                            "time":      _to_et_str(t.timestamp, "%H:%M ET") if t.timestamp else "—",
+                            "ticker":    t.ticker,
+                            "action":    t.action,
+                            "qty":       t.qty,
+                            "price":     round(t.price, 2),
+                            "total":     round(t.total, 2),
+                            "cash_after": round(t.cash_after, 2) if t.cash_after else None,
+                            "signal":    t.signal,
+                            "notes":     t.notes,
+                            "stop_loss": round(t.stop_loss, 2) if t.stop_loss else None,
+                        }
+                        for t in trades
+                    ],
+                    "trade_count": len(trades),
+                    "buys":  sum(1 for t in trades if t.action == "BUY"),
+                    "sells": sum(1 for t in trades if t.action == "SELL"),
+                    "current_cash":   round(acct.cash, 2) if acct else None,
+                    "eod_equity":     round(snap.total_equity, 2) if snap else None,
+                }
+        except Exception as e:
+            result[model_name] = {"error": str(e), "trades": []}
+
+    return {"date": str(target), "models": result}
+
+
+_DAILY_REPORT_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Daily Report &mdash; NWO</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', monospace; font-size: 13px; }
+  header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;
+           display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .back-btn { padding: 5px 12px; border-radius: 6px; border: 1px solid #30363d;
+              background: #21262d; color: #8b949e; text-decoration: none; font-size: 12px; }
+  header h1 { font-size: 17px; letter-spacing: 1px; color: #58a6ff; }
+  .hdr-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .date-input { background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+                border-radius: 6px; padding: 4px 10px; font-size: 12px; }
+  .btn { padding: 5px 14px; border-radius: 6px; border: 1px solid #30363d;
+         background: #21262d; color: #8b949e; cursor: pointer; font-size: 12px; }
+  .btn:hover { border-color: #58a6ff; color: #58a6ff; }
+  main { padding: 16px; display: flex; flex-direction: column; gap: 20px; }
+  .date-bar { font-size: 12px; color: #8b949e; padding: 4px 0; }
+  .model-section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .model-head { padding: 12px 16px; border-bottom: 1px solid #21262d;
+                display: flex; align-items: center; gap: 12px; }
+  .m-standard   .model-head { border-top: 3px solid #8b949e; }
+  .m-relaxed    .model-head { border-top: 3px solid #d29922; }
+  .m-very_relaxed .model-head { border-top: 3px solid #3fb950; }
+  .m-claude     .model-head { border-top: 3px solid #58a6ff; }
+  .m-title { font-size: 13px; font-weight: 700; }
+  .m-standard   .m-title { color: #8b949e; }
+  .m-relaxed    .m-title { color: #d29922; }
+  .m-very_relaxed .m-title { color: #3fb950; }
+  .m-claude     .m-title { color: #58a6ff; }
+  .m-stats { display: flex; gap: 16px; margin-left: auto; }
+  .m-stat { font-size: 11px; color: #8b949e; text-align: right; }
+  .m-stat strong { display: block; font-size: 13px; color: #e6edf3; }
+  .trade-table { width: 100%; border-collapse: collapse; }
+  .trade-table th { padding: 8px 12px; text-align: left; font-size: 10px; font-weight: 700;
+                    text-transform: uppercase; letter-spacing: 0.5px; color: #6e7681;
+                    border-bottom: 1px solid #21262d; background: #0d1117; }
+  .trade-table td { padding: 8px 12px; border-bottom: 1px solid #161b22; vertical-align: top; }
+  .trade-table tr:last-child td { border-bottom: none; }
+  .trade-table tr:hover td { background: rgba(88,166,255,0.04); }
+  .act-buy  { color: #3fb950; font-weight: 700; }
+  .act-sell { color: #f85149; font-weight: 700; }
+  .notes-cell { font-size: 11px; color: #6e7681; max-width: 400px; line-height: 1.5; }
+  .gate-badge { display: inline-block; font-size: 10px; padding: 1px 5px; border-radius: 3px;
+                margin: 1px; background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+  .gate-pass { border-color: #3fb950; color: #3fb950; background: rgba(63,185,80,0.08); }
+  .gate-fail { border-color: #f85149; color: #f85149; background: rgba(248,81,73,0.08); }
+  .empty-note { padding: 16px; text-align: center; font-size: 12px; color: #8b949e; font-style: italic; }
+  .sig-badge { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 10px;
+               font-weight: 700; background: #21262d; color: #8b949e; }
+  .sig-buy  { background: rgba(63,185,80,0.15); color: #3fb950; }
+  .sig-sell { background: rgba(248,81,73,0.15); color: #f85149; }
+  @media (max-width: 700px) { .m-stats { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <a href="/paper/compare" class="back-btn">&#8592; Compare</a>
+  <h1>&#128196; Daily Activity Report</h1>
+  <div class="hdr-right">
+    <input type="date" id="date-pick" class="date-input">
+    <button class="btn" onclick="load()">&#8635; Load</button>
+  </div>
+</header>
+<main>
+  <div class="date-bar" id="date-bar">Loading&hellip;</div>
+  <div id="report-body"></div>
+</main>
+<script>
+const MODEL_META = {
+  standard:    { label: 'Standard',         cls: 'm-standard' },
+  relaxed:     { label: 'Relaxed \u221225%', cls: 'm-relaxed' },
+  very_relaxed:{ label: 'Very Relaxed \u221250%', cls: 'm-very_relaxed' },
+  claude:      { label: '\uD83E\uDD16 Claude', cls: 'm-claude' },
+};
+const ORDER = ['standard','relaxed','very_relaxed','claude'];
+
+function today() {
+  const d = new Date();
+  return d.toISOString().slice(0,10);
+}
+
+function fmtMoney(n) {
+  if (n == null) return '\u2014';
+  return '$' + Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+
+function parseNotes(notes) {
+  if (!notes) return '';
+  // Separate gate results (lines with ✓/✗ or PASS/FAIL) from risk warnings
+  return notes.split('\n').map(l => l.trim()).filter(Boolean)
+    .map(l => '<div>' + l.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>')
+    .join('');
+}
+
+function renderModel(key, data) {
+  const meta = MODEL_META[key] || {label: key, cls: ''};
+  const trades = data.trades || [];
+  let html = `<div class="model-section ${meta.cls}">
+    <div class="model-head">
+      <span class="m-title">${meta.label}</span>
+      <div class="m-stats">
+        <div class="m-stat"><strong>${data.trade_count||0}</strong>Trades</div>
+        <div class="m-stat"><strong class="act-buy">${data.buys||0}</strong>Buys</div>
+        <div class="m-stat"><strong class="act-sell">${data.sells||0}</strong>Sells</div>
+        ${data.eod_equity ? `<div class="m-stat"><strong>${fmtMoney(data.eod_equity)}</strong>EOD Equity</div>` : ''}
+        ${data.current_cash != null ? `<div class="m-stat"><strong>${fmtMoney(data.current_cash)}</strong>Cash</div>` : ''}
+      </div>
+    </div>`;
+
+  if (data.error) {
+    html += `<div class="empty-note">Error: ${data.error}</div>`;
+  } else if (!trades.length) {
+    html += `<div class="empty-note">No trades on this date</div>`;
+  } else {
+    html += `<table class="trade-table">
+      <thead><tr>
+        <th>Time</th><th>Ticker</th><th>Action</th><th>Qty</th>
+        <th>Price</th><th>Total</th><th>Cash After</th><th>Signal</th><th>Notes / Gates</th>
+      </tr></thead><tbody>`;
+    for (const t of trades) {
+      const actCls = t.action === 'BUY' ? 'act-buy' : t.action === 'SELL' ? 'act-sell' : '';
+      const sigCls = (t.signal||'').toLowerCase().includes('buy') ? 'sig-buy'
+                   : (t.signal||'').toLowerCase().includes('sell') ? 'sig-sell' : '';
+      html += `<tr>
+        <td>${t.time||'—'}</td>
+        <td><strong>${t.ticker}</strong></td>
+        <td class="${actCls}">${t.action}</td>
+        <td>${t.qty}</td>
+        <td>${fmtMoney(t.price)}</td>
+        <td>${fmtMoney(t.total)}</td>
+        <td>${fmtMoney(t.cash_after)}</td>
+        <td><span class="sig-badge ${sigCls}">${t.signal||'—'}</span></td>
+        <td class="notes-cell">${parseNotes(t.notes)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  html += '</div>';
+  return html;
+}
+
+async function load() {
+  const dp = document.getElementById('date-pick');
+  const dateVal = dp.value || today();
+  dp.value = dateVal;
+  document.getElementById('date-bar').textContent = 'Loading ' + dateVal + '…';
+  document.getElementById('report-body').innerHTML = '';
+  try {
+    const data = await fetch('/api/paper/daily-activity?date=' + dateVal).then(r => r.json());
+    document.getElementById('date-bar').textContent =
+      '\uD83D\uDCC5 ' + data.date + ' — showing all 4 models';
+    let html = '';
+    for (const k of ORDER) {
+      if (data.models && data.models[k]) html += renderModel(k, data.models[k]);
+    }
+    document.getElementById('report-body').innerHTML = html || '<div class="empty-note">No data</div>';
+  } catch(e) {
+    document.getElementById('date-bar').textContent = 'Error: ' + e.message;
+  }
+}
+
+// Default to today and auto-load
+document.getElementById('date-pick').value = today();
+load();
+// Auto-refresh every 5 min during the session
+setInterval(load, 300000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/paper/daily-report", response_class=HTMLResponse)
+def paper_daily_report():
+    from fastapi.responses import HTMLResponse as HR
+    return HR(content=_DAILY_REPORT_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/paper/account")
+def api_paper_account(model: str = "standard"):
+    """Return account summary with live P&L — prices from Schwab batch quote."""
+    try:
+        ex = _get_paper_executor(model)
+        # Build price_lookup from live cache for instant response,
+        # executor will batch-fetch any missing tickers
+        with _live_cache_lock:
+            price_lookup = {t: v["price"] for t, v in _live_price_cache.items()}
+        summary = ex.get_account_summary(price_lookup=price_lookup or None)
+        # Recompute portfolio totals with live position values (always, even with no positions)
+        positions     = summary.get("positions", [])
+        total_mkt_val = sum(p["mkt_val"]    for p in positions)
+        total_cost    = sum(p["cost_basis"] for p in positions)
+        cash          = summary.get("cash", 0)
+        total_equity  = round(cash + total_mkt_val, 2)
+        start_bal     = summary.get("starting_balance", 100_000.0) or 100_000.0
+
+        # invested_pnl = gain/loss on currently held positions only (mkt value vs cost basis)
+        invested_pnl     = round(total_mkt_val - total_cost, 2)
+        invested_pnl_pct = round((invested_pnl / total_cost * 100) if total_cost else 0, 2)
+
+        summary["positions_value"]  = round(total_mkt_val, 2)
+        summary["total_invested"]   = round(total_cost, 2)
+        summary["total_equity"]     = total_equity
+        summary["total_pnl"]        = invested_pnl
+        summary["total_pnl_pct"]    = invested_pnl_pct
+        # Keep lifetime P&L (equity vs starting $100k) as a separate field
+        summary["lifetime_pnl"]     = round(total_equity - start_bal, 2)
+        summary["lifetime_pnl_pct"] = round((total_equity - start_bal) / start_bal * 100, 2)
         return summary
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
@@ -2558,30 +4249,105 @@ def api_paper_account():
 
 @app.get("/api/prices")
 def api_prices(tickers: str = ""):
-    """Return {ticker: latest_close_price} from PriceHistory for any requested tickers."""
+    """Return {ticker: price} — live intraday price during market hours, else latest EOD close."""
     if not tickers:
         return {}
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     result = {}
-    try:
-        from models.database import init_db as _init_db, PriceHistory, Company
-        _, _Session = _init_db(config.database.url, echo=False)
-        with _Session() as s:
-            rows = (
-                s.query(Company.ticker, PriceHistory.close)
-                .join(PriceHistory, PriceHistory.company_id == Company.id)
-                .filter(Company.ticker.in_(ticker_list))
-                .order_by(Company.ticker, PriceHistory.date.desc())
-                .all()
-            )
-            seen: set = set()
-            for ticker, close in rows:
-                if ticker not in seen and close:
-                    result[ticker] = round(float(close), 2)
-                    seen.add(ticker)
-    except Exception:
-        pass
+    # Live cache first
+    for ticker in ticker_list:
+        live = _live_price(ticker)
+        if live:
+            result[ticker] = live["price"]
+    # EOD fallback for any missed tickers
+    remaining = [t for t in ticker_list if t not in result]
+    if remaining:
+        try:
+            from models.database import init_db as _init_db, PriceHistory, Company
+            _, _Session = _init_db(config.database.url, echo=False)
+            with _Session() as s:
+                rows = (
+                    s.query(Company.ticker, PriceHistory.close)
+                    .join(PriceHistory, PriceHistory.company_id == Company.id)
+                    .filter(Company.ticker.in_(remaining))
+                    .order_by(Company.ticker, PriceHistory.date.desc())
+                    .all()
+                )
+                seen: set = set()
+                for ticker, close in rows:
+                    if ticker not in seen and close:
+                        result[ticker] = round(float(close), 2)
+                        seen.add(ticker)
+        except Exception:
+            pass
     return result
+
+
+@app.get("/api/live-prices")
+def api_live_prices():
+    """Return all cached live prices. Forces a refresh."""
+    _refresh_live_prices(force=True)
+    with _live_cache_lock:
+        return {
+            t: {"price": v["price"], "change_pct": v.get("change_pct"), "prev_close": v.get("prev_close")}
+            for t, v in _live_price_cache.items()
+        }
+
+
+@app.get("/api/paper/live-prices")
+def api_paper_live_prices(model: str = "standard"):
+    """Lightweight: returns {ticker: {price, pnl, pnl_pct, mkt_val}} for open positions."""
+    try:
+        ex = _get_paper_executor(model)
+        with _live_cache_lock:
+            price_lookup = {t: v["price"] for t, v in _live_price_cache.items()}
+        from paper.account import PaperPosition
+        with ex.Session() as s:
+            positions = s.query(PaperPosition).all()
+        result = {}
+        for p in positions:
+            if p.qty <= 0:
+                continue
+            cur = price_lookup.get(p.ticker) or p.avg_cost
+            cost_basis = round(p.qty * p.avg_cost, 2)
+            mkt_val    = round(p.qty * cur, 2)
+            pnl        = round(mkt_val - cost_basis, 2)
+            pnl_pct    = round((pnl / cost_basis * 100) if cost_basis else 0, 2)
+            result[p.ticker] = {"price": round(cur, 2), "pnl": pnl, "pnl_pct": pnl_pct, "mkt_val": mkt_val}
+        return result
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+
+@app.get("/api/paper/r2000-universe")
+def api_r2000_universe():
+    """Return R2000 universe + which tickers are active/held per model."""
+    import json
+    from pathlib import Path
+    from paper.executor import PAPER_MODEL_CONFIGS
+    sg_r2k = json.loads(Path("data/stagegate_russell2000.json").read_text(encoding="utf-8"))
+    universe = sg_r2k.get("stage1", [])
+    universe_set = set(universe)
+    model_stage2: dict = {}
+    model_stage3: dict = {}
+    for model, cfg in PAPER_MODEL_CONFIGS.items():
+        try:
+            sg = json.loads(Path(cfg["stagegate"]).read_text(encoding="utf-8"))
+            model_stage2[model] = [t for t in sg.get("stage2", []) if t in universe_set]
+            model_stage3[model] = [t for t in sg.get("stage3", []) if t in universe_set]
+        except Exception:
+            model_stage2[model] = []
+            model_stage3[model] = []
+    active = list({t for lst in model_stage2.values() for t in lst})
+    held   = list({t for lst in model_stage3.values() for t in lst})
+    return {
+        "universe":     universe,
+        "active":       active,
+        "held":         held,
+        "model_stage2": model_stage2,
+        "model_stage3": model_stage3,
+    }
 
 
 @app.get("/api/ai-exits")
@@ -2606,21 +4372,102 @@ async def api_ai_exits_post(request: Request):
     return {"status": "ok"}
 
 
+# ── Per-model AI exits (under /api/paper/ so fetch interceptor adds ?model=) ──
+def _ai_exits_file(model: str) -> "Path":
+    from pathlib import Path
+    return Path("data/ai_exits.json") if model == "standard" else Path(f"data/ai_exits_{model}.json")
+
+@app.get("/api/paper/ai-exits")
+def api_paper_ai_exits_get(model: str = "standard"):
+    import json
+    f = _ai_exits_file(model)
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+@app.post("/api/paper/ai-exits")
+async def api_paper_ai_exits_post(request: Request, model: str = "standard"):
+    import json
+    body = await request.json()
+    f = _ai_exits_file(model)
+    current = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    current.update({k: bool(v) for k, v in body.items()})
+    f.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    return {"status": "ok"}
+
+
+# ── Per-model stagegate (under /api/paper/ so fetch interceptor adds ?model=) ──
+def _model_stagegate_file(model: str) -> str:
+    files = {
+        "standard":    "data/stagegate.json",
+        "relaxed":     "data/stagegate_relaxed.json",
+        "very_relaxed":"data/stagegate_very_relaxed.json",
+        "claude":      "data/stagegate_claude.json",
+    }
+    return files.get(model, "data/stagegate.json")
+
+@app.get("/api/paper/stagegate")
+def api_paper_stagegate_get(model: str = "standard"):
+    import json
+    from pathlib import Path
+    p = Path(_model_stagegate_file(model))
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"stage1": list(config.watchlist), "stage2": [], "stage3": []}
+
+@app.post("/api/paper/stagegate")
+async def api_paper_stagegate_post(request: Request, model: str = "standard"):
+    import json, threading
+    from pathlib import Path
+    body = await request.json()
+    stage1 = body.get("stage1", [])
+    stage2 = body.get("stage2", [])
+    stage3 = body.get("stage3", [])
+
+    if model == "standard":
+        # Standard: full save + sync stage1/2 to all models
+        existing = _load_stagegate()
+        existing_all = set(existing.get("stage1",[]) + existing.get("stage2",[]) + existing.get("stage3",[]))
+        incoming_all = set(stage1 + stage2 + stage3)
+        new_tickers = [t for t in incoming_all - existing_all if t]
+        _save_stagegate({"stage1": stage1, "stage2": stage2, "stage3": stage3})
+        if new_tickers:
+            def _bg():
+                import time; time.sleep(2)
+                try:
+                    from paper.auto_scheduler import get_scheduler
+                    s = get_scheduler()
+                    if s: s.trigger_now()
+                except Exception:
+                    pass
+            threading.Thread(target=_bg, daemon=True).start()
+    else:
+        # Non-standard: only update stage3 in the model-specific file;
+        # stage1/stage2 are managed by standard and synced to all models
+        p = Path(_model_stagegate_file(model))
+        existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        existing["stage3"] = stage3
+        # Accept stage1/stage2 writes but sync them back through standard to keep consistency
+        existing["stage1"] = stage1
+        existing["stage2"] = stage2
+        p.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    return {"status": "ok"}
+
+
 @app.get("/api/paper/trades")
-def api_paper_trades():
+def api_paper_trades(model: str = "standard"):
     try:
-        from paper.executor import PaperExecutor
-        ex = PaperExecutor()
+        ex = _get_paper_executor(model)
         return ex.get_recent_trades(limit=100)
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
 
 
 @app.post("/api/paper/reset")
-def api_paper_reset():
+def api_paper_reset(model: str = "standard"):
     try:
-        from paper.executor import PaperExecutor
-        ex = PaperExecutor()
+        ex = _get_paper_executor(model)
         ex.reset_account()
         return {"status": "reset"}
     except Exception as e:
@@ -2744,9 +4591,27 @@ def _load_stagegate() -> dict:
 
 def _save_stagegate(data: dict):
     import json, os
+    from pathlib import Path
     os.makedirs("data", exist_ok=True)
     with open(_STAGEGATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    # Sync stage1/stage2 to all other model stagegate files (stage3 is model-specific)
+    _other_sg_files = [
+        "data/stagegate_relaxed.json",
+        "data/stagegate_very_relaxed.json",
+        "data/stagegate_claude.json",
+    ]
+    for sg_path in _other_sg_files:
+        try:
+            p = Path(sg_path)
+            existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+            existing["stage1"] = data.get("stage1", [])
+            existing["stage2"] = data.get("stage2", [])
+            existing.setdefault("stage3", [])
+            with open(sg_path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+        except Exception:
+            pass
 
 
 @app.get("/stagegate", response_class=HTMLResponse)
@@ -2873,7 +4738,7 @@ PAPER_JS   = PAPER_JS + _SG_JS
 
 
 @app.post("/api/paper/activate")
-async def api_paper_activate(request: Request):
+async def api_paper_activate(request: Request, model: str = "standard"):
     """Execute a manual paper buy when dragging a stock to Stage 2."""
     import datetime
     body   = await request.json()
@@ -2885,12 +4750,13 @@ async def api_paper_activate(request: Request):
         return JSONResponse(status_code=400, content={"error": "invalid input"})
 
     try:
-        from paper.executor  import PaperExecutor
+        from paper.executor  import PaperExecutor, PAPER_MODEL_CONFIGS
         from paper.account   import init_paper_db, PaperAccount, PaperPosition, PaperTrade
         from models.database import init_db as _init_db
 
+        cfg = PAPER_MODEL_CONFIGS.get(model, PAPER_MODEL_CONFIGS["standard"])
         _, MainSession = _init_db(config.database.url, echo=False)
-        ex    = PaperExecutor(main_db_session_factory=MainSession)
+        ex    = PaperExecutor(main_db_session_factory=MainSession, db_path=cfg["db"], stagegate_file=cfg["stagegate"])
         price = ex._latest_price(ticker)
         if not price or price <= 0:
             return JSONResponse(status_code=400, content={"error": f"no price data for {ticker}"})
@@ -2899,7 +4765,7 @@ async def api_paper_activate(request: Request):
         if qty <= 0:
             return JSONResponse(status_code=400, content={"error": "quantity rounds to zero"})
 
-        _, PaperSession = init_paper_db()
+        _, PaperSession = init_paper_db(cfg["db"])
         with PaperSession() as session:
             acct = session.query(PaperAccount).first()
             if not acct:
@@ -2927,13 +4793,19 @@ async def api_paper_activate(request: Request):
             session.commit()
 
         # Persist stage gate state change — manual buy goes to Stage 3
-        sg = _load_stagegate()
+        import json as _json, os as _os
+        sg_file = cfg["stagegate"]
+        if _os.path.exists(sg_file):
+            sg = _json.loads(open(sg_file, encoding="utf-8").read())
+        else:
+            sg = _load_stagegate()
         for k in ("stage1", "stage2", "stage3"):
             sg.setdefault(k, [])
             if ticker in sg[k]:
                 sg[k].remove(ticker)
         sg["stage3"].append(ticker)
-        _save_stagegate(sg)
+        _os.makedirs("data", exist_ok=True)
+        open(sg_file, "w", encoding="utf-8").write(_json.dumps(sg, indent=2))
 
         return {"status": "ok", "ticker": ticker, "qty": qty, "price": price, "total": total}
 
@@ -2943,17 +4815,49 @@ async def api_paper_activate(request: Request):
 
 
 # ── AI Decision info modal (auto-patched) ─────────────────────────────────────
-_AI_CSS        = '\n  /* ── AI Decision modal ──────────────────────────────────────── */\n  .sg-info { background: none; border: 1px solid #30363d; color: #58a6ff; cursor: pointer;\n             font-size: 12px; padding: 1px 5px; border-radius: 4px; line-height: 1.4; }\n  .sg-info:hover { background: rgba(88,166,255,0.1); }\n  .ai-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.80);\n                display: flex; align-items: flex-start; justify-content: center;\n                z-index: 10000; overflow-y: auto; padding: 40px 16px; }\n  .ai-modal { background: #161b22; border: 1px solid #30363d; border-radius: 12px;\n              width: 100%; max-width: 580px; display: flex; flex-direction: column; gap: 0; }\n  .ai-modal-head { padding: 18px 20px 14px; border-bottom: 1px solid #21262d;\n                   display: flex; align-items: center; gap: 12px; }\n  .ai-modal-ticker { font-size: 20px; font-weight: 700; color: #e6edf3; }\n  .ai-modal-price  { font-size: 13px; color: #8b949e; }\n  .ai-sig-badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700;\n                  letter-spacing: 0.5px; margin-left: auto; }\n  .ai-sig-bull { background: rgba(63,185,80,0.15); color: #3fb950; border: 1px solid #3fb950; }\n  .ai-sig-bear { background: rgba(248,81,73,0.15);  color: #f85149; border: 1px solid #f85149; }\n  .ai-sig-hold { background: rgba(139,148,158,0.15); color: #8b949e; border: 1px solid #8b949e; }\n  .ai-modal-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 14px; }\n  .ai-narrative { font-size: 13px; color: #c9d1d9; line-height: 1.6;\n                  background: #0d1117; border: 1px solid #21262d; border-radius: 8px;\n                  padding: 12px 14px; }\n  .ai-blocking { font-size: 12px; color: #f85149; background: rgba(248,81,73,0.08);\n                 border: 1px solid rgba(248,81,73,0.25); border-radius: 6px;\n                 padding: 8px 12px; }\n  .ai-gates { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }\n  .ai-gate-col { display: flex; flex-direction: column; gap: 4px; }\n  .ai-gate-title { font-size: 10px; font-weight: 700; letter-spacing: 1px;\n                   text-transform: uppercase; margin-bottom: 2px; }\n  .ai-gate-pass .ai-gate-title { color: #3fb950; }\n  .ai-gate-fail .ai-gate-title { color: #f85149; }\n  .ai-gate-item { font-size: 11px; color: #c9d1d9; padding: 4px 8px;\n                  border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; }\n  .ai-gate-pass .ai-gate-item { background: rgba(63,185,80,0.06); }\n  .ai-gate-fail .ai-gate-item { background: rgba(248,81,73,0.06); }\n  .ai-gate-icon { flex-shrink: 0; margin-top: 1px; }\n  .ai-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; }\n  .ai-metric { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;\n               padding: 8px 10px; text-align: center; }\n  .ai-metric-label { font-size: 9px; color: #8b949e; letter-spacing: 0.8px;\n                     text-transform: uppercase; margin-bottom: 4px; }\n  .ai-metric-value { font-size: 14px; font-weight: 700; color: #e6edf3; }\n  .ai-modal-foot { padding: 12px 20px; border-top: 1px solid #21262d;\n                   display: flex; justify-content: space-between; align-items: center; }\n  .ai-gen-time { font-size: 10px; color: #8b949e; }\n  .ai-close-btn { padding: 6px 18px; border-radius: 6px; border: 1px solid #30363d;\n                  background: #21262d; color: #8b949e; cursor: pointer; font-size: 13px; }\n  .ai-close-btn:hover { background: #30363d; }\n'
+_AI_CSS        = '\n  /* ── AI Decision modal ──────────────────────────────────────── */\n  .sg-info { background: none; border: 1px solid #30363d; color: #58a6ff; cursor: pointer;\n             font-size: 12px; padding: 1px 5px; border-radius: 4px; line-height: 1.4; }\n  .sg-info:hover { background: rgba(88,166,255,0.1); }\n  .ai-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.80);\n                display: flex; align-items: flex-start; justify-content: center;\n                z-index: 10000; overflow-y: auto; padding: 40px 16px; }\n  .ai-modal { background: #161b22; border: 1px solid #30363d; border-radius: 12px;\n              width: 100%; max-width: 580px; display: flex; flex-direction: column; gap: 0; }\n  .ai-modal-head { padding: 18px 20px 14px; border-bottom: 1px solid #21262d;\n                   display: flex; align-items: center; gap: 12px; }\n  .ai-modal-ticker { font-size: 20px; font-weight: 700; color: #e6edf3; }\n  .ai-modal-price  { font-size: 13px; color: #8b949e; }\n  .ai-sig-badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700;\n                  letter-spacing: 0.5px; margin-left: auto; }\n  .ai-sig-bull { background: rgba(63,185,80,0.15); color: #3fb950; border: 1px solid #3fb950; }\n  .ai-sig-bear { background: rgba(248,81,73,0.15);  color: #f85149; border: 1px solid #f85149; }\n  .ai-sig-hold { background: rgba(139,148,158,0.15); color: #8b949e; border: 1px solid #8b949e; }\n  .ai-modal-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 14px; }\n  .ai-narrative { font-size: 13px; color: #c9d1d9; line-height: 1.6;\n                  background: #0d1117; border: 1px solid #21262d; border-radius: 8px;\n                  padding: 12px 14px; }\n  .ai-blocking { font-size: 12px; color: #f85149; background: rgba(248,81,73,0.08);\n                 border: 1px solid rgba(248,81,73,0.25); border-radius: 6px;\n                 padding: 8px 12px; }\n  .ai-gates { display: flex; flex-wrap: wrap; gap: 10px; }\n  .ai-gate-col { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 130px; }\n  .ai-gate-title { font-size: 10px; font-weight: 700; letter-spacing: 1px;\n                   text-transform: uppercase; margin-bottom: 2px; }\n  .ai-gate-pass .ai-gate-title { color: #3fb950; }\n  .ai-gate-bypass .ai-gate-title { color: #d29922; }\n  .ai-gate-fail .ai-gate-title { color: #f85149; }\n  .ai-gate-item { font-size: 11px; color: #c9d1d9; padding: 4px 8px;\n                  border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; }\n  .ai-gate-pass .ai-gate-item { background: rgba(63,185,80,0.06); }\n  .ai-gate-bypass .ai-gate-item { background: rgba(210,153,34,0.06); }\n  .ai-gate-fail .ai-gate-item { background: rgba(248,81,73,0.06); }\n  .ai-gate-icon { flex-shrink: 0; margin-top: 1px; }\n  .ai-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; }\n  .ai-metric { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;\n               padding: 8px 10px; text-align: center; }\n  .ai-metric-label { font-size: 9px; color: #8b949e; letter-spacing: 0.8px;\n                     text-transform: uppercase; margin-bottom: 4px; }\n  .ai-metric-value { font-size: 14px; font-weight: 700; color: #e6edf3; }\n  .ai-modal-foot { padding: 12px 20px; border-top: 1px solid #21262d;\n                   display: flex; justify-content: space-between; align-items: center; }\n  .ai-gen-time { font-size: 10px; color: #8b949e; }\n  .ai-close-btn { padding: 6px 18px; border-radius: 6px; border: 1px solid #30363d;\n                  background: #21262d; color: #8b949e; cursor: pointer; font-size: 13px; }\n  .ai-close-btn:hover { background: #30363d; }\n'
 _AI_MODAL_HTML = '\n  <!-- AI Decision modal -->\n  <div id="ai-overlay" class="ai-overlay" style="display:none" onclick="if(event.target===this) aiClose()">\n    <div class="ai-modal">\n      <div class="ai-modal-head">\n        <div class="ai-modal-ticker" id="ai-ticker"></div>\n        <div class="ai-modal-price" id="ai-price"></div>\n        <span class="ai-sig-badge" id="ai-sig-badge"></span>\n      </div>\n      <div class="ai-modal-body">\n        <div class="ai-narrative" id="ai-narrative"></div>\n        <div class="ai-blocking" id="ai-blocking" style="display:none"></div>\n        <div class="ai-gates" id="ai-gates"></div>\n        <div class="ai-metrics" id="ai-metrics"></div>\n      </div>\n      <div class="ai-modal-foot">\n        <span class="ai-gen-time" id="ai-gen-time"></span>\n        <button class="ai-close-btn" onclick="aiClose()">Close</button>\n      </div>\n    </div>\n  </div>\n'
-_AI_JS         = '\n// ── AI Decision info modal ────────────────────────────────────────────────────\n\n// Override sgCardHtml to add the info (ⓘ) button\nfunction sgCardHtml(ticker, stage) {\n  const s   = _sgSigs[ticker] || {};\n  const sig = (s.signal || \'HOLD\').toUpperCase();\n  const sc  = sig === \'BUY\' || sig === \'STRONG_BUY\'   ? \'sig-bull\'\n            : sig === \'SELL\' || sig === \'STRONG_SELL\'  ? \'sig-bear\' : \'\';\n  const price = s.current_price ? \'$\' + s.current_price.toFixed(2) : \'\';\n  return \'<div class="sg-card" draggable="true" data-ticker="\' + ticker + \'" data-stage="\' + stage + \'" \'\n    + \'ondragstart="sgDragStart(event)" ondragend="sgDragEnd(event)">\'\n    + \'<div class="sg-ticker">\' + ticker + \'</div>\'\n    + \'<div class="sg-meta">\' + price + \'</div>\'\n    + \'<span class="sg-signal \' + sc + \'">\' + sig + \'</span>\'\n    + \'<button class="sg-info"  data-ticker="\' + ticker + \'" onclick="sgShowInfo(this.dataset.ticker)" title="AI Decision">&#9432;</button>\'\n    + \'<button class="sg-remove" data-ticker="\' + ticker + \'" onclick="sgRemove(this.dataset.ticker)" title="Remove">&#x2715;</button>\'\n    + \'</div>\';\n}\n\nfunction sgShowInfo(ticker) {\n  const s = _sgSigs[ticker] || {};\n  let reason = {};\n  try { reason = JSON.parse(s.reasoning || \'{}\'); } catch(e) {}\n\n  // Header\n  document.getElementById(\'ai-ticker\').textContent = ticker;\n  const price = s.current_price;\n  document.getElementById(\'ai-price\').textContent = price ? \'$\' + price.toFixed(2) : \'\';\n\n  const sig = (s.signal || \'HOLD\').toUpperCase();\n  const badge = document.getElementById(\'ai-sig-badge\');\n  badge.textContent = sig;\n  badge.className = \'ai-sig-badge \' +\n    (sig === \'BUY\' || sig === \'STRONG_BUY\'   ? \'ai-sig-bull\' :\n     sig === \'SELL\' || sig === \'STRONG_SELL\' ? \'ai-sig-bear\' : \'ai-sig-hold\');\n\n  // Narrative\n  document.getElementById(\'ai-narrative\').textContent =\n    reason.narrative || \'No AI narrative available yet.\';\n\n  // Blocking reason\n  const blockEl = document.getElementById(\'ai-blocking\');\n  if (reason.blocking_reason) {\n    blockEl.textContent = \'\\u26d4 Blocked: \' + reason.blocking_reason;\n    blockEl.style.display = \'block\';\n  } else {\n    blockEl.style.display = \'none\';\n  }\n\n  // Gates\n  const passed = reason.gates_passed || [];\n  const failed = reason.gates_failed || [];\n  let gatesHtml = \'\';\n  if (passed.length) {\n    gatesHtml += \'<div class="ai-gate-col ai-gate-pass">\'\n      + \'<div class="ai-gate-title">&#10003; Gates Passed</div>\'\n      + passed.map(g => \'<div class="ai-gate-item"><span class="ai-gate-icon">&#9679;</span><span>\' + g + \'</span></div>\').join(\'\')\n      + \'</div>\';\n  }\n  if (failed.length) {\n    gatesHtml += \'<div class="ai-gate-col ai-gate-fail">\'\n      + \'<div class="ai-gate-title">&#10007; Gates Failed</div>\'\n      + failed.map(g => \'<div class="ai-gate-item"><span class="ai-gate-icon">&#9679;</span><span>\' + g + \'</span></div>\').join(\'\')\n      + \'</div>\';\n  }\n  document.getElementById(\'ai-gates\').innerHTML = gatesHtml;\n\n  // Metrics\n  function pct(v)  { return v != null ? (v * 100).toFixed(1) + \'%\' : \'—\'; }\n  function f2(v)   { return v != null ? v.toFixed(2) : \'—\'; }\n  const metrics = [\n    { label: \'Signal\',    value: sig },\n    { label: \'Conf\',      value: pct(s.confidence) },\n    { label: \'P(Bull)\',   value: pct(reason.p_bull) },\n    { label: \'Kelly\',     value: f2(reason.kelly) },\n    { label: \'MoS\',       value: pct(s.margin_of_safety) },\n    { label: \'FUD\',       value: f2(s.fud_score) },\n    { label: \'Regime\',    value: (reason.reynolds_regime || \'—\').toUpperCase() },\n    { label: \'Quantum\',   value: (reason.quantum_state  || \'—\').toUpperCase() },\n  ];\n  document.getElementById(\'ai-metrics\').innerHTML = metrics.map(m =>\n    \'<div class="ai-metric"><div class="ai-metric-label">\' + m.label + \'</div>\'\n    + \'<div class="ai-metric-value">\' + m.value + \'</div></div>\'\n  ).join(\'\');\n\n  // Footer timestamp\n  document.getElementById(\'ai-gen-time\').textContent =\n    s.generated_at ? \'Generated: \' + s.generated_at : \'\';\n\n  document.getElementById(\'ai-overlay\').style.display = \'flex\';\n}\n\nfunction aiClose() {\n  document.getElementById(\'ai-overlay\').style.display = \'none\';\n}\n\n// Close on Escape\ndocument.addEventListener(\'keydown\', e => { if (e.key === \'Escape\') aiClose(); });\n'
+_AI_JS         = '\n// ── AI Decision info modal ────────────────────────────────────────────────────\n\n// Override sgCardHtml to add the info (ⓘ) button\nfunction sgCardHtml(ticker, stage) {\n  const s   = _sgSigs[ticker] || {};\n  const sig = (s.signal || \'HOLD\').toUpperCase();\n  const sc  = sig === \'BUY\' || sig === \'STRONG_BUY\'   ? \'sig-bull\'\n            : sig === \'SELL\' || sig === \'STRONG_SELL\'  ? \'sig-bear\' : \'\';\n  const price = s.current_price ? \'$\' + s.current_price.toFixed(2) : \'\';\n  return \'<div class="sg-card" draggable="true" data-ticker="\' + ticker + \'" data-stage="\' + stage + \'" \'\n    + \'ondragstart="sgDragStart(event)" ondragend="sgDragEnd(event)">\'\n    + \'<div class="sg-ticker">\' + ticker + \'</div>\'\n    + \'<div class="sg-meta">\' + price + \'</div>\'\n    + \'<span class="sg-signal \' + sc + \'">\' + sig + \'</span>\'\n    + \'<button class="sg-info"  data-ticker="\' + ticker + \'" onclick="sgShowInfo(this.dataset.ticker)" title="AI Decision">&#9432;</button>\'\n    + \'<button class="sg-remove" data-ticker="\' + ticker + \'" onclick="sgRemove(this.dataset.ticker)" title="Remove">&#x2715;</button>\'\n    + \'</div>\';\n}\n\nfunction sgShowInfo(ticker) {\n  const s = _sgSigs[ticker] || {};\n  let reason = {};\n  try { reason = JSON.parse(s.reasoning || \'{}\'); } catch(e) {}\n\n  // Header\n  document.getElementById(\'ai-ticker\').textContent = ticker;\n  const price = s.current_price;\n  document.getElementById(\'ai-price\').textContent = price ? \'$\' + price.toFixed(2) : \'\';\n\n  const sig = (s.signal || \'HOLD\').toUpperCase();\n  const badge = document.getElementById(\'ai-sig-badge\');\n  badge.textContent = sig;\n  badge.className = \'ai-sig-badge \' +\n    (sig === \'BUY\' || sig === \'STRONG_BUY\'   ? \'ai-sig-bull\' :\n     sig === \'SELL\' || sig === \'STRONG_SELL\' ? \'ai-sig-bear\' : \'ai-sig-hold\');\n\n  // Narrative\n  document.getElementById(\'ai-narrative\').textContent =\n    reason.narrative || \'No AI narrative available yet.\';\n\n  // Blocking reason\n  const blockEl = document.getElementById(\'ai-blocking\');\n  if (reason.blocking_reason) {\n    blockEl.textContent = \'\\u26d4 Blocked: \' + reason.blocking_reason;\n    blockEl.style.display = \'block\';\n  } else {\n    blockEl.style.display = \'none\';\n  }\n\n  // Gates — split passed into truly-passed vs bypassed\n  const _allPassed = reason.gates_passed || [];\n  const failed     = reason.gates_failed || [];\n  const bypassed   = _allPassed.filter(g => g.includes(\'BYPASSED\'));\n  const passed     = _allPassed.filter(g => !g.includes(\'BYPASSED\'));\n  function _gateItem(g) {\n    return \'<div class="ai-gate-item"><span class="ai-gate-icon">&#9679;</span><span>\' + g + \'</span></div>\';\n  }\n  let gatesHtml = \'\';\n  if (passed.length) {\n    gatesHtml += \'<div class="ai-gate-col ai-gate-pass">\'\n      + \'<div class="ai-gate-title">&#10003; Gates Passed</div>\'\n      + passed.map(_gateItem).join(\'\')\n      + \'</div>\';\n  }\n  if (bypassed.length) {\n    gatesHtml += \'<div class="ai-gate-col ai-gate-bypass">\'\n      + \'<div class="ai-gate-title">&#8631; Bypassed</div>\'\n      + bypassed.map(_gateItem).join(\'\')\n      + \'</div>\';\n  }\n  if (failed.length) {\n    gatesHtml += \'<div class="ai-gate-col ai-gate-fail">\'\n      + \'<div class="ai-gate-title">&#10007; Gates Failed</div>\'\n      + failed.map(_gateItem).join(\'\')\n      + \'</div>\';\n  }\n  document.getElementById(\'ai-gates\').innerHTML = gatesHtml;\n\n  // Metrics\n  function pct(v)  { return v != null ? (v * 100).toFixed(1) + \'%\' : \'—\'; }\n  function f2(v)   { return v != null ? v.toFixed(2) : \'—\'; }\n  const metrics = [\n    { label: \'Signal\',    value: sig },\n    { label: \'Conf\',      value: pct(s.confidence) },\n    { label: \'P(Bull)\',   value: pct(reason.p_bull) },\n    { label: \'Kelly\',     value: f2(reason.kelly) },\n    { label: \'MoS\',       value: pct(s.margin_of_safety) },\n    { label: \'FUD\',       value: f2(s.fud_score) },\n    { label: \'Regime\',    value: (reason.reynolds_regime || \'—\').toUpperCase() },\n    { label: \'Quantum\',   value: (reason.quantum_state  || \'—\').toUpperCase() },\n  ];\n  document.getElementById(\'ai-metrics\').innerHTML = metrics.map(m =>\n    \'<div class="ai-metric"><div class="ai-metric-label">\' + m.label + \'</div>\'\n    + \'<div class="ai-metric-value">\' + m.value + \'</div></div>\'\n  ).join(\'\');\n\n  // Footer timestamp\n  document.getElementById(\'ai-gen-time\').textContent =\n    s.generated_at ? \'Generated: \' + s.generated_at : \'\';\n\n  document.getElementById(\'ai-overlay\').style.display = \'flex\';\n}\n\nfunction aiClose() {\n  document.getElementById(\'ai-overlay\').style.display = \'none\';\n}\n\n// Close on Escape\ndocument.addEventListener(\'keydown\', e => { if (e.key === \'Escape\') aiClose(); });\n'
 
 PAPER_HTML = PAPER_HTML.replace('</style>', _AI_CSS + '</style>', 1).replace('</main>', _AI_MODAL_HTML + '</main>', 1)
 PAPER_JS   = PAPER_JS + _AI_JS
 
 
 # ── 3-Stage UI override (auto-patched) ────────────────────────────────────────
-_SG3_JS  = '\n// ════════════════════════════════════════════════════════════════════════════\n// Stage Gate 3-Stage (overrides old 2-stage code)\n// ════════════════════════════════════════════════════════════════════════════\n(function() {\n\n// ── Inject CSS ────────────────────────────────────────────────────────────────\nconst _sg3style = document.createElement(\'style\');\n_sg3style.textContent = \'\\n  /* ── Stage Gate 3-col ─────────────────────────────────────── */\\n  .sg3-wrap  { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0; }\\n  .sg3-col   { display: flex; flex-direction: column; border-right: 1px solid #21262d; min-width: 0; }\\n  .sg3-col:last-child { border-right: none; }\\n  .sg3-hd    { padding: 10px 14px; background: #0d1117; border-bottom: 1px solid #21262d;\\n               display: flex; align-items: center; gap: 8px; }\\n  .sg3-c1 .sg3-hd  { border-top: 3px solid #8b949e; }\\n  .sg3-c2 .sg3-hd  { border-top: 3px solid #58a6ff; }\\n  .sg3-c3 .sg3-hd  { border-top: 3px solid #3fb950; }\\n  .sg3-title { font-size: 12px; font-weight: 700; }\\n  .sg3-c1 .sg3-title { color: #8b949e; }\\n  .sg3-c2 .sg3-title { color: #58a6ff; }\\n  .sg3-c3 .sg3-title { color: #3fb950; }\\n  .sg3-sub   { font-size: 10px; color: #8b949e; margin-top: 2px; }\\n  .sg3-cnt   { margin-left: auto; font-size: 11px; color: #8b949e;\\n               background: #21262d; padding: 2px 7px; border-radius: 10px; }\\n  .sg3-zone  { flex: 1; min-height: 80px; padding: 8px;\\n               display: flex; flex-direction: column; gap: 6px; }\\n  .sg3-zone.drag-over { background: rgba(88,166,255,0.05);\\n                        outline: 2px dashed #58a6ff; outline-offset: -3px; border-radius: 4px; }\\n  .sg3-card  { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;\\n               padding: 7px 10px; cursor: grab; display: flex; align-items: center;\\n               gap: 6px; user-select: none; transition: border-color 0.15s; flex-wrap: wrap; }\\n  .sg3-card:hover   { border-color: #58a6ff; }\\n  .sg3-card:active  { cursor: grabbing; }\\n  .sg3-card.dragging { opacity: 0.4; }\\n  .sg3-c2 .sg3-card { border-left: 3px solid #58a6ff; }\\n  .sg3-c3 .sg3-card { border-left: 3px solid #3fb950; }\\n  .sg3-tick  { font-size: 13px; font-weight: 700; min-width: 52px; }\\n  .sg3-meta  { font-size: 10px; color: #8b949e; flex: 1; min-width: 50px; }\\n  .sg3-pnl   { font-size: 10px; font-weight: 600; }\\n  .sg3-sig   { font-size: 10px; font-weight: 600; }\\n  .sg3-acts  { display: flex; gap: 3px; margin-left: auto; }\\n  .sg3-btn   { background: none; border: 1px solid #30363d; color: #8b949e;\\n               cursor: pointer; font-size: 11px; padding: 2px 6px;\\n               border-radius: 4px; line-height: 1.4; white-space: nowrap; }\\n  .sg3-btn-buy  { border-color: #3fb950; color: #3fb950; }\\n  .sg3-btn-buy:hover  { background: rgba(63,185,80,0.12); }\\n  .sg3-btn-sell { border-color: #f85149; color: #f85149; }\\n  .sg3-btn-sell:hover { background: rgba(248,81,73,0.12); }\\n  .sg3-btn-ai   { border-color: #58a6ff; color: #58a6ff; }\\n  .sg3-btn-ai:hover   { background: rgba(88,166,255,0.12); }\\n  .sg3-btn-info { border-color: #30363d; color: #58a6ff; }\\n  .sg3-btn-info:hover { background: rgba(88,166,255,0.08); }\\n  .sg3-btn-rm   { border-color: transparent; color: #8b949e; }\\n  .sg3-btn-rm:hover   { color: #f85149; background: rgba(248,81,73,0.08); }\\n  .sg3-hint  { color: #8b949e; font-size: 11px; text-align: center; padding: 18px 8px;\\n               border: 2px dashed #21262d; border-radius: 6px; font-style: italic; }\\n  .sg3-status { font-size: 9px; font-weight: 700; letter-spacing: 0.5px;\\n                padding: 1px 5px; border-radius: 8px; }\\n  .sg3-status-bought { background: rgba(63,185,80,0.2); color: #3fb950; }\\n  .sg3-status-sold   { background: rgba(248,81,73,0.2);  color: #f85149; }\\n  /* Sell modal */\\n  .sg3-sell-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75);\\n                      display: flex; align-items: center; justify-content: center; z-index: 10001; }\\n  .sg3-sell-box { background: #161b22; border: 1px solid #30363d; border-radius: 10px;\\n                  padding: 24px; width: 340px; display: flex; flex-direction: column; gap: 14px; }\\n  .sg3-sell-box h3 { font-size: 15px; color: #e6edf3; }\\n  .sg3-sell-pos  { font-size: 12px; color: #8b949e; }\\n  .sg3-sell-dest { font-size: 11px; color: #8b949e; }\\n  @media (max-width: 700px) {\\n    .sg3-wrap { grid-template-columns: 1fr; }\\n    .sg3-col  { border-right: none; border-bottom: 1px solid #21262d; }\\n  }\\n\';\ndocument.head.appendChild(_sg3style);\n\n// ── Replace old Stage Gate section with 3-col ─────────────────────────────────\n(function injectHtml() {\n  // Find old section (has sg-stages or sg3-section)\n  const old = document.getElementById(\'sg3-section\')\n           || Array.from(document.querySelectorAll(\'.section\'))\n                .find(s => s.querySelector(\'.section-title\')\n                        && s.querySelector(\'.section-title\').textContent.includes(\'Stage Gate\'));\n  if (!old) {\n    // Not rendered yet — insert before first .section\n    const main = document.querySelector(\'main\');\n    if (main) {\n      const firstSec = main.querySelector(\'.section\');\n      if (firstSec) {\n        firstSec.insertAdjacentHTML(\'beforebegin\', \'\\n<div id="sg3-section" class="section">\\n  <div class="section-title">&#127760; Stage Gate &mdash; Stock Pipeline</div>\\n  <div class="sg3-wrap">\\n    <div class="sg3-col sg3-c1">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128203; Stage 1 &mdash; Monitoring</div>\\n             <div class="sg3-sub">Watching only &middot; no trading</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-1">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-1"\\n           ondragover="sg3Over(event,\\\'1\\\')" ondragleave="sg3Leave(\\\'1\\\')" ondrop="sg3Drop(event,\\\'1\\\')">\\n        <div class="sg3-hint">Stocks you are watching</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c2">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#129302; Stage 2 &mdash; Active AI</div>\\n             <div class="sg3-sub">AI pipeline &middot; auto-buys on signal</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-2">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-2"\\n           ondragover="sg3Over(event,\\\'2\\\')" ondragleave="sg3Leave(\\\'2\\\')" ondrop="sg3Drop(event,\\\'2\\\')">\\n        <div class="sg3-hint">Drag here to activate AI trading</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c3">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128200; Stage 3 &mdash; Open Positions</div>\\n             <div class="sg3-sub">Live positions &middot; drag left to sell</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-3">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-3"\\n           ondragover="sg3Over(event,\\\'3\\\')" ondragleave="sg3Leave(\\\'3\\\')" ondrop="sg3Drop(event,\\\'3\\\')">\\n        <div class="sg3-hint">Positions appear here after a buy</div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\\n<!-- Sell modal -->\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\');\n      } else {\n        main.insertAdjacentHTML(\'beforeend\', \'\\n<div id="sg3-section" class="section">\\n  <div class="section-title">&#127760; Stage Gate &mdash; Stock Pipeline</div>\\n  <div class="sg3-wrap">\\n    <div class="sg3-col sg3-c1">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128203; Stage 1 &mdash; Monitoring</div>\\n             <div class="sg3-sub">Watching only &middot; no trading</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-1">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-1"\\n           ondragover="sg3Over(event,\\\'1\\\')" ondragleave="sg3Leave(\\\'1\\\')" ondrop="sg3Drop(event,\\\'1\\\')">\\n        <div class="sg3-hint">Stocks you are watching</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c2">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#129302; Stage 2 &mdash; Active AI</div>\\n             <div class="sg3-sub">AI pipeline &middot; auto-buys on signal</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-2">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-2"\\n           ondragover="sg3Over(event,\\\'2\\\')" ondragleave="sg3Leave(\\\'2\\\')" ondrop="sg3Drop(event,\\\'2\\\')">\\n        <div class="sg3-hint">Drag here to activate AI trading</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c3">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128200; Stage 3 &mdash; Open Positions</div>\\n             <div class="sg3-sub">Live positions &middot; drag left to sell</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-3">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-3"\\n           ondragover="sg3Over(event,\\\'3\\\')" ondragleave="sg3Leave(\\\'3\\\')" ondrop="sg3Drop(event,\\\'3\\\')">\\n        <div class="sg3-hint">Positions appear here after a buy</div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\\n<!-- Sell modal -->\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\');\n      }\n    }\n  } else if (!document.getElementById(\'sg3-section\')) {\n    old.outerHTML = \'\\n<div id="sg3-section" class="section">\\n  <div class="section-title">&#127760; Stage Gate &mdash; Stock Pipeline</div>\\n  <div class="sg3-wrap">\\n    <div class="sg3-col sg3-c1">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128203; Stage 1 &mdash; Monitoring</div>\\n             <div class="sg3-sub">Watching only &middot; no trading</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-1">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-1"\\n           ondragover="sg3Over(event,\\\'1\\\')" ondragleave="sg3Leave(\\\'1\\\')" ondrop="sg3Drop(event,\\\'1\\\')">\\n        <div class="sg3-hint">Stocks you are watching</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c2">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#129302; Stage 2 &mdash; Active AI</div>\\n             <div class="sg3-sub">AI pipeline &middot; auto-buys on signal</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-2">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-2"\\n           ondragover="sg3Over(event,\\\'2\\\')" ondragleave="sg3Leave(\\\'2\\\')" ondrop="sg3Drop(event,\\\'2\\\')">\\n        <div class="sg3-hint">Drag here to activate AI trading</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c3">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128200; Stage 3 &mdash; Open Positions</div>\\n             <div class="sg3-sub">Live positions &middot; drag left to sell</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-3">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-3"\\n           ondragover="sg3Over(event,\\\'3\\\')" ondragleave="sg3Leave(\\\'3\\\')" ondrop="sg3Drop(event,\\\'3\\\')">\\n        <div class="sg3-hint">Positions appear here after a buy</div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\\n<!-- Sell modal -->\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\';\n  }\n  // Inject sell modal if not present\n  if (!document.getElementById(\'sg3-sell-overlay\')) {\n    document.body.insertAdjacentHTML(\'beforeend\', \'\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\');\n  }\n})();\n\n// ── State ─────────────────────────────────────────────────────────────────────\nlet _sg3 = { stage1: [], stage2: [], stage3: [] };\nlet _sg3sigs = {};\nlet _sg3pos  = {};   // ticker -> position data {qty, avg_cost, cur_price, pnl, pnl_pct}\nlet _sg3dragT = null;\nlet _sg3dragF = null;\nlet _sg3pendTicker  = null;  // pending for buy modal\nlet _sg3pendTarget  = null;  // target stage for buy\nlet _sg3sellTicker  = null;  // pending for sell modal\nlet _sg3sellTarget  = null;  // target stage after sell\nlet _sg3recentTrades = {};   // ticker -> \'BOUGHT\'|\'SOLD\' (shown briefly)\n\n// ── Boot ──────────────────────────────────────────────────────────────────────\nasync function sg3Boot() {\n  try {\n    const sigs = await fetch(\'/api/signals\').then(r => r.json());\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });\n  } catch(e) {}\n  try { _sg3 = await fetch(\'/api/stagegate\').then(r => r.json()); } catch(e) {}\n  _sg3.stage1 = _sg3.stage1 || [];\n  _sg3.stage2 = _sg3.stage2 || [];\n  _sg3.stage3 = _sg3.stage3 || [];\n  sg3Render();\n}\n\n// Override old sgBoot to be a no-op (sg3Boot takes over)\nwindow.sgBoot = function() {};\n\n// ── Sync positions from account data ─────────────────────────────────────────\nfunction sg3SyncPositions(positions) {\n  _sg3pos = {};\n  (positions || []).forEach(p => { _sg3pos[p.ticker] = p; });\n\n  // Auto-promote: any open position not in stage3 → move to stage3\n  let changed = false;\n  Object.keys(_sg3pos).forEach(ticker => {\n    if (!_sg3.stage3.includes(ticker)) {\n      for (const k of [\'stage1\', \'stage2\']) {\n        const i = _sg3[k].indexOf(ticker);\n        if (i !== -1) { _sg3[k].splice(i, 1); }\n      }\n      _sg3.stage3.push(ticker);\n      changed = true;\n    }\n  });\n  // Auto-demote: stage3 ticker with no position → back to stage2\n  _sg3.stage3 = _sg3.stage3.filter(ticker => {\n    if (!_sg3pos[ticker]) {\n      if (!_sg3.stage2.includes(ticker) && !_sg3.stage1.includes(ticker)) {\n        _sg3.stage2.push(ticker);\n      }\n      changed = true;\n      return false;\n    }\n    return true;\n  });\n  if (changed) sg3Save();\n  sg3Render();\n}\n\n// ── Render ────────────────────────────────────────────────────────────────────\nfunction sg3Render() {\n  sg3RenderZone(\'1\', _sg3.stage1);\n  sg3RenderZone(\'2\', _sg3.stage2);\n  sg3RenderZone(\'3\', _sg3.stage3);\n  document.getElementById(\'sg3-cnt-1\').textContent = _sg3.stage1.length;\n  document.getElementById(\'sg3-cnt-2\').textContent = _sg3.stage2.length;\n  document.getElementById(\'sg3-cnt-3\').textContent = _sg3.stage3.length;\n}\n\nfunction sg3RenderZone(stage, tickers) {\n  const zone = document.getElementById(\'sg3-zone-\' + stage);\n  if (!zone) return;\n  if (!tickers.length) {\n    const hints = {\n      \'1\': \'Stocks you are watching\',\n      \'2\': \'Drag here to activate AI trading\',\n      \'3\': \'Positions appear here after a buy\',\n    };\n    zone.innerHTML = \'<div class="sg3-hint">\' + hints[stage] + \'</div>\';\n    return;\n  }\n  zone.innerHTML = tickers.map(t => sg3CardHtml(t, stage)).join(\'\');\n}\n\nfunction sg3CardHtml(ticker, stage) {\n  const s    = _sg3sigs[ticker] || {};\n  const pos  = _sg3pos[ticker]  || {};\n  const sig  = (s.signal || \'HOLD\').toUpperCase();\n  const sc   = sig === \'BUY\' || sig === \'STRONG_BUY\'  ? \'sig-bull\'\n             : sig === \'SELL\'|| sig === \'STRONG_SELL\' ? \'sig-bear\' : \'\';\n  const price = s.current_price ? \'$\' + s.current_price.toFixed(2) : \'\';\n  const recent = _sg3recentTrades[ticker];\n\n  let meta = price;\n  let pnlHtml = \'\';\n  if (stage === \'3\' && pos.qty) {\n    const pnlCls = (pos.pnl || 0) >= 0 ? \'up\' : \'dn\';\n    const pnlStr = ((pos.pnl || 0) >= 0 ? \'+\' : \'\') + \'$\' + Math.abs(pos.pnl || 0).toFixed(0);\n    const pctStr = ((pos.pnl_pct || 0) >= 0 ? \'+\' : \'\') + (pos.pnl_pct || 0).toFixed(1) + \'%\';\n    meta = price + (price ? \' · \' : \'\') + pos.qty + \' sh @ $\' + (pos.avg_cost || 0).toFixed(2);\n    pnlHtml = \'<span class="sg3-pnl \' + pnlCls + \'">\' + pnlStr + \' (\' + pctStr + \')</span>\';\n  }\n\n  let statusHtml = \'\';\n  if (recent) {\n    statusHtml = \'<span class="sg3-status sg3-status-\' + recent.toLowerCase() + \'">\' + recent + \'</span>\';\n  }\n\n  // Action buttons differ per stage\n  let btns = \'<div class="sg3-acts">\';\n  btns += \'<button class="sg3-btn sg3-btn-info" data-ticker="\' + ticker + \'" onclick="sgShowInfo(this.dataset.ticker)" title="AI Analysis">&#9432;</button>\';\n  if (stage === \'1\') {\n    btns += \'<button class="sg3-btn sg3-btn-ai"  data-ticker="\' + ticker + \'" onclick="sg3ActivateAI(this.dataset.ticker)"  title="Activate AI">AI</button>\';\n    btns += \'<button class="sg3-btn sg3-btn-buy" data-ticker="\' + ticker + \'" onclick="sg3OpenBuy(this.dataset.ticker,\\\'3\\\')" title="Buy now">Buy</button>\';\n  } else if (stage === \'2\') {\n    btns += \'<button class="sg3-btn sg3-btn-buy" data-ticker="\' + ticker + \'" onclick="sg3OpenBuy(this.dataset.ticker,\\\'3\\\')" title="Buy now">Buy</button>\';\n  } else if (stage === \'3\') {\n    btns += \'<button class="sg3-btn sg3-btn-buy"  data-ticker="\' + ticker + \'" onclick="sg3OpenBuy(this.dataset.ticker,\\\'3\\\')"  title="Add to position">Buy+</button>\';\n    btns += \'<button class="sg3-btn sg3-btn-sell" data-ticker="\' + ticker + \'" onclick="sg3OpenSell(this.dataset.ticker,\\\'2\\\')" title="Sell">Sell</button>\';\n  }\n  btns += \'<button class="sg3-btn sg3-btn-rm" data-ticker="\' + ticker + \'" onclick="sg3Remove(this.dataset.ticker)" title="Remove">&#x2715;</button>\';\n  btns += \'</div>\';\n\n  return \'<div class="sg3-card" draggable="true" data-ticker="\' + ticker + \'" data-stage="\' + stage + \'" \'\n    + \'ondragstart="sg3DragStart(event)" ondragend="sg3DragEnd(event)">\'\n    + \'<div class="sg3-tick">\' + ticker + \'</div>\'\n    + \'<div class="sg3-meta">\' + meta + \'</div>\'\n    + pnlHtml\n    + statusHtml\n    + \'<span class="sg3-sig \' + sc + \'">\' + sig + \'</span>\'\n    + btns\n    + \'</div>\';\n}\n\n// ── Drag & drop ───────────────────────────────────────────────────────────────\nfunction sg3DragStart(e) {\n  _sg3dragT = e.currentTarget.dataset.ticker;\n  _sg3dragF = e.currentTarget.dataset.stage;\n  e.currentTarget.classList.add(\'dragging\');\n  e.dataTransfer.effectAllowed = \'move\';\n}\nfunction sg3DragEnd(e) { e.currentTarget.classList.remove(\'dragging\'); }\nfunction sg3Over(e, stage) {\n  e.preventDefault();\n  e.dataTransfer.dropEffect = \'move\';\n  const z = document.getElementById(\'sg3-zone-\' + stage);\n  if (z) z.classList.add(\'drag-over\');\n}\nfunction sg3Leave(stage) {\n  const z = document.getElementById(\'sg3-zone-\' + stage);\n  if (z) z.classList.remove(\'drag-over\');\n}\n\nfunction sg3Drop(e, toStage) {\n  e.preventDefault();\n  const z = document.getElementById(\'sg3-zone-\' + toStage);\n  if (z) z.classList.remove(\'drag-over\');\n  if (!_sg3dragT || _sg3dragF === toStage) return;\n  const from = _sg3dragF, ticker = _sg3dragT;\n\n  // Moving to Stage 1 from Stage 2 or 3 → sell popup (if has position)\n  if (toStage === \'1\' && (from === \'2\' || from === \'3\')) {\n    if (_sg3pos[ticker]) {\n      sg3OpenSell(ticker, \'1\');\n    } else {\n      sg3MoveLocal(ticker, from, \'1\');\n    }\n    return;\n  }\n  // Moving Stage 3 → Stage 2 → sell popup\n  if (toStage === \'2\' && from === \'3\') {\n    sg3OpenSell(ticker, \'2\');\n    return;\n  }\n  // Stage 1 → Stage 2: activate for AI (no buy)\n  if (toStage === \'2\' && from === \'1\') {\n    sg3ActivateAI(ticker);\n    return;\n  }\n  // Stage 1/2 → Stage 3: buy popup\n  if (toStage === \'3\') {\n    sg3OpenBuy(ticker, \'3\', from);\n    return;\n  }\n  sg3MoveLocal(ticker, from, toStage);\n}\n\n// ── AI activation (Stage 1 → Stage 2, no immediate buy) ──────────────────────\nasync function sg3ActivateAI(ticker) {\n  try {\n    await fetch(\'/api/paper/activate-ai\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify({ ticker }),\n    });\n  } catch(e) {}\n  sg3MoveLocal(ticker, \'1\', \'2\');\n}\n\n// ── Buy modal ─────────────────────────────────────────────────────────────────\nfunction sg3OpenBuy(ticker, targetStage, fromStage) {\n  _sg3pendTicker = ticker;\n  _sg3pendTarget = targetStage || \'3\';\n  _sg3pendFrom   = fromStage || _sg3dragF || null;\n  // Reuse existing buy modal (sg-overlay) from the previous embed\n  const s = _sg3sigs[ticker] || {};\n  document.getElementById(\'sg-modal-title\').textContent = \'Buy \' + ticker;\n  document.getElementById(\'sg-modal-price\').textContent =\n    s.current_price ? \'Current price: $\' + s.current_price.toFixed(2) : \'Price not available\';\n  document.getElementById(\'sg-mode-shares\').checked = true;\n  document.getElementById(\'sg-amount\').value = \'\';\n  document.getElementById(\'sg-modal-hint\').innerHTML = \'&nbsp;\';\n  document.getElementById(\'sg-overlay\').style.display = \'flex\';\n  setTimeout(() => document.getElementById(\'sg-amount\').focus(), 60);\n  // Swap confirm handler\n  document.getElementById(\'sg-act-btn\').onclick = sg3BuyConfirm;\n  document.getElementById(\'sg-act-btn\').textContent = \'\\u25b6 Buy\';\n}\n\nfunction sgUpdateHint() {  // keep existing hint updater working\n  const mode  = document.querySelector(\'input[name="sg-mode"]:checked\').value;\n  const amt   = parseFloat(document.getElementById(\'sg-amount\').value);\n  const price = (_sg3sigs[_sg3pendTicker] || {}).current_price;\n  const hint  = document.getElementById(\'sg-modal-hint\');\n  if (!amt || amt <= 0) { hint.innerHTML = \'&nbsp;\'; return; }\n  if (mode === \'shares\') {\n    hint.textContent = price\n      ? \'Total \\u2248 $\' + (amt * price).toLocaleString(\'en-US\', {minimumFractionDigits:2, maximumFractionDigits:2})\n      : amt + \' shares\';\n  } else {\n    const sh = price ? Math.floor(amt / price) : null;\n    hint.textContent = sh != null ? sh + \' shares @ $\' + price.toFixed(2) : \'$\' + amt;\n  }\n}\n\nasync function sg3BuyConfirm() {\n  const ticker = _sg3pendTicker;\n  const mode   = document.querySelector(\'input[name="sg-mode"]:checked\').value;\n  const amount = parseFloat(document.getElementById(\'sg-amount\').value);\n  if (!ticker || !amount || amount <= 0) return;\n\n  const btn = document.getElementById(\'sg-act-btn\');\n  btn.disabled = true; btn.textContent = \'Buying\\u2026\';\n\n  try {\n    const r = await fetch(\'/api/paper/activate\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify({ ticker, mode, amount }),\n    }).then(res => res.json());\n\n    if (r.status === \'ok\') {\n      if (_sg3pendFrom) sg3RemoveFromStage(_sg3pendTicker, _sg3pendFrom);\n      sg3MoveLocal(ticker, null, \'3\');\n      document.getElementById(\'sg-overlay\').style.display = \'none\';\n      _sg3recentTrades[ticker] = \'BOUGHT\';\n      setTimeout(() => { delete _sg3recentTrades[ticker]; sg3Render(); }, 8000);\n      load();\n    } else {\n      alert(\'Buy failed: \' + (r.error || \'unknown\'));\n    }\n  } catch(e) { alert(\'Error: \' + e.message); }\n  finally {\n    btn.disabled = false; btn.textContent = \'\\u25b6 Start Trading\';\n    btn.onclick  = sgModalConfirm;  // restore original handler\n  }\n}\n\n// ── Sell modal ────────────────────────────────────────────────────────────────\nfunction sg3OpenSell(ticker, targetStage) {\n  _sg3sellTicker = ticker;\n  _sg3sellTarget = targetStage || \'1\';\n  const pos = _sg3pos[ticker] || {};\n  const price = (_sg3sigs[ticker] || {}).current_price || pos.cur_price || pos.avg_cost || 0;\n\n  document.getElementById(\'sg3-sell-title\').textContent = \'Sell \' + ticker;\n  document.getElementById(\'sg3-sell-pos\').textContent =\n    pos.qty\n      ? pos.qty + \' shares · avg cost $\' + (pos.avg_cost || 0).toFixed(2) + \' · current $\' + price.toFixed(2)\n      : \'No open position\';\n  document.getElementById(\'sg3sm-all\').checked = true;\n  document.getElementById(\'sg3-sell-qty\').style.display = \'none\';\n  document.getElementById(\'sg3-sell-qty\').value = \'\';\n  const dest = targetStage === \'1\' ? \'Stage 1 (Monitoring)\' : \'Stage 2 (Active AI)\';\n  document.getElementById(\'sg3-sell-dest\').textContent = \'After sell: move to \' + dest;\n  sg3UpdateSellHint();\n  document.getElementById(\'sg3-sell-overlay\').style.display = \'flex\';\n  if (pos.qty) setTimeout(() => document.getElementById(\'sg3-sell-overlay\').focus?.(), 60);\n}\n\nfunction sg3SellModeChange() {\n  const partial = document.getElementById(\'sg3sm-part\').checked;\n  document.getElementById(\'sg3-sell-qty\').style.display = partial ? \'block\' : \'none\';\n  if (partial) document.getElementById(\'sg3-sell-qty\').focus();\n  sg3UpdateSellHint();\n}\n\nfunction sg3UpdateSellHint() {\n  const pos   = _sg3pos[_sg3sellTicker] || {};\n  const price = (_sg3sigs[_sg3sellTicker] || {}).current_price || pos.cur_price || 0;\n  const hint  = document.getElementById(\'sg3-sell-hint\');\n  const mode  = document.querySelector(\'input[name="sg3sm"]:checked\')?.value || \'all\';\n  const qty   = mode === \'all\' ? (pos.qty || 0) : parseFloat(document.getElementById(\'sg3-sell-qty\').value) || 0;\n  if (!qty || !price) { hint.innerHTML = \'&nbsp;\'; return; }\n  hint.textContent = \'Proceeds \\u2248 $\' + (qty * price).toLocaleString(\'en-US\', {minimumFractionDigits:2, maximumFractionDigits:2});\n}\n\nfunction sg3SellCancel() {\n  document.getElementById(\'sg3-sell-overlay\').style.display = \'none\';\n  _sg3sellTicker = null;\n}\n\nasync function sg3SellConfirm() {\n  const ticker      = _sg3sellTicker;\n  const targetStage = _sg3sellTarget;\n  if (!ticker) return;\n\n  const mode = document.querySelector(\'input[name="sg3sm"]:checked\')?.value || \'all\';\n  const qty  = mode === \'partial\' ? parseFloat(document.getElementById(\'sg3-sell-qty\').value) : null;\n\n  const btn = document.getElementById(\'sg3-sell-btn\');\n  btn.disabled = true; btn.textContent = \'Selling\\u2026\';\n\n  try {\n    const r = await fetch(\'/api/paper/sell\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify({ ticker, mode, qty, target_stage: targetStage }),\n    }).then(res => res.json());\n\n    if (r.status === \'ok\') {\n      sg3MoveLocal(ticker, \'3\', targetStage);\n      document.getElementById(\'sg3-sell-overlay\').style.display = \'none\';\n      _sg3sellTicker = null;\n      if (!r.no_position) {\n        _sg3recentTrades[ticker] = \'SOLD\';\n        setTimeout(() => { delete _sg3recentTrades[ticker]; sg3Render(); }, 8000);\n      }\n      load();\n    } else {\n      alert(\'Sell failed: \' + (r.error || \'unknown\'));\n    }\n  } catch(e) { alert(\'Error: \' + e.message); }\n  finally { btn.disabled = false; btn.textContent = \'\\u1f4b8 Sell\'; }\n}\n\n// ── Local state helpers ───────────────────────────────────────────────────────\nfunction sg3RemoveFromStage(ticker, stage) {\n  const arr = _sg3[\'stage\' + stage];\n  if (!arr) return;\n  const i = arr.indexOf(ticker);\n  if (i !== -1) arr.splice(i, 1);\n}\n\nfunction sg3MoveLocal(ticker, from, to) {\n  if (from) sg3RemoveFromStage(ticker, from);\n  const toArr = _sg3[\'stage\' + to];\n  if (toArr && !toArr.includes(ticker)) toArr.push(ticker);\n  sg3Render();\n  sg3Save();\n}\n\nfunction sg3Remove(ticker) {\n  [\'stage1\',\'stage2\',\'stage3\'].forEach(k => {\n    _sg3[k] = (_sg3[k] || []).filter(t => t !== ticker);\n  });\n  sg3Render();\n  sg3Save();\n}\n\nasync function sg3Save() {\n  try {\n    await fetch(\'/api/stagegate\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify(_sg3),\n    });\n  } catch(e) {}\n}\n\n// ── Hook into existing load() to sync Stage 3 ────────────────────────────────\nconst _origLoad = load;\nwindow.load = async function() {\n  await _origLoad();\n  try {\n    const acct = await fetch(\'/api/paper/account\').then(r => r.json());\n    sg3SyncPositions(acct.positions || []);\n  } catch(e) {}\n};\n\n// Escape closes sell modal too\ndocument.addEventListener(\'keydown\', e => {\n  if (e.key === \'Escape\') { sg3SellCancel(); aiClose(); }\n});\n\n// Boot\nsg3Boot();\n\n})(); // end IIFE\n'
+_SG3_JS  = '\n// ════════════════════════════════════════════════════════════════════════════\n// Stage Gate 3-Stage (overrides old 2-stage code)\n// ════════════════════════════════════════════════════════════════════════════\n(function() {\n\n// ── Inject CSS ────────────────────────────────────────────────────────────────\nconst _sg3style = document.createElement(\'style\');\n_sg3style.textContent = \'\\n  /* ── Stage Gate 3-col ─────────────────────────────────────── */\\n  .sg3-wrap  { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0; }\\n  .sg3-col   { display: flex; flex-direction: column; border-right: 1px solid #21262d; min-width: 0; }\\n  .sg3-col:last-child { border-right: none; }\\n  .sg3-hd    { padding: 10px 14px; background: #0d1117; border-bottom: 1px solid #21262d;\\n               display: flex; align-items: center; gap: 8px; }\\n  .sg3-c1 .sg3-hd  { border-top: 3px solid #8b949e; }\\n  .sg3-c2 .sg3-hd  { border-top: 3px solid #58a6ff; }\\n  .sg3-c3 .sg3-hd  { border-top: 3px solid #3fb950; }\\n  .sg3-title { font-size: 12px; font-weight: 700; }\\n  .sg3-c1 .sg3-title { color: #8b949e; }\\n  .sg3-c2 .sg3-title { color: #58a6ff; }\\n  .sg3-c3 .sg3-title { color: #3fb950; }\\n  .sg3-sub   { font-size: 10px; color: #8b949e; margin-top: 2px; }\\n  .sg3-cnt   { margin-left: auto; font-size: 11px; color: #8b949e;\\n               background: #21262d; padding: 2px 7px; border-radius: 10px; }\\n  .sg3-zone  { flex: 1; min-height: 80px; padding: 8px;\\n               display: flex; flex-direction: column; gap: 6px; }\\n  .sg3-zone.drag-over { background: rgba(88,166,255,0.05);\\n                        outline: 2px dashed #58a6ff; outline-offset: -3px; border-radius: 4px; }\\n  .sg3-card  { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;\\n               padding: 7px 10px; cursor: grab; display: flex; align-items: center;\\n               gap: 6px; user-select: none; transition: border-color 0.15s; flex-wrap: wrap; }\\n  .sg3-card:hover   { border-color: #58a6ff; }\\n  .sg3-card:active  { cursor: grabbing; }\\n  .sg3-card.dragging { opacity: 0.4; }\\n  .sg3-c2 .sg3-card { border-left: 3px solid #58a6ff; }\\n  .sg3-c3 .sg3-card { border-left: 3px solid #3fb950; }\\n  .sg3-tick  { font-size: 13px; font-weight: 700; min-width: 52px; }\\n  .sg3-meta  { font-size: 10px; color: #8b949e; flex: 1; min-width: 50px; }\\n  .sg3-pnl   { font-size: 10px; font-weight: 600; }\\n  .sg3-sig   { font-size: 10px; font-weight: 600; }\\n  .sg3-acts  { display: flex; gap: 3px; margin-left: auto; }\\n  .sg3-btn   { background: none; border: 1px solid #30363d; color: #8b949e;\\n               cursor: pointer; font-size: 11px; padding: 2px 6px;\\n               border-radius: 4px; line-height: 1.4; white-space: nowrap; }\\n  .sg3-btn-buy  { border-color: #3fb950; color: #3fb950; }\\n  .sg3-btn-buy:hover  { background: rgba(63,185,80,0.12); }\\n  .sg3-btn-sell { border-color: #f85149; color: #f85149; }\\n  .sg3-btn-sell:hover { background: rgba(248,81,73,0.12); }\\n  .sg3-btn-ai   { border-color: #58a6ff; color: #58a6ff; }\\n  .sg3-btn-ai:hover   { background: rgba(88,166,255,0.12); }\\n  .sg3-btn-info { border-color: #30363d; color: #58a6ff; }\\n  .sg3-btn-info:hover { background: rgba(88,166,255,0.08); }\\n  .sg3-btn-rm   { border-color: transparent; color: #8b949e; }\\n  .sg3-btn-rm:hover   { color: #f85149; background: rgba(248,81,73,0.08); }\\n  .sg3-hint  { color: #8b949e; font-size: 11px; text-align: center; padding: 18px 8px;\\n               border: 2px dashed #21262d; border-radius: 6px; font-style: italic; }\\n  .sg3-status { font-size: 9px; font-weight: 700; letter-spacing: 0.5px;\\n                padding: 1px 5px; border-radius: 8px; }\\n  .sg3-status-bought { background: rgba(63,185,80,0.2); color: #3fb950; }\\n  .sg3-status-sold   { background: rgba(248,81,73,0.2);  color: #f85149; }\\n  /* Sell modal */\\n  .sg3-sell-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75);\\n                      display: flex; align-items: center; justify-content: center; z-index: 10001; }\\n  .sg3-sell-box { background: #161b22; border: 1px solid #30363d; border-radius: 10px;\\n                  padding: 24px; width: 340px; display: flex; flex-direction: column; gap: 14px; }\\n  .sg3-sell-box h3 { font-size: 15px; color: #e6edf3; }\\n  .sg3-sell-pos  { font-size: 12px; color: #8b949e; }\\n  .sg3-sell-dest { font-size: 11px; color: #8b949e; }\\n  @media (max-width: 700px) {\\n    .sg3-wrap { grid-template-columns: 1fr; }\\n    .sg3-col  { border-right: none; border-bottom: 1px solid #21262d; }\\n  }\\n\';\ndocument.head.appendChild(_sg3style);\n\n// ── Replace old Stage Gate section with 3-col ─────────────────────────────────\n(function injectHtml() {\n  // Find old section (has sg-stages or sg3-section)\n  const old = document.getElementById(\'sg3-section\')\n           || Array.from(document.querySelectorAll(\'.section\'))\n                .find(s => s.querySelector(\'.section-title\')\n                        && s.querySelector(\'.section-title\').textContent.includes(\'Stage Gate\'));\n  if (!old) {\n    // Not rendered yet — insert before first .section\n    const main = document.querySelector(\'main\');\n    if (main) {\n      const firstSec = main.querySelector(\'.section\');\n      if (firstSec) {\n        firstSec.insertAdjacentHTML(\'beforebegin\', \'\\n<div id="sg3-section" class="section">\\n  <div class="section-title">&#127760; Stage Gate &mdash; Stock Pipeline</div>\\n  <div class="sg3-wrap">\\n    <div class="sg3-col sg3-c1">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128203; Stage 1 &mdash; Monitoring</div>\\n             <div class="sg3-sub">Watching only &middot; no trading</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-1">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-1"\\n           ondragover="sg3Over(event,\\\'1\\\')" ondragleave="sg3Leave(\\\'1\\\')" ondrop="sg3Drop(event,\\\'1\\\')">\\n        <div class="sg3-hint">Stocks you are watching</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c2">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#129302; Stage 2 &mdash; Active AI</div>\\n             <div class="sg3-sub">AI pipeline &middot; auto-buys on signal</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-2">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-2"\\n           ondragover="sg3Over(event,\\\'2\\\')" ondragleave="sg3Leave(\\\'2\\\')" ondrop="sg3Drop(event,\\\'2\\\')">\\n        <div class="sg3-hint">Drag here to activate AI trading</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c3">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128200; Stage 3 &mdash; Open Positions</div>\\n             <div class="sg3-sub">Live positions &middot; drag left to sell</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-3">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-3"\\n           ondragover="sg3Over(event,\\\'3\\\')" ondragleave="sg3Leave(\\\'3\\\')" ondrop="sg3Drop(event,\\\'3\\\')">\\n        <div class="sg3-hint">Positions appear here after a buy</div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\\n<!-- Sell modal -->\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\');\n      } else {\n        main.insertAdjacentHTML(\'beforeend\', \'\\n<div id="sg3-section" class="section">\\n  <div class="section-title">&#127760; Stage Gate &mdash; Stock Pipeline</div>\\n  <div class="sg3-wrap">\\n    <div class="sg3-col sg3-c1">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128203; Stage 1 &mdash; Monitoring</div>\\n             <div class="sg3-sub">Watching only &middot; no trading</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-1">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-1"\\n           ondragover="sg3Over(event,\\\'1\\\')" ondragleave="sg3Leave(\\\'1\\\')" ondrop="sg3Drop(event,\\\'1\\\')">\\n        <div class="sg3-hint">Stocks you are watching</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c2">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#129302; Stage 2 &mdash; Active AI</div>\\n             <div class="sg3-sub">AI pipeline &middot; auto-buys on signal</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-2">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-2"\\n           ondragover="sg3Over(event,\\\'2\\\')" ondragleave="sg3Leave(\\\'2\\\')" ondrop="sg3Drop(event,\\\'2\\\')">\\n        <div class="sg3-hint">Drag here to activate AI trading</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c3">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128200; Stage 3 &mdash; Open Positions</div>\\n             <div class="sg3-sub">Live positions &middot; drag left to sell</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-3">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-3"\\n           ondragover="sg3Over(event,\\\'3\\\')" ondragleave="sg3Leave(\\\'3\\\')" ondrop="sg3Drop(event,\\\'3\\\')">\\n        <div class="sg3-hint">Positions appear here after a buy</div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\\n<!-- Sell modal -->\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\');\n      }\n    }\n  } else if (!document.getElementById(\'sg3-section\')) {\n    old.outerHTML = \'\\n<div id="sg3-section" class="section">\\n  <div class="section-title">&#127760; Stage Gate &mdash; Stock Pipeline</div>\\n  <div class="sg3-wrap">\\n    <div class="sg3-col sg3-c1">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128203; Stage 1 &mdash; Monitoring</div>\\n             <div class="sg3-sub">Watching only &middot; no trading</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-1">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-1"\\n           ondragover="sg3Over(event,\\\'1\\\')" ondragleave="sg3Leave(\\\'1\\\')" ondrop="sg3Drop(event,\\\'1\\\')">\\n        <div class="sg3-hint">Stocks you are watching</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c2">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#129302; Stage 2 &mdash; Active AI</div>\\n             <div class="sg3-sub">AI pipeline &middot; auto-buys on signal</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-2">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-2"\\n           ondragover="sg3Over(event,\\\'2\\\')" ondragleave="sg3Leave(\\\'2\\\')" ondrop="sg3Drop(event,\\\'2\\\')">\\n        <div class="sg3-hint">Drag here to activate AI trading</div>\\n      </div>\\n    </div>\\n    <div class="sg3-col sg3-c3">\\n      <div class="sg3-hd">\\n        <div><div class="sg3-title">&#128200; Stage 3 &mdash; Open Positions</div>\\n             <div class="sg3-sub">Live positions &middot; drag left to sell</div></div>\\n        <span class="sg3-cnt" id="sg3-cnt-3">0</span>\\n      </div>\\n      <div class="sg3-zone" id="sg3-zone-3"\\n           ondragover="sg3Over(event,\\\'3\\\')" ondragleave="sg3Leave(\\\'3\\\')" ondrop="sg3Drop(event,\\\'3\\\')">\\n        <div class="sg3-hint">Positions appear here after a buy</div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\\n<!-- Sell modal -->\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\';\n  }\n  // Inject sell modal if not present\n  if (!document.getElementById(\'sg3-sell-overlay\')) {\n    document.body.insertAdjacentHTML(\'beforeend\', \'\\n<div id="sg3-sell-overlay" class="sg3-sell-overlay" style="display:none"\\n     onclick="if(event.target===this) sg3SellCancel()">\\n  <div class="sg3-sell-box">\\n    <h3 id="sg3-sell-title">Sell</h3>\\n    <p class="sg3-sell-pos" id="sg3-sell-pos"></p>\\n    <div class="sg-toggle">\\n      <label><input type="radio" name="sg3sm" id="sg3sm-all" value="all" checked\\n                    onchange="sg3SellModeChange()"> Sell all</label>\\n      <label><input type="radio" name="sg3sm" id="sg3sm-part" value="partial"\\n                    onchange="sg3SellModeChange()"> Partial</label>\\n    </div>\\n    <input class="sg-amount-input" id="sg3-sell-qty" type="number" min="1" step="1"\\n           placeholder="Shares to sell..." style="display:none"\\n           oninput="sg3UpdateSellHint()" onkeydown="if(event.key===\\\'Enter\\\') sg3SellConfirm()">\\n    <p class="sg-modal-hint" id="sg3-sell-hint">&nbsp;</p>\\n    <p class="sg3-sell-dest" id="sg3-sell-dest"></p>\\n    <div class="sg-modal-btns">\\n      <button class="sg-cancel-btn" onclick="sg3SellCancel()">Cancel</button>\\n      <button class="sg-act-btn" id="sg3-sell-btn"\\n              style="border-color:#f85149;background:rgba(248,81,73,0.15);color:#f85149"\\n              onclick="sg3SellConfirm()">&#x1f4b8; Sell</button>\\n    </div>\\n  </div>\\n</div>\\n\');\n  }\n})();\n\n// ── State ─────────────────────────────────────────────────────────────────────\nlet _sg3 = { stage1: [], stage2: [], stage3: [] };\nlet _sg3sigs = {};\nlet _sg3pos  = {};   // ticker -> position data {qty, avg_cost, cur_price, pnl, pnl_pct}\nlet _sg3dragT = null;\nlet _sg3dragF = null;\nlet _sg3pendTicker  = null;  // pending for buy modal\nlet _sg3pendTarget  = null;  // target stage for buy\nlet _sg3sellTicker  = null;  // pending for sell modal\nlet _sg3sellTarget  = null;  // target stage after sell\nlet _sg3recentTrades = {};   // ticker -> \'BOUGHT\'|\'SOLD\' (shown briefly)\n\n// ── Boot ──────────────────────────────────────────────────────────────────────\nasync function sg3Boot() {\n  try {\n    const sigs = await fetch(\'/api/signals\').then(r => r.json());\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });\n  } catch(e) {}\n  try { _sg3 = await fetch(\'/api/paper/stagegate\').then(r => r.json()); } catch(e) {}\n  _sg3.stage1 = _sg3.stage1 || [];\n  _sg3.stage2 = _sg3.stage2 || [];\n  _sg3.stage3 = _sg3.stage3 || [];\n  sg3Render();\n}\n\n// Override old sgBoot to be a no-op (sg3Boot takes over)\nwindow.sgBoot = function() {};\n\n// ── Sync positions from account data ─────────────────────────────────────────\nfunction sg3SyncPositions(positions) {\n  _sg3pos = {};\n  (positions || []).forEach(p => { _sg3pos[p.ticker] = p; });\n\n  // Auto-promote: any open position not in stage3 → move to stage3\n  let changed = false;\n  Object.keys(_sg3pos).forEach(ticker => {\n    if (!_sg3.stage3.includes(ticker)) {\n      for (const k of [\'stage1\', \'stage2\']) {\n        const i = _sg3[k].indexOf(ticker);\n        if (i !== -1) { _sg3[k].splice(i, 1); }\n      }\n      _sg3.stage3.push(ticker);\n      changed = true;\n    }\n  });\n  // Auto-demote: stage3 ticker with no position → back to stage2\n  _sg3.stage3 = _sg3.stage3.filter(ticker => {\n    if (!_sg3pos[ticker]) {\n      if (!_sg3.stage2.includes(ticker) && !_sg3.stage1.includes(ticker)) {\n        _sg3.stage2.push(ticker);\n      }\n      changed = true;\n      return false;\n    }\n    return true;\n  });\n  if (changed) sg3Save();\n  sg3Render();\n}\n\n// ── Render ────────────────────────────────────────────────────────────────────\nfunction sg3Render() {\n  sg3RenderZone(\'1\', _sg3.stage1);\n  sg3RenderZone(\'2\', _sg3.stage2);\n  sg3RenderZone(\'3\', _sg3.stage3);\n  document.getElementById(\'sg3-cnt-1\').textContent = _sg3.stage1.length;\n  document.getElementById(\'sg3-cnt-2\').textContent = _sg3.stage2.length;\n  document.getElementById(\'sg3-cnt-3\').textContent = _sg3.stage3.length;\n}\n\nfunction sg3RenderZone(stage, tickers) {\n  const zone = document.getElementById(\'sg3-zone-\' + stage);\n  if (!zone) return;\n  if (!tickers.length) {\n    const hints = {\n      \'1\': \'Stocks you are watching\',\n      \'2\': \'Drag here to activate AI trading\',\n      \'3\': \'Positions appear here after a buy\',\n    };\n    zone.innerHTML = \'<div class="sg3-hint">\' + hints[stage] + \'</div>\';\n    return;\n  }\n  zone.innerHTML = tickers.map(t => sg3CardHtml(t, stage)).join(\'\');\n}\n\nfunction sg3CardHtml(ticker, stage) {\n  const s    = _sg3sigs[ticker] || {};\n  const pos  = _sg3pos[ticker]  || {};\n  const sig  = (s.signal || \'HOLD\').toUpperCase();\n  const sc   = sig === \'BUY\' || sig === \'STRONG_BUY\'  ? \'sig-bull\'\n             : sig === \'SELL\'|| sig === \'STRONG_SELL\' ? \'sig-bear\' : \'\';\n  const price = s.current_price ? \'$\' + s.current_price.toFixed(2) : \'\';\n  const recent = _sg3recentTrades[ticker];\n\n  let meta = price;\n  let pnlHtml = \'\';\n  if (stage === \'3\' && pos.qty) {\n    const pnlCls = (pos.pnl || 0) >= 0 ? \'up\' : \'dn\';\n    const pnlStr = ((pos.pnl || 0) >= 0 ? \'+\' : \'\') + \'$\' + Math.abs(pos.pnl || 0).toFixed(0);\n    const pctStr = ((pos.pnl_pct || 0) >= 0 ? \'+\' : \'\') + (pos.pnl_pct || 0).toFixed(1) + \'%\';\n    meta = price + (price ? \' · \' : \'\') + pos.qty + \' sh @ $\' + (pos.avg_cost || 0).toFixed(2);\n    pnlHtml = \'<span class="sg3-pnl \' + pnlCls + \'">\' + pnlStr + \' (\' + pctStr + \')</span>\';\n  }\n\n  let statusHtml = \'\';\n  if (recent) {\n    statusHtml = \'<span class="sg3-status sg3-status-\' + recent.toLowerCase() + \'">\' + recent + \'</span>\';\n  }\n\n  // Action buttons differ per stage\n  let btns = \'<div class="sg3-acts">\';\n  btns += \'<button class="sg3-btn sg3-btn-info" data-ticker="\' + ticker + \'" onclick="sgShowInfo(this.dataset.ticker)" title="AI Analysis">&#9432;</button>\';\n  if (stage === \'1\') {\n    btns += \'<button class="sg3-btn sg3-btn-ai"  data-ticker="\' + ticker + \'" onclick="sg3ActivateAI(this.dataset.ticker)"  title="Activate AI">AI</button>\';\n    btns += \'<button class="sg3-btn sg3-btn-buy" data-ticker="\' + ticker + \'" onclick="sg3OpenBuy(this.dataset.ticker,\\\'3\\\')" title="Buy now">Buy</button>\';\n  } else if (stage === \'2\') {\n    btns += \'<button class="sg3-btn sg3-btn-buy" data-ticker="\' + ticker + \'" onclick="sg3OpenBuy(this.dataset.ticker,\\\'3\\\')" title="Buy now">Buy</button>\';\n  } else if (stage === \'3\') {\n    btns += \'<button class="sg3-btn sg3-btn-buy"  data-ticker="\' + ticker + \'" onclick="sg3OpenBuy(this.dataset.ticker,\\\'3\\\')"  title="Add to position">Buy+</button>\';\n    btns += \'<button class="sg3-btn sg3-btn-sell" data-ticker="\' + ticker + \'" onclick="sg3OpenSell(this.dataset.ticker,\\\'2\\\')" title="Sell">Sell</button>\';\n  }\n  btns += \'<button class="sg3-btn sg3-btn-rm" data-ticker="\' + ticker + \'" onclick="sg3Remove(this.dataset.ticker)" title="Remove">&#x2715;</button>\';\n  btns += \'</div>\';\n\n  return \'<div class="sg3-card" draggable="true" data-ticker="\' + ticker + \'" data-stage="\' + stage + \'" \'\n    + \'ondragstart="sg3DragStart(event)" ondragend="sg3DragEnd(event)">\'\n    + \'<div class="sg3-tick">\' + ticker + \'</div>\'\n    + \'<div class="sg3-meta">\' + meta + \'</div>\'\n    + pnlHtml\n    + statusHtml\n    + \'<span class="sg3-sig \' + sc + \'">\' + sig + \'</span>\'\n    + btns\n    + \'</div>\';\n}\n\n// ── Drag & drop ───────────────────────────────────────────────────────────────\nfunction sg3DragStart(e) {\n  _sg3dragT = e.currentTarget.dataset.ticker;\n  _sg3dragF = e.currentTarget.dataset.stage;\n  e.currentTarget.classList.add(\'dragging\');\n  e.dataTransfer.effectAllowed = \'move\';\n}\nfunction sg3DragEnd(e) { e.currentTarget.classList.remove(\'dragging\'); }\nfunction sg3Over(e, stage) {\n  e.preventDefault();\n  e.dataTransfer.dropEffect = \'move\';\n  const z = document.getElementById(\'sg3-zone-\' + stage);\n  if (z) z.classList.add(\'drag-over\');\n}\nfunction sg3Leave(stage) {\n  const z = document.getElementById(\'sg3-zone-\' + stage);\n  if (z) z.classList.remove(\'drag-over\');\n}\n\nfunction sg3Drop(e, toStage) {\n  e.preventDefault();\n  const z = document.getElementById(\'sg3-zone-\' + toStage);\n  if (z) z.classList.remove(\'drag-over\');\n  if (!_sg3dragT || _sg3dragF === toStage) return;\n  const from = _sg3dragF, ticker = _sg3dragT;\n\n  // Moving to Stage 1 from Stage 2 or 3 → sell popup (if has position)\n  if (toStage === \'1\' && (from === \'2\' || from === \'3\')) {\n    if (_sg3pos[ticker]) {\n      sg3OpenSell(ticker, \'1\');\n    } else {\n      sg3MoveLocal(ticker, from, \'1\');\n    }\n    return;\n  }\n  // Moving Stage 3 → Stage 2 → sell popup\n  if (toStage === \'2\' && from === \'3\') {\n    sg3OpenSell(ticker, \'2\');\n    return;\n  }\n  // Stage 1 → Stage 2: activate for AI (no buy)\n  if (toStage === \'2\' && from === \'1\') {\n    sg3ActivateAI(ticker);\n    return;\n  }\n  // Stage 1/2 → Stage 3: buy popup\n  if (toStage === \'3\') {\n    sg3OpenBuy(ticker, \'3\', from);\n    return;\n  }\n  sg3MoveLocal(ticker, from, toStage);\n}\n\n// ── AI activation (Stage 1 → Stage 2, no immediate buy) ──────────────────────\nasync function sg3ActivateAI(ticker) {\n  try {\n    await fetch(\'/api/paper/activate-ai\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify({ ticker }),\n    });\n  } catch(e) {}\n  sg3MoveLocal(ticker, \'1\', \'2\');\n}\n\n// ── Buy modal ─────────────────────────────────────────────────────────────────\nfunction sg3OpenBuy(ticker, targetStage, fromStage) {\n  _sg3pendTicker = ticker;\n  _sg3pendTarget = targetStage || \'3\';\n  _sg3pendFrom   = fromStage || _sg3dragF || null;\n  // Reuse existing buy modal (sg-overlay) from the previous embed\n  const s = _sg3sigs[ticker] || {};\n  document.getElementById(\'sg-modal-title\').textContent = \'Buy \' + ticker;\n  document.getElementById(\'sg-modal-price\').textContent =\n    s.current_price ? \'Current price: $\' + s.current_price.toFixed(2) : \'Price not available\';\n  document.getElementById(\'sg-mode-shares\').checked = true;\n  document.getElementById(\'sg-amount\').value = \'\';\n  document.getElementById(\'sg-modal-hint\').innerHTML = \'&nbsp;\';\n  document.getElementById(\'sg-overlay\').style.display = \'flex\';\n  setTimeout(() => document.getElementById(\'sg-amount\').focus(), 60);\n  // Swap confirm handler\n  document.getElementById(\'sg-act-btn\').onclick = sg3BuyConfirm;\n  document.getElementById(\'sg-act-btn\').textContent = \'\\u25b6 Buy\';\n}\n\nfunction sgUpdateHint() {  // keep existing hint updater working\n  const mode  = document.querySelector(\'input[name="sg-mode"]:checked\').value;\n  const amt   = parseFloat(document.getElementById(\'sg-amount\').value);\n  const price = (_sg3sigs[_sg3pendTicker] || {}).current_price;\n  const hint  = document.getElementById(\'sg-modal-hint\');\n  if (!amt || amt <= 0) { hint.innerHTML = \'&nbsp;\'; return; }\n  if (mode === \'shares\') {\n    hint.textContent = price\n      ? \'Total \\u2248 $\' + (amt * price).toLocaleString(\'en-US\', {minimumFractionDigits:2, maximumFractionDigits:2})\n      : amt + \' shares\';\n  } else {\n    const sh = price ? Math.floor(amt / price) : null;\n    hint.textContent = sh != null ? sh + \' shares @ $\' + price.toFixed(2) : \'$\' + amt;\n  }\n}\n\nasync function sg3BuyConfirm() {\n  const ticker = _sg3pendTicker;\n  const mode   = document.querySelector(\'input[name="sg-mode"]:checked\').value;\n  const amount = parseFloat(document.getElementById(\'sg-amount\').value);\n  if (!ticker || !amount || amount <= 0) return;\n\n  const btn = document.getElementById(\'sg-act-btn\');\n  btn.disabled = true; btn.textContent = \'Buying\\u2026\';\n\n  try {\n    const r = await fetch(\'/api/paper/activate\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify({ ticker, mode, amount }),\n    }).then(res => res.json());\n\n    if (r.status === \'ok\') {\n      if (_sg3pendFrom) sg3RemoveFromStage(_sg3pendTicker, _sg3pendFrom);\n      sg3MoveLocal(ticker, null, \'3\');\n      document.getElementById(\'sg-overlay\').style.display = \'none\';\n      _sg3recentTrades[ticker] = \'BOUGHT\';\n      setTimeout(() => { delete _sg3recentTrades[ticker]; sg3Render(); }, 8000);\n      load();\n    } else {\n      alert(\'Buy failed: \' + (r.error || \'unknown\'));\n    }\n  } catch(e) { alert(\'Error: \' + e.message); }\n  finally {\n    btn.disabled = false; btn.textContent = \'\\u25b6 Start Trading\';\n    btn.onclick  = sgModalConfirm;  // restore original handler\n  }\n}\n\n// ── Sell modal ────────────────────────────────────────────────────────────────\nfunction sg3OpenSell(ticker, targetStage) {\n  _sg3sellTicker = ticker;\n  _sg3sellTarget = targetStage || \'1\';\n  const pos = _sg3pos[ticker] || {};\n  const price = (_sg3sigs[ticker] || {}).current_price || pos.cur_price || pos.avg_cost || 0;\n\n  document.getElementById(\'sg3-sell-title\').textContent = \'Sell \' + ticker;\n  document.getElementById(\'sg3-sell-pos\').textContent =\n    pos.qty\n      ? pos.qty + \' shares · avg cost $\' + (pos.avg_cost || 0).toFixed(2) + \' · current $\' + price.toFixed(2)\n      : \'No open position\';\n  document.getElementById(\'sg3sm-all\').checked = true;\n  document.getElementById(\'sg3-sell-qty\').style.display = \'none\';\n  document.getElementById(\'sg3-sell-qty\').value = \'\';\n  const dest = targetStage === \'1\' ? \'Stage 1 (Monitoring)\' : \'Stage 2 (Active AI)\';\n  document.getElementById(\'sg3-sell-dest\').textContent = \'After sell: move to \' + dest;\n  sg3UpdateSellHint();\n  document.getElementById(\'sg3-sell-overlay\').style.display = \'flex\';\n  if (pos.qty) setTimeout(() => document.getElementById(\'sg3-sell-overlay\').focus?.(), 60);\n}\n\nfunction sg3SellModeChange() {\n  const partial = document.getElementById(\'sg3sm-part\').checked;\n  document.getElementById(\'sg3-sell-qty\').style.display = partial ? \'block\' : \'none\';\n  if (partial) document.getElementById(\'sg3-sell-qty\').focus();\n  sg3UpdateSellHint();\n}\n\nfunction sg3UpdateSellHint() {\n  const pos   = _sg3pos[_sg3sellTicker] || {};\n  const price = (_sg3sigs[_sg3sellTicker] || {}).current_price || pos.cur_price || 0;\n  const hint  = document.getElementById(\'sg3-sell-hint\');\n  const mode  = document.querySelector(\'input[name="sg3sm"]:checked\')?.value || \'all\';\n  const qty   = mode === \'all\' ? (pos.qty || 0) : parseFloat(document.getElementById(\'sg3-sell-qty\').value) || 0;\n  if (!qty || !price) { hint.innerHTML = \'&nbsp;\'; return; }\n  hint.textContent = \'Proceeds \\u2248 $\' + (qty * price).toLocaleString(\'en-US\', {minimumFractionDigits:2, maximumFractionDigits:2});\n}\n\nfunction sg3SellCancel() {\n  document.getElementById(\'sg3-sell-overlay\').style.display = \'none\';\n  _sg3sellTicker = null;\n}\n\nasync function sg3SellConfirm() {\n  const ticker      = _sg3sellTicker;\n  const targetStage = _sg3sellTarget;\n  if (!ticker) return;\n\n  const mode = document.querySelector(\'input[name="sg3sm"]:checked\')?.value || \'all\';\n  const qty  = mode === \'partial\' ? parseFloat(document.getElementById(\'sg3-sell-qty\').value) : null;\n\n  const btn = document.getElementById(\'sg3-sell-btn\');\n  btn.disabled = true; btn.textContent = \'Selling\\u2026\';\n\n  try {\n    const r = await fetch(\'/api/paper/sell\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify({ ticker, mode, qty, target_stage: targetStage }),\n    }).then(res => res.json());\n\n    if (r.status === \'ok\') {\n      sg3MoveLocal(ticker, \'3\', targetStage);\n      document.getElementById(\'sg3-sell-overlay\').style.display = \'none\';\n      _sg3sellTicker = null;\n      if (!r.no_position) {\n        _sg3recentTrades[ticker] = \'SOLD\';\n        setTimeout(() => { delete _sg3recentTrades[ticker]; sg3Render(); }, 8000);\n      }\n      load();\n    } else {\n      alert(\'Sell failed: \' + (r.error || \'unknown\'));\n    }\n  } catch(e) { alert(\'Error: \' + e.message); }\n  finally { btn.disabled = false; btn.textContent = \'\\u1f4b8 Sell\'; }\n}\n\n// ── Local state helpers ───────────────────────────────────────────────────────\nfunction sg3RemoveFromStage(ticker, stage) {\n  const arr = _sg3[\'stage\' + stage];\n  if (!arr) return;\n  const i = arr.indexOf(ticker);\n  if (i !== -1) arr.splice(i, 1);\n}\n\nfunction sg3MoveLocal(ticker, from, to) {\n  if (from) sg3RemoveFromStage(ticker, from);\n  const toArr = _sg3[\'stage\' + to];\n  if (toArr && !toArr.includes(ticker)) toArr.push(ticker);\n  sg3Render();\n  sg3Save();\n}\n\nfunction sg3Remove(ticker) {\n  [\'stage1\',\'stage2\',\'stage3\'].forEach(k => {\n    _sg3[k] = (_sg3[k] || []).filter(t => t !== ticker);\n  });\n  sg3Render();\n  sg3Save();\n}\n\nasync function sg3Save() {\n  try {\n    await fetch(\'/api/stagegate\', {\n      method: \'POST\',\n      headers: {\'Content-Type\': \'application/json\'},\n      body: JSON.stringify(_sg3),\n    });\n  } catch(e) {}\n}\n\n// ── Hook into existing load() to sync Stage 3 ────────────────────────────────\nconst _origLoad = load;\nwindow.load = async function() {\n  await _origLoad();\n  try {\n    const sigs = await fetch(\'/api/signals\').then(r => r.json());\n    (sigs || []).forEach(s => { _sg3sigs[s.ticker] = s; });\n    sg3Render();\n  } catch(e) {}\n  try {\n    const acct = await fetch(\'/api/paper/account\').then(r => r.json());\n    sg3SyncPositions(acct.positions || []);\n  } catch(e) {}\n};\n\n// Escape closes sell modal too\ndocument.addEventListener(\'keydown\', e => {\n  if (e.key === \'Escape\') { sg3SellCancel(); aiClose(); }\n});\n\n// Boot\nsg3Boot();\n\n})(); // end IIFE\n'
 PAPER_JS = PAPER_JS + _SG3_JS
+
+# ── TipRanks badge for Paper Trading stage gate cards ─────────────────────────
+_TIPRANKS_SG3_JS = """
+var _sg3TrData = {};
+function _sg3TrBadge(t) {
+  var d = _sg3TrData[t] || {};
+  var ss = d.smart_score;
+  if (ss == null) return '';
+  var bg  = ss >= 8 ? '#1a4731' : ss >= 4 ? '#3d2b00' : '#4a1519';
+  var col = ss >= 8 ? '#3fb950' : ss >= 4 ? '#d29922' : '#f85149';
+  return ' <span style="background:' + bg + ';color:' + col + ';border:1px solid ' + col + ';font-size:9px;padding:1px 4px;border-radius:3px;font-weight:700">&#9733;' + ss + '</span>';
+}
+"""
+PAPER_JS = PAPER_JS + _TIPRANKS_SG3_JS
+
+# Patch sg3CardHtml to show TipRanks Smart Score badge next to ticker
+PAPER_JS = PAPER_JS.replace(
+    "    + '<div class=\"sg3-tick\">' + ticker + '</div>'\n",
+    "    + '<div class=\"sg3-tick\">' + ticker + _sg3TrBadge(ticker) + '</div>'\n"
+)
+
+# Patch sg3Boot to load TipRanks data before rendering
+PAPER_JS = PAPER_JS.replace(
+    "  _sg3.stage1 = _sg3.stage1 || [];\n  _sg3.stage2 = _sg3.stage2 || [];\n  _sg3.stage3 = _sg3.stage3 || [];\n  sg3Render();\n}",
+    "  _sg3.stage1 = _sg3.stage1 || [];\n  _sg3.stage2 = _sg3.stage2 || [];\n  _sg3.stage3 = _sg3.stage3 || [];\n  try { _sg3TrData = await fetch('/api/tipranks/all').then(r => r.json()); } catch(e) {}\n  sg3Render();\n}"
+)
+
+# Patch sg3Save + AI exits to use per-model /api/paper/ routes (interceptor adds ?model= automatically)
+PAPER_JS = PAPER_JS.replace(
+    "await fetch('/api/stagegate', {\n      method: 'POST',\n      headers: {'Content-Type': 'application/json'},\n      body: JSON.stringify(_sg3),\n    });",
+    "await fetch('/api/paper/stagegate', {\n      method: 'POST',\n      headers: {'Content-Type': 'application/json'},\n      body: JSON.stringify(_sg3),\n    });"
+)
 
 
 @app.post("/api/paper/activate-ai")
@@ -2975,7 +4879,7 @@ async def api_paper_activate_ai(request: Request):
 
 
 @app.post("/api/paper/sell")
-async def api_paper_sell(request: Request):
+async def api_paper_sell(request: Request, model: str = "standard"):
     """Manual paper sell; moves ticker to target_stage in stagegate."""
     import datetime
     body         = await request.json()
@@ -2989,26 +4893,39 @@ async def api_paper_sell(request: Request):
 
     try:
         from paper.account   import init_paper_db, PaperAccount, PaperPosition, PaperTrade
-        from paper.executor  import PaperExecutor
+        from paper.executor  import PaperExecutor, PAPER_MODEL_CONFIGS
         from models.database import init_db as _init_db
 
+        cfg = PAPER_MODEL_CONFIGS.get(model, PAPER_MODEL_CONFIGS["standard"])
         _, MainSession = _init_db(config.database.url, echo=False)
-        ex    = PaperExecutor(main_db_session_factory=MainSession)
+        ex    = PaperExecutor(main_db_session_factory=MainSession, db_path=cfg["db"], stagegate_file=cfg["stagegate"])
         price = ex._latest_price(ticker)
 
-        _, PaperSession = init_paper_db()
+        import json as _json, os as _os
+        sg_file = cfg["stagegate"]
+
+        def _sg_load():
+            if _os.path.exists(sg_file):
+                return _json.loads(open(sg_file, encoding="utf-8").read())
+            return _load_stagegate()
+
+        def _sg_save(sg):
+            _os.makedirs("data", exist_ok=True)
+            open(sg_file, "w", encoding="utf-8").write(_json.dumps(sg, indent=2))
+
+        _, PaperSession = init_paper_db(cfg["db"])
         with PaperSession() as session:
             acct = session.query(PaperAccount).first()
             pos  = session.query(PaperPosition).filter_by(ticker=ticker).first()
 
             if not pos or pos.qty <= 0:
-                sg = _load_stagegate()
+                sg = _sg_load()
                 for k in ("stage1","stage2","stage3"):
                     sg.setdefault(k, [])
                     if ticker in sg[k]: sg[k].remove(ticker)
                 sg.setdefault(f"stage{target_stage}", [])
                 sg[f"stage{target_stage}"].append(ticker)
-                _save_stagegate(sg)
+                _sg_save(sg)
                 return {"status": "ok", "ticker": ticker, "qty": 0, "no_position": True}
 
             if not price or price <= 0:
@@ -3034,12 +4951,12 @@ async def api_paper_sell(request: Request):
             ))
             session.commit()
 
-        sg = _load_stagegate()
+        sg = _sg_load()
         for k in ("stage1","stage2","stage3"):
             sg.setdefault(k, [])
             if ticker in sg[k]: sg[k].remove(ticker)
         sg[f"stage{target_stage}"].append(ticker)
-        _save_stagegate(sg)
+        _sg_save(sg)
 
         return {"status": "ok", "ticker": ticker, "qty": qty, "price": price, "proceeds": proceeds}
 
@@ -3054,7 +4971,7 @@ PAPER_JS   = PAPER_JS.replace('sg3Boot();\n\n})(); // end IIFE',
 
 
 # ── Paper dashboard feature additions (auto-patched) ─────────────────────────
-_FEAT_JS  = '\n// ════════════════════════════════════════════════════════════════════════════\n// Paper dashboard feature additions\n// ════════════════════════════════════════════════════════════════════════════\n\n// ── Inject extra CSS ─────────────────────────────────────────────────────────\n(function() {\n  const s = document.createElement(\'style\');\n  s.textContent = \'\\n  /* ── Ticker tape (paper page) ─────────────────────────────── */\\n  .p-tape-wrap  { overflow: hidden; background: #0a0f17;\\n                  border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0; }\\n  .p-tape-track { display: flex; gap: 24px; white-space: nowrap; will-change: transform;\\n                  animation: p-tape 100s linear infinite; align-items: center; height: 100%;\\n                  padding-left: 12px; }\\n  .p-tape-track:hover { animation-play-state: paused; }\\n  @keyframes p-tape { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }\\n  .pt-bull { color: #3fb950; font-size: 12px; font-weight: 700; }\\n  .pt-bear { color: #f85149; font-size: 12px; font-weight: 700; }\\n  .pt-neu  { color: #8b949e; font-size: 12px; }\\n  .pt-sep  { color: #30363d; font-size: 10px; }\\n  /* ── Search + sync header controls ────────────────────────── */\\n  .p-search-wrap { display: flex; gap: 5px; align-items: center; }\\n  .p-search-input { padding: 5px 10px; border-radius: 6px; border: 1px solid #30363d;\\n                    background: #21262d; color: #e6edf3; font-size: 12px; width: 130px;\\n                    text-transform: uppercase; }\\n  .p-search-input::placeholder { color: #8b949e; text-transform: none; }\\n  .p-add-s1 { padding: 5px 9px; border-radius: 6px; border: 1px solid #8b949e;\\n               background: transparent; color: #8b949e; cursor: pointer; font-size: 11px; }\\n  .p-add-s1:hover { background: rgba(139,148,158,0.12); }\\n  .p-add-s2 { padding: 5px 9px; border-radius: 6px; border: 1px solid #58a6ff;\\n               background: transparent; color: #58a6ff; cursor: pointer; font-size: 11px; }\\n  .p-add-s2:hover { background: rgba(88,166,255,0.12); }\\n  .p-sync-btn { padding: 5px 10px; border-radius: 6px; border: 1px solid #d29922;\\n                background: transparent; color: #d29922; cursor: pointer; font-size: 11px; }\\n  .p-sync-btn:hover { background: rgba(210,153,34,0.12); }\\n  /* ── Compact swim lanes ───────────────────────────────────── */\\n  .swim-compact-wrap { padding: 10px 14px; display: flex; flex-direction: column; gap: 10px; }\\n  .swim-row  { display: flex; gap: 8px; align-items: flex-start; }\\n  .swim-row-label { font-size: 10px; font-weight: 700; letter-spacing: 0.5px;\\n                    text-transform: uppercase; width: 90px; flex-shrink: 0; padding-top: 4px; }\\n  .swim-row-0 .swim-row-label { color: #58a6ff; }\\n  .swim-row-1 .swim-row-label { color: #d29922; }\\n  .swim-row-2 .swim-row-label { color: #3fb950; }\\n  .swim-chips { display: flex; gap: 5px; flex-wrap: wrap; }\\n  .swim-chip  { padding: 3px 8px; border-radius: 10px; font-size: 11px; font-weight: 600;\\n                background: rgba(63,185,80,0.12); color: #3fb950; border: 1px solid rgba(63,185,80,0.3); }\\n  .swim-none  { font-size: 11px; color: #8b949e; font-style: italic; padding-top: 3px; }\\n\';\n  document.head.appendChild(s);\n})();\n\n// ── Inject search + sync into header ─────────────────────────────────────────\n(function() {\n  const hr = document.querySelector(\'.header-right\');\n  if (hr) hr.insertAdjacentHTML(\'afterbegin\', \'\\n  <div class="p-search-wrap">\\n    <input class="p-search-input" id="p-search" type="text" placeholder="Add ticker..."\\n           maxlength="10" onkeydown="if(event.key===\\\'Enter\\\') pAddTicker(\\\'1\\\')">\\n    <button class="p-add-s1" onclick="pAddTicker(\\\'1\\\')" title="Add to Stage 1">+S1</button>\\n    <button class="p-add-s2" onclick="pAddTicker(\\\'2\\\')" title="Add to Stage 2">+S2</button>\\n  </div>\\n  <button class="p-sync-btn" onclick="pSyncWatchlist()" title="Sync top signals to Stage 1">&#8635; Sync</button>\\n\');\n})();\n\n// ── Inject ticker tape after header ──────────────────────────────────────────\n(function() {\n  const hdr = document.querySelector(\'header\');\n  if (hdr) hdr.insertAdjacentHTML(\'afterend\', \'<div class="p-tape-wrap"><div class="p-tape-track" id="p-tape">&nbsp;</div></div>\');\n})();\n\n// ── Build ticker tape from signals ───────────────────────────────────────────\nfunction pBuildTape(sigs) {\n  const track = document.getElementById(\'p-tape\');\n  if (!track) return;\n  const items = (sigs || []).filter(s => {\n    const sig = (s.signal || \'\').toUpperCase();\n    return sig === \'BUY\' || sig === \'STRONG_BUY\' || sig === \'SELL\' || sig === \'STRONG_SELL\';\n  });\n  if (!items.length) { track.innerHTML = \'<span class="pt-neu">No signals</span>\'; return; }\n  const all = [...items, ...items];\n  track.innerHTML = all.map(s => {\n    const sig = (s.signal || \'\').toUpperCase();\n    const bull = sig === \'BUY\' || sig === \'STRONG_BUY\';\n    const cls  = bull ? \'pt-bull\' : \'pt-bear\';\n    const arr  = bull ? \'&#9650;\' : \'&#9660;\';\n    const price = s.current_price ? \' $\' + s.current_price.toFixed(2) : \'\';\n    return \'<span class="\' + cls + \'">\' + arr + \' \' + s.ticker + price + \'</span>\'\n         + \'<span class="pt-sep">|</span>\';\n  }).join(\'\');\n  track.style.animationDuration = Math.max(40, items.length * 0.7) + \'s\';\n}\n\n// ── Compact swim lanes (replace 3-col grid with single box) ──────────────────\nfunction pBuildCompactSwim(sigs) {\n  const swimSec = document.getElementById(\'swim-section\');\n  if (!swimSec) return;\n\n  const MODELS = [\n    { label: \'Standard\',     conf: 0.50,  mos: 0.15,   fud: 0.60 },\n    { label: \'Relaxed -25%\', conf: 0.375, mos: 0.1125, fud: 0.45 },\n    { label: \'Relaxed -50%\', conf: 0.25,  mos: 0.075,  fud: 0.30 },\n  ];\n\n  const rows = MODELS.map((m, i) => {\n    const passing = (sigs || []).filter(s => {\n      const sig = (s.signal || \'\').toUpperCase();\n      return (s.confidence || 0) >= m.conf\n          && (s.margin_of_safety || 0) >= m.mos\n          && (s.fud_score || 0) >= m.fud\n          && (sig === \'BUY\' || sig === \'STRONG_BUY\');\n    }).sort((a, b) => (b.confidence || 0) - (a.confidence || 0));\n\n    const chips = passing.length\n      ? passing.map(s =>\n          \'<span class="swim-chip" title="Conf \' + ((s.confidence||0)*100).toFixed(0) + \'% | MoS \'\n          + ((s.margin_of_safety||0)*100).toFixed(1) + \'%">\' + s.ticker + \'</span>\'\n        ).join(\'\')\n      : \'<span class="swim-none">None clear this bar</span>\';\n\n    return \'<div class="swim-row swim-row-\' + i + \'">\'\n      + \'<div class="swim-row-label">\' + m.label + \'</div>\'\n      + \'<div class="swim-chips">\' + chips + \'</div>\'\n      + \'</div>\';\n  });\n\n  swimSec.querySelector(\'.section-title\').textContent = \'\\ud83d\\udcca Threshold Models\';\n  let body = swimSec.querySelector(\'.swim-compact-wrap\');\n  if (!body) {\n    // Replace old grid with compact wrap\n    const old = swimSec.querySelector(\'.swim-wrap\');\n    if (old) old.remove();\n    body = document.createElement(\'div\');\n    body.className = \'swim-compact-wrap\';\n    swimSec.appendChild(body);\n  }\n  body.innerHTML = rows.join(\'\');\n\n  // Move swim section below sg3-section\n  const sg3Sec = document.getElementById(\'sg3-section\');\n  if (sg3Sec && swimSec.parentNode) {\n    sg3Sec.insertAdjacentElement(\'afterend\', swimSec);\n  }\n}\n\n// ── Search: add ticker to stage 1 or 2 ───────────────────────────────────────\nfunction pAddTicker(toStage) {\n  const inp = document.getElementById(\'p-search\');\n  const ticker = (inp ? inp.value : \'\').trim().toUpperCase();\n  if (!ticker) return;\n  inp.value = \'\';\n  sg3AddTicker(ticker, toStage);\n}\n\nfunction sg3AddTicker(ticker, toStage) {\n  if (!ticker) return;\n  // Remove from all stages first to avoid duplicates\n  [\'stage1\',\'stage2\',\'stage3\'].forEach(k => {\n    if (_sg3[k] && _sg3[k].includes(ticker)) return; // already there\n  });\n  const already = (_sg3.stage1||[]).includes(ticker)\n               || (_sg3.stage2||[]).includes(ticker)\n               || (_sg3.stage3||[]).includes(ticker);\n  if (already) return;\n  (_sg3[\'stage\' + toStage] || []).push(ticker);\n  sg3Render();\n  sg3Save();\n}\nwindow.sg3AddTicker = sg3AddTicker;\nwindow.pAddTicker   = pAddTicker;\n\n// ── Sync watchlist: top-5 bullish I-Tool + all recent signals ─────────────────\nasync function pSyncWatchlist() {\n  const btn = document.querySelector(\'.p-sync-btn\');\n  if (btn) { btn.disabled = true; btn.textContent = \'\\u29d7 Syncing...\'; }\n  try {\n    const [itool, sigs] = await Promise.all([\n      fetch(\'/api/itool\').then(r => r.json()).catch(() => ({})),\n      fetch(\'/api/signals\').then(r => r.json()).catch(() => []),\n    ]);\n\n    const toAdd = new Set();\n\n    // Top 5 bullish from I-Tool\n    const itoolResults = (itool.results || [])\n      .filter(r => r.signal === \'bullish\')\n      .slice(0, 5);\n    itoolResults.forEach(r => toAdd.add(r.ticker));\n\n    // All bullish from recent signals\n    (sigs || []).forEach(s => {\n      const sig = (s.signal || \'\').toUpperCase();\n      if (sig === \'BUY\' || sig === \'STRONG_BUY\') toAdd.add(s.ticker);\n    });\n\n    let added = 0;\n    toAdd.forEach(ticker => {\n      const inAny = (_sg3.stage1||[]).includes(ticker)\n                 || (_sg3.stage2||[]).includes(ticker)\n                 || (_sg3.stage3||[]).includes(ticker);\n      if (!inAny) {\n        (_sg3.stage1 = _sg3.stage1 || []).push(ticker);\n        added++;\n      }\n    });\n\n    if (added > 0) {\n      sg3Render();\n      await sg3Save();\n    }\n    if (btn) btn.textContent = \'\\u2713 Synced +\' + added;\n  } catch(e) {\n    if (btn) btn.textContent = \'Error\';\n  } finally {\n    setTimeout(() => { if (btn) { btn.disabled = false; btn.textContent = \'\\u8635 Sync\'; } }, 3000);\n  }\n}\nwindow.pSyncWatchlist = pSyncWatchlist;\n\n// ── Hook into existing loadSwimLanes / signal load to drive tape + compact swim ─\nconst _origLoadSwimLanes = typeof loadSwimLanes === \'function\' ? loadSwimLanes : null;\nwindow.loadSwimLanes = async function() {\n  if (_origLoadSwimLanes) await _origLoadSwimLanes();\n  try {\n    const sigs = await fetch(\'/api/signals\').then(r => r.json());\n    pBuildTape(sigs);\n    pBuildCompactSwim(sigs);\n  } catch(e) {}\n};\n\n// Also seed tape immediately from already-loaded _sg3sigs\nsetTimeout(() => {\n  const sigsArr = Object.values(_sg3sigs || {});\n  if (sigsArr.length) {\n    pBuildTape(sigsArr);\n    pBuildCompactSwim(sigsArr);\n  }\n}, 800);\n'
+_FEAT_JS  = '\n// ════════════════════════════════════════════════════════════════════════════\n// Paper dashboard feature additions\n// ════════════════════════════════════════════════════════════════════════════\n\n// ── Inject extra CSS ─────────────────────────────────────────────────────────\n(function() {\n  const s = document.createElement(\'style\');\n  s.textContent = \'\\n  /* ── Ticker tape (paper page) ─────────────────────────────── */\\n  .p-tape-wrap  { overflow: hidden; background: #0a0f17;\\n                  border-bottom: 1px solid #1f6feb; height: 26px; flex-shrink: 0; }\\n  .p-tape-track { display: flex; gap: 24px; white-space: nowrap; will-change: transform;\\n                  animation: p-tape 100s linear infinite; align-items: center; height: 100%;\\n                  padding-left: 12px; }\\n  .p-tape-track:hover { animation-play-state: paused; }\\n  @keyframes p-tape { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }\\n  .pt-bull { color: #3fb950; font-size: 12px; font-weight: 700; }\\n  .pt-bear { color: #f85149; font-size: 12px; font-weight: 700; }\\n  .pt-neu  { color: #8b949e; font-size: 12px; }\\n  .pt-sep  { color: #30363d; font-size: 10px; }\\n  /* ── Search + sync header controls ────────────────────────── */\\n  .p-search-wrap { display: flex; gap: 5px; align-items: center; }\\n  .p-search-input { padding: 5px 10px; border-radius: 6px; border: 1px solid #30363d;\\n                    background: #21262d; color: #e6edf3; font-size: 12px; width: 130px;\\n                    text-transform: uppercase; }\\n  .p-search-input::placeholder { color: #8b949e; text-transform: none; }\\n  .p-add-s1 { padding: 5px 9px; border-radius: 6px; border: 1px solid #8b949e;\\n               background: transparent; color: #8b949e; cursor: pointer; font-size: 11px; }\\n  .p-add-s1:hover { background: rgba(139,148,158,0.12); }\\n  .p-add-s2 { padding: 5px 9px; border-radius: 6px; border: 1px solid #58a6ff;\\n               background: transparent; color: #58a6ff; cursor: pointer; font-size: 11px; }\\n  .p-add-s2:hover { background: rgba(88,166,255,0.12); }\\n  .p-sync-btn { padding: 5px 10px; border-radius: 6px; border: 1px solid #d29922;\\n                background: transparent; color: #d29922; cursor: pointer; font-size: 11px; }\\n  .p-sync-btn:hover { background: rgba(210,153,34,0.12); }\\n  /* ── Compact swim lanes ───────────────────────────────────── */\\n  .swim-compact-wrap { padding: 10px 14px; display: flex; flex-direction: column; gap: 10px; }\\n  .swim-row  { display: flex; gap: 8px; align-items: flex-start; }\\n  .swim-row-label { font-size: 10px; font-weight: 700; letter-spacing: 0.5px;\\n                    text-transform: uppercase; width: 90px; flex-shrink: 0; padding-top: 4px; }\\n  .swim-row-0 .swim-row-label { color: #58a6ff; }\\n  .swim-row-1 .swim-row-label { color: #d29922; }\\n  .swim-row-2 .swim-row-label { color: #3fb950; }\\n  .swim-chips { display: flex; gap: 5px; flex-wrap: wrap; }\\n  .swim-chip  { padding: 3px 8px; border-radius: 10px; font-size: 11px; font-weight: 600;\\n                background: rgba(63,185,80,0.12); color: #3fb950; border: 1px solid rgba(63,185,80,0.3); }\\n  .swim-none  { font-size: 11px; color: #8b949e; font-style: italic; padding-top: 3px; }\\n\';\n  document.head.appendChild(s);\n})();\n\n// ── Inject search + sync into header ─────────────────────────────────────────\n(function() {\n  const hr = document.querySelector(\'.header-right\');\n  if (hr) hr.insertAdjacentHTML(\'afterbegin\', \'\\n  <div class="p-search-wrap">\\n    <input class="p-search-input" id="p-search" type="text" placeholder="Add ticker..."\\n           maxlength="10" onkeydown="if(event.key===\\\'Enter\\\') pAddTicker(\\\'1\\\')">\\n    <button class="p-add-s1" onclick="pAddTicker(\\\'1\\\')" title="Add to Stage 1">+S1</button>\\n    <button class="p-add-s2" onclick="pAddTicker(\\\'2\\\')" title="Add to Stage 2">+S2</button>\\n  </div>\\n  <button class="p-sync-btn" onclick="pSyncWatchlist()" title="Sync top signals to Stage 1">&#8635; Sync</button>\\n\');\n})();\n\n// ── Inject ticker tape after header ──────────────────────────────────────────\n(function() {\n  const hdr = document.querySelector(\'header\');\n  if (hdr) hdr.insertAdjacentHTML(\'afterend\', \'<div class="p-tape-wrap"><div class="p-tape-track" id="p-tape">&nbsp;</div></div>\');\n})();\n\n// ── Build ticker tape from signals (with live prices from /api/prices) ───────\nasync function pBuildTape(sigs) {\n  const track = document.getElementById(\'p-tape\');\n  if (!track) return;\n  const items = (sigs || []).filter(s => {\n    const sig = (s.signal || \'\').toUpperCase();\n    return sig === \'BUY\' || sig === \'STRONG_BUY\' || sig === \'SELL\' || sig === \'STRONG_SELL\';\n  });\n  if (!items.length) { track.innerHTML = \'<span class="pt-neu">No signals</span>\'; return; }\n  // Fetch live prices from /api/prices\n  let livePrices = {};\n  try {\n    const tickerStr = items.map(s => s.ticker).join(\',\');\n    livePrices = await fetch(\'/api/prices?tickers=\' + tickerStr).then(r => r.json());\n  } catch(e) {}\n  const all = [...items, ...items];\n  track.innerHTML = all.map(s => {\n    const sig = (s.signal || \'\').toUpperCase();\n    const bull = sig === \'BUY\' || sig === \'STRONG_BUY\';\n    const cls  = bull ? \'pt-bull\' : \'pt-bear\';\n    const arr  = bull ? \'&#9650;\' : \'&#9660;\';\n    const liveP = livePrices[s.ticker];\n    const displayP = liveP || s.current_price;\n    const price = displayP ? \' $\' + displayP.toFixed(2) : \'\';\n    return \'<span class="\' + cls + \'">\' + arr + \' \' + s.ticker + price + \'</span>\'\n         + \'<span class="pt-sep">|</span>\';\n  }).join(\'\');\n  track.style.animationDuration = Math.max(40, items.length * 0.7) + \'s\';\n}\n\n// ── Compact swim lanes (replace 3-col grid with single box) ──────────────────\nfunction pBuildCompactSwim(sigs) {\n  const swimSec = document.getElementById(\'swim-section\');\n  if (!swimSec) return;\n\n  const MODELS = [\n    { label: \'Standard\',     conf: 0.50,  mos: 0.15,   fud: 0.60 },\n    { label: \'Relaxed -25%\', conf: 0.375, mos: 0.1125, fud: 0.45 },\n    { label: \'Relaxed -50%\', conf: 0.25,  mos: 0.075,  fud: 0.30 },\n  ];\n\n  const rows = MODELS.map((m, i) => {\n    const passing = (sigs || []).filter(s => {\n      const sig = (s.signal || \'\').toUpperCase();\n      return (s.confidence || 0) >= m.conf\n          && (s.margin_of_safety || 0) >= m.mos\n          && (s.fud_score || 0) >= m.fud\n          && (sig === \'BUY\' || sig === \'STRONG_BUY\');\n    }).sort((a, b) => (b.confidence || 0) - (a.confidence || 0));\n\n    const chips = passing.length\n      ? passing.map(s =>\n          \'<span class="swim-chip" title="Conf \' + ((s.confidence||0)*100).toFixed(0) + \'% | MoS \'\n          + ((s.margin_of_safety||0)*100).toFixed(1) + \'%">\' + s.ticker + \'</span>\'\n        ).join(\'\')\n      : \'<span class="swim-none">None clear this bar</span>\';\n\n    return \'<div class="swim-row swim-row-\' + i + \'">\'\n      + \'<div class="swim-row-label">\' + m.label + \'</div>\'\n      + \'<div class="swim-chips">\' + chips + \'</div>\'\n      + \'</div>\';\n  });\n\n  swimSec.querySelector(\'.section-title\').textContent = \'\\ud83d\\udcca Threshold Models\';\n  let body = swimSec.querySelector(\'.swim-compact-wrap\');\n  if (!body) {\n    // Replace old grid with compact wrap\n    const old = swimSec.querySelector(\'.swim-wrap\');\n    if (old) old.remove();\n    body = document.createElement(\'div\');\n    body.className = \'swim-compact-wrap\';\n    swimSec.appendChild(body);\n  }\n  body.innerHTML = rows.join(\'\');\n\n  // Move swim section below sg3-section\n  const sg3Sec = document.getElementById(\'sg3-section\');\n  if (sg3Sec && swimSec.parentNode) {\n    sg3Sec.insertAdjacentElement(\'afterend\', swimSec);\n  }\n}\n\n// ── Search: add ticker to stage 1 or 2 ───────────────────────────────────────\nfunction pAddTicker(toStage) {\n  const inp = document.getElementById(\'p-search\');\n  const ticker = (inp ? inp.value : \'\').trim().toUpperCase();\n  if (!ticker) return;\n  inp.value = \'\';\n  sg3AddTicker(ticker, toStage);\n}\n\nfunction sg3AddTicker(ticker, toStage) {\n  if (!ticker) return;\n  // Remove from all stages first to avoid duplicates\n  [\'stage1\',\'stage2\',\'stage3\'].forEach(k => {\n    if (_sg3[k] && _sg3[k].includes(ticker)) return; // already there\n  });\n  const already = (_sg3.stage1||[]).includes(ticker)\n               || (_sg3.stage2||[]).includes(ticker)\n               || (_sg3.stage3||[]).includes(ticker);\n  if (already) return;\n  (_sg3[\'stage\' + toStage] || []).push(ticker);\n  sg3Render();\n  sg3Save();\n}\nwindow.sg3AddTicker = sg3AddTicker;\nwindow.pAddTicker   = pAddTicker;\n\n// ── Sync watchlist: top-5 bullish I-Tool + all recent signals ─────────────────\nasync function pSyncWatchlist() {\n  const btn = document.querySelector(\'.p-sync-btn\');\n  if (btn) { btn.disabled = true; btn.textContent = \'\\u29d7 Syncing...\'; }\n  try {\n    const [itool, sigs] = await Promise.all([\n      fetch(\'/api/itool\').then(r => r.json()).catch(() => ({})),\n      fetch(\'/api/signals\').then(r => r.json()).catch(() => []),\n    ]);\n\n    const toAdd = new Set();\n\n    // Top 5 bullish from I-Tool\n    const itoolResults = (itool.results || [])\n      .filter(r => r.signal === \'bullish\')\n      .slice(0, 5);\n    itoolResults.forEach(r => toAdd.add(r.ticker));\n\n    // All bullish from recent signals\n    (sigs || []).forEach(s => {\n      const sig = (s.signal || \'\').toUpperCase();\n      if (sig === \'BUY\' || sig === \'STRONG_BUY\') toAdd.add(s.ticker);\n    });\n\n    let added = 0;\n    toAdd.forEach(ticker => {\n      const inAny = (_sg3.stage1||[]).includes(ticker)\n                 || (_sg3.stage2||[]).includes(ticker)\n                 || (_sg3.stage3||[]).includes(ticker);\n      if (!inAny) {\n        (_sg3.stage1 = _sg3.stage1 || []).push(ticker);\n        added++;\n      }\n    });\n\n    if (added > 0) {\n      sg3Render();\n      await sg3Save();\n    }\n    if (btn) btn.textContent = \'\\u2713 Synced +\' + added;\n  } catch(e) {\n    if (btn) btn.textContent = \'Error\';\n  } finally {\n    setTimeout(() => { if (btn) { btn.disabled = false; btn.textContent = \'\\u8635 Sync\'; } }, 3000);\n  }\n}\nwindow.pSyncWatchlist = pSyncWatchlist;\n\n// ── Hook into existing loadSwimLanes / signal load to drive tape + compact swim ─\nconst _origLoadSwimLanes = typeof loadSwimLanes === \'function\' ? loadSwimLanes : null;\nwindow.loadSwimLanes = async function() {\n  if (_origLoadSwimLanes) await _origLoadSwimLanes();\n  try {\n    const sigs = await fetch(\'/api/signals\').then(r => r.json());\n    pBuildTape(sigs);\n    pBuildCompactSwim(sigs);\n  } catch(e) {}\n};\n\n// Also seed tape immediately from already-loaded _sg3sigs\nsetTimeout(() => {\n  const sigsArr = Object.values(_sg3sigs || {});\n  if (sigsArr.length) {\n    pBuildTape(sigsArr);\n    pBuildCompactSwim(sigsArr);\n  }\n}, 800);\n'
 PAPER_JS  = PAPER_JS + _FEAT_JS
 
 
@@ -3200,7 +5117,7 @@ PAPER_JS = PAPER_JS.replace(_SYNC_OLD, _SYNC_NEW_JS)
 
 # ── Threshold patch ───────────────────────────────────────────────────────────
 # 1. Hide swim-wrap + inject threshold bar CSS
-PAPER_HTML = PAPER_HTML.replace('</style>', "\n  /* ── Hide old swim-wrap ─────────────────────────────────────── */\n  #swim-wrap, .swim-wrap { display: none !important; }\n  /* ── AI Threshold control bar ──────────────────────────────── */\n  .thresh-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px;\n                background: #161b22; border: 1px solid #30363d; border-radius: 8px;\n                flex-wrap: wrap; }\n  .thresh-label { font-size: 10px; font-weight: 700; color: #8b949e;\n                  letter-spacing: 0.5px; text-transform: uppercase; white-space: nowrap; }\n  .thresh-grp { display: flex; gap: 3px; }\n  .thresh-btn  { padding: 3px 11px; border-radius: 20px; border: 1px solid #30363d;\n                 background: transparent; color: #8b949e; font-size: 11px; cursor: pointer; }\n  .thresh-btn.t-high { border-color: #f85149; color: #f85149; background: rgba(248,81,73,0.1); }\n  .thresh-btn.t-med  { border-color: #d29922; color: #d29922; background: rgba(210,153,34,0.1); }\n  .thresh-btn.t-low  { border-color: #3fb950; color: #3fb950; background: rgba(63,185,80,0.1); }\n  .thresh-desc { font-size: 10px; color: #8b949e; white-space: nowrap; }\n  .thresh-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-left: auto; }\n  .thresh-chip  { padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600;\n                  background: rgba(63,185,80,0.12); color: #3fb950;\n                  border: 1px solid rgba(63,185,80,0.3); }\n  .thresh-none  { font-size: 11px; color: #8b949e; font-style: italic; }\n  /* ── Gate toggles in AI modal ───────────────────────────────── */\n  .ai-gate-sect { margin-top: 12px; padding-top: 10px; border-top: 1px solid #21262d; }\n  .ai-gate-title { font-size: 10px; color: #8b949e; font-weight: 700;\n                   letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 8px; }\n  .gate-row { display: flex; gap: 8px; flex-wrap: wrap; }\n  .gate-tog { display: flex; align-items: center; gap: 5px; cursor: pointer;\n              padding: 4px 9px; border-radius: 6px; border: 1px solid #30363d;\n              background: #0d1117; user-select: none; }\n  .gate-tog:hover { border-color: #58a6ff; }\n  .gate-tog.bypassed { border-color: #d29922; background: rgba(210,153,34,0.08); }\n  .gate-name { font-size: 11px; font-weight: 700; color: #e6edf3; }\n  .gate-tog.bypassed .gate-name { color: #d29922; }\n  .gate-hint { font-size: 10px; color: #8b949e; }\n  .gate-sw { width: 28px; height: 14px; border-radius: 7px; background: #30363d;\n             position: relative; flex-shrink: 0; }\n  .gate-tog.bypassed .gate-sw { background: #d29922; }\n  .gate-sw::after { content: ''; position: absolute; top: 2px; left: 2px;\n                    width: 10px; height: 10px; border-radius: 50%; background: #8b949e; }\n  .gate-tog.bypassed .gate-sw::after { left: 16px; background: #fff; }\n" + '</style>', 1)
+PAPER_HTML = PAPER_HTML.replace('</style>', "\n  /* ── Hide old swim-wrap ─────────────────────────────────────── */\n  #swim-wrap, .swim-wrap { display: none !important; }\n  /* ── AI Threshold control bar ──────────────────────────────── */\n  .thresh-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px;\n                background: #161b22; border: 1px solid #30363d; border-radius: 8px;\n                flex-wrap: wrap; }\n  .thresh-label { font-size: 10px; font-weight: 700; color: #8b949e;\n                  letter-spacing: 0.5px; text-transform: uppercase; white-space: nowrap; }\n  .thresh-grp { display: flex; gap: 3px; }\n  .thresh-btn  { padding: 3px 11px; border-radius: 20px; border: 1px solid #30363d;\n                 background: transparent; color: #8b949e; font-size: 11px; cursor: pointer; }\n  .thresh-btn.t-high { border-color: #f85149; color: #f85149; background: rgba(248,81,73,0.1); }\n  .thresh-btn.t-med  { border-color: #d29922; color: #d29922; background: rgba(210,153,34,0.1); }\n  .thresh-btn.t-low  { border-color: #3fb950; color: #3fb950; background: rgba(63,185,80,0.1); }\n  .thresh-desc { font-size: 10px; color: #8b949e; white-space: nowrap; }\n  .thresh-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-left: auto; }\n  .thresh-chip  { padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600;\n                  background: rgba(63,185,80,0.12); color: #3fb950;\n                  border: 1px solid rgba(63,185,80,0.3); }\n  .thresh-none  { font-size: 11px; color: #8b949e; font-style: italic; }\n  /* ── Gate toggles in AI modal ───────────────────────────────── */\n  .ai-gate-sect { margin-top: 12px; padding-top: 10px; border-top: 1px solid #21262d; }\n  .ai-gate-title { font-size: 10px; color: #8b949e; font-weight: 700;\n                   letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 8px; }\n  .gate-row { display: flex; gap: 8px; flex-wrap: wrap; }\n  .gate-tog { display: flex; align-items: center; gap: 5px; cursor: pointer;\n              padding: 4px 9px; border-radius: 6px; border: 1px solid #30363d;\n              background: #0d1117; user-select: none; }\n  .gate-tog:hover { border-color: #58a6ff; }\n  .gate-tog.bypassed { border-color: #d29922; background: rgba(210,153,34,0.08); }\n  .gate-name { font-size: 11px; font-weight: 700; color: #e6edf3; }\n  .gate-tog.bypassed .gate-name { color: #d29922; }\n  .gate-hint { font-size: 10px; color: #8b949e; }\n  .gate-sw { width: 28px; height: 14px; border-radius: 7px; background: #30363d;\n             position: relative; flex-shrink: 0; }\n  .gate-tog.bypassed .gate-sw { background: #d29922; }\n  .gate-sw::after { content: ''; position: absolute; top: 2px; left: 2px;\n                    width: 10px; height: 10px; border-radius: 50%; background: #8b949e; }\n  .gate-tog.bypassed .gate-sw::after { left: 16px; background: #fff; }\n  .gate-locked { opacity: 0.7; cursor: not-allowed !important; }\n  .gate-locked .gate-hint { font-style: italic; }\n" + '</style>', 1)
 
 # 2. Inject gate toggles into AI modal (before modal footer)
 PAPER_HTML = PAPER_HTML.replace(
@@ -3210,7 +5127,7 @@ PAPER_HTML = PAPER_HTML.replace(
 )
 
 # 3. Inject threshold + gate JS inside IIFE
-_THRESH_IIFE_JS = '\n// ── AI Threshold control ──────────────────────────────────────────────────────\nconst THRESH_CFG = {\n  high: { label:\'High\', re:5.0,  ens:0.550, qst:0.450, rr:1.50, kal:2.50 },\n  med:  { label:\'Med\',  re:5.75, ens:0.468, qst:0.383, rr:1.28, kal:2.88 },\n  low:  { label:\'Low\',  re:6.50, ens:0.385, qst:0.315, rr:1.05, kal:3.25 },\n};\nlet _thresh = localStorage.getItem(\'sg3_thresh\') || \'high\';\nlet _gateOv  = JSON.parse(localStorage.getItem(\'sg3_gate_ov\') || \'{}\');\nlet _lastSigs = [];\n\nfunction _threshDesc(t) {\n  const c = THRESH_CFG[t];\n  return \'Re<\' + c.re + \' · Ens>\' + Math.round(c.ens*100) + \'% · QSt>\'\n       + Math.round(c.qst*100) + \'% · R/R>\' + c.rr + \' · Kal<\' + c.kal + \'σ\';\n}\n\nfunction setThreshLevel(lv) {\n  _thresh = lv;\n  localStorage.setItem(\'sg3_thresh\', lv);\n  fetch(\'/api/paper/set-thresh\', {method:\'POST\',\n    headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({level:lv})}).catch(()=>{});\n  renderThreshBar();\n}\nwindow.setThreshLevel = setThreshLevel;\nwindow._threshGet = () => THRESH_CFG[_thresh];\n\nfunction renderThreshBar() {\n  const bar = document.getElementById(\'thresh-bar\');\n  if (!bar) return;\n  const c = THRESH_CFG[_thresh];\n  const passing = _lastSigs.filter(s => {\n    const sig = (s.signal||\'\').toUpperCase();\n    return (s.confidence||0) >= c.ens && (sig===\'BUY\'||sig===\'STRONG_BUY\');\n  }).sort((a,b) => (b.confidence||0)-(a.confidence||0));\n  const chips = passing.length\n    ? passing.map(s => \'<span class="thresh-chip" title="Conf \'\n        + Math.round((s.confidence||0)*100) + \'%">\' + s.ticker + \'</span>\').join(\'\')\n    : \'<span class="thresh-none">No signals at this threshold</span>\';\n  bar.innerHTML =\n    \'<span class="thresh-label">⚡ AI Gates:</span>\' +\n    \'<div class="thresh-grp">\' +\n    [\'high\',\'med\',\'low\'].map(lv => {\n      const act = _thresh===lv;\n      return \'<button class="thresh-btn\' + (act?\' t-\'+lv:\'\') + \'" onclick="setThreshLevel(\\\'\' + lv + \'\\\')">\'\n           + (act?\'● \':\'○ \') + THRESH_CFG[lv].label + \'</button>\';\n    }).join(\'\') + \'</div>\' +\n    \'<span class="thresh-desc">\' + _threshDesc(_thresh) + \'</span>\' +\n    \'<div class="thresh-chips">\' + chips + \'</div>\';\n}\nwindow.renderThreshBar = function(sigs) { if(sigs) _lastSigs=sigs; renderThreshBar(); };\n\n// Inject thresh bar after sg3-section once DOM is ready\nsetTimeout(function() {\n  const sg3 = document.getElementById(\'sg3-section\');\n  if (sg3 && !document.getElementById(\'thresh-bar\')) {\n    const el = document.createElement(\'div\');\n    el.id = \'thresh-bar\'; el.className = \'thresh-bar\';\n    sg3.insertAdjacentElement(\'afterend\', el);\n    renderThreshBar();\n  }\n}, 600);\n\n// ── Per-ticker gate overrides ─────────────────────────────────────────────────\nconst GATE_DEFS = [\n  {key:\'reynolds\', abbr:\'Re\',  hint:\'Reynolds turbulence\'},\n  {key:\'ensemble\', abbr:\'Ens\', hint:\'Ensemble probability\'},\n  {key:\'quantum\',  abbr:\'QSt\', hint:\'Quantum state\'},\n  {key:\'rr\',       abbr:\'R/R\', hint:\'Risk/reward ratio\'},\n  {key:\'kalman\',   abbr:\'Kal\', hint:\'Kalman filter\'},\n];\n\nfunction sgRenderGateToggles(ticker) {\n  const row = document.getElementById(\'gate-row\');\n  if (!row) return;\n  const tov = _gateOv[ticker] || [];\n  row.innerHTML = GATE_DEFS.map(g => {\n    const by = tov.includes(g.key);\n    return \'<div class="gate-tog\' + (by?\' bypassed\':\'\') + \'" \'\n      + \'onclick="sgToggleGate(\\\'\' + ticker + \'\\\',\\\'\' + g.key + \'\\\')" \'\n      + \'title="\' + (by?\'BYPASSED\':\'Active\') + \'">\'\n      + \'<div class="gate-sw"></div>\'\n      + \'<span class="gate-name">\' + g.abbr + \'</span>\'\n      + \'<span class="gate-hint">\' + g.hint + \'</span>\'\n      + \'</div>\';\n  }).join(\'\');\n}\nwindow.sgRenderGateToggles = sgRenderGateToggles;\n\nfunction sgToggleGate(ticker, key) {\n  if (!_gateOv[ticker]) _gateOv[ticker] = [];\n  const i = _gateOv[ticker].indexOf(key);\n  if (i===-1) _gateOv[ticker].push(key); else _gateOv[ticker].splice(i,1);\n  if (!_gateOv[ticker].length) delete _gateOv[ticker];\n  localStorage.setItem(\'sg3_gate_ov\', JSON.stringify(_gateOv));\n  fetch(\'/api/paper/set-gate\', {method:\'POST\',\n    headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(_gateOv)}).catch(()=>{});\n  sgRenderGateToggles(ticker);\n}\nwindow.sgToggleGate = sgToggleGate;\n'
+_THRESH_IIFE_JS = '\n// ── AI Threshold control ──────────────────────────────────────────────────────\nconst THRESH_CFG = {\n  high: { label:\'High\', re:5.0,  ens:0.550, qst:0.450, rr:1.50, kal:2.50 },\n  med:  { label:\'Med\',  re:5.75, ens:0.468, qst:0.383, rr:1.28, kal:2.88 },\n  low:  { label:\'Low\',  re:6.50, ens:0.385, qst:0.315, rr:1.05, kal:3.25 },\n};\nlet _thresh = localStorage.getItem(\'sg3_thresh\') || \'high\';\nlet _gateOv  = {};\nlet _lastSigs = [];\n\nfunction _threshDesc(t) {\n  const c = THRESH_CFG[t];\n  return \'Re<\' + c.re + \' · Ens>\' + Math.round(c.ens*100) + \'% · QSt>\'\n       + Math.round(c.qst*100) + \'% · R/R>\' + c.rr + \' · Kal<\' + c.kal + \'σ\';\n}\n\nfunction setThreshLevel(lv) {\n  _thresh = lv;\n  localStorage.setItem(\'sg3_thresh\', lv);\n  fetch(\'/api/paper/set-thresh\', {method:\'POST\',\n    headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({level:lv})}).catch(()=>{});\n  renderThreshBar();\n}\nwindow.setThreshLevel = setThreshLevel;\nwindow._threshGet = () => THRESH_CFG[_thresh];\n\nfunction renderThreshBar() {\n  const bar = document.getElementById(\'thresh-bar\');\n  if (!bar) return;\n  const c = THRESH_CFG[_thresh];\n  const passing = _lastSigs.filter(s => {\n    const sig = (s.signal||\'\').toUpperCase();\n    return (s.confidence||0) >= c.ens && (sig===\'BUY\'||sig===\'STRONG_BUY\');\n  }).sort((a,b) => (b.confidence||0)-(a.confidence||0));\n  const chips = passing.length\n    ? passing.map(s => \'<span class="thresh-chip" title="Conf \'\n        + Math.round((s.confidence||0)*100) + \'%">\' + s.ticker + \'</span>\').join(\'\')\n    : \'<span class="thresh-none">No signals at this threshold</span>\';\n  bar.innerHTML =\n    \'<span class="thresh-label">⚡ AI Gates:</span>\' +\n    \'<div class="thresh-grp">\' +\n    [\'high\',\'med\',\'low\'].map(lv => {\n      const act = _thresh===lv;\n      return \'<button class="thresh-btn\' + (act?\' t-\'+lv:\'\') + \'" onclick="setThreshLevel(\\\'\' + lv + \'\\\')">\'\n           + (act?\'● \':\'○ \') + THRESH_CFG[lv].label + \'</button>\';\n    }).join(\'\') + \'</div>\' +\n    \'<span class="thresh-desc">\' + _threshDesc(_thresh) + \'</span>\' +\n    \'<div class="thresh-chips">\' + chips + \'</div>\';\n}\nwindow.renderThreshBar = function(sigs) { if(sigs) _lastSigs=sigs; renderThreshBar(); };\n\n// Inject thresh bar after sg3-section once DOM is ready\nsetTimeout(function() {\n  const sg3 = document.getElementById(\'sg3-section\');\n  if (sg3 && !document.getElementById(\'thresh-bar\')) {\n    const el = document.createElement(\'div\');\n    el.id = \'thresh-bar\'; el.className = \'thresh-bar\';\n    sg3.insertAdjacentElement(\'afterend\', el);\n    renderThreshBar();\n  }\n}, 600);\n\n// ── Per-ticker gate overrides ─────────────────────────────────────────────────\nconst GATE_DEFS_BY_MODEL = {\n  standard:     [{key:\'fud\',abbr:\'FUD\',hint:\'FUD news filter\'},{key:\'reynolds\',abbr:\'Re\', hint:\'Reynolds turbulence\'},{key:\'ensemble\',abbr:\'Ens\',hint:\'Ensemble probability\'},{key:\'quantum\',abbr:\'QSt\',hint:\'Quantum state\'},{key:\'rr\',abbr:\'R/R\',hint:\'Risk/reward ratio\'},{key:\'kalman\',abbr:\'Kal\',hint:\'Kalman filter\'}],\n  relaxed:      [{key:\'fud\',abbr:\'FUD\',hint:\'FUD news filter\'},{key:\'reynolds\',abbr:\'Re\', hint:\'Reynolds turbulence\'},{key:\'ensemble\',abbr:\'Ens\',hint:\'Ensemble probability\'},{key:\'quantum\',abbr:\'QSt\',hint:\'Quantum state\'},{key:\'rr\',abbr:\'R/R\',hint:\'Risk/reward ratio\'},{key:\'kalman\',abbr:\'Kal\',hint:\'Kalman filter\'}],\n  very_relaxed: [{key:\'fud\',abbr:\'FUD\',hint:\'FUD news filter\'},{key:\'reynolds\',abbr:\'Re\', hint:\'Reynolds turbulence\'},{key:\'ensemble\',abbr:\'Ens\',hint:\'Ensemble probability\'},{key:\'quantum\',abbr:\'QSt\',hint:\'Quantum state\'},{key:\'rr\',abbr:\'R/R\',hint:\'Risk/reward ratio\'},{key:\'kalman\',abbr:\'Kal\',hint:\'Kalman filter\'}],\n  claude:       [{key:\'vix\',abbr:\'VIX\',hint:\'VIX hard gate (>30=block)\'},{key:\'ensemble\',abbr:\'Ens\',hint:\'Ensemble probability\'},{key:\'rr\',abbr:\'R/R\',hint:\'Risk/reward ratio\'},{key:\'kalman\',abbr:\'Kal\',hint:\'Kalman filter\'},{key:\'reynolds\',abbr:\'Re\',hint:\'Reynolds turbulence\'}],\n};\nfunction _getGateDefs() {\n  var _gm = (typeof window!==\'undefined\' && window._PAPER_MODEL)||\'standard\';\n  return GATE_DEFS_BY_MODEL[_gm] || GATE_DEFS_BY_MODEL.standard;\n}\n\nfunction sgRenderGateToggles(ticker) {\n  const row = document.getElementById(\'gate-row\');\n  if (!row) return;\n  var _gm = (typeof window!==\'undefined\' && window._PAPER_MODEL)||\'standard\';\n  var _govKey = \'sg3_gate_ov_\'+_gm;\n  _gateOv = JSON.parse(localStorage.getItem(_govKey)||\'{}\')\n  const tov = _gateOv[ticker] || [];\n  row.innerHTML = _getGateDefs().map(g => {\n    var locked = (_gm===\'very_relaxed\' && g.key===\'fud\');\n    var by = locked || tov.includes(g.key);\n    var click = locked ? \'\' : \'onclick="sgToggleGate(\\\'\' + ticker + \'\\\',\\\'\' + g.key + \'\\\')"\';\n    var title = locked ? \'Always bypassed on Very Relaxed\' : (by?\'BYPASSED\':\'Active\');\n    return \'<div class="gate-tog\' + (by?\' bypassed\':\'\') + (locked?\' gate-locked\':\'\') + \'" \'\n      + click + \' title="\' + title + \'">\'\n      + \'<div class="gate-sw"></div>\'\n      + \'<span class="gate-name">\' + g.abbr + \'</span>\'\n      + \'<span class="gate-hint">\' + g.hint + (locked?\' ⊘\':\'\') + \'</span>\'\n      + \'</div>\';\n  }).join(\'\');\n}\nwindow.sgRenderGateToggles = sgRenderGateToggles;\n\nfunction sgToggleGate(ticker, key) {\n  var _gm = (typeof window!==\'undefined\' && window._PAPER_MODEL)||\'standard\';\n  var _govKey = \'sg3_gate_ov_\'+_gm;\n  if (!_gateOv[ticker]) _gateOv[ticker] = [];\n  const i = _gateOv[ticker].indexOf(key);\n  if (i===-1) _gateOv[ticker].push(key); else _gateOv[ticker].splice(i,1);\n  if (!_gateOv[ticker].length) delete _gateOv[ticker];\n  localStorage.setItem(_govKey, JSON.stringify(_gateOv));\n  fetch(\'/api/paper/set-gate\', {method:\'POST\',\n    headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({model:_gm,overrides:_gateOv})}).catch(()=>{});\n  sgRenderGateToggles(ticker);\n  // Warn if the diagnostic overlay is open for this ticker\n  var _ov = document.getElementById(\'sg-diag-overlay\');\n  if (_ov && _ov.style.display !== \'none\' && window._diagActiveTicker === ticker) {\n    var _snap = JSON.stringify(_gateOv[ticker] || []);\n    if (_snap !== window._diagBypassSnap && !document.getElementById(\'sg-diag-stale\')) {\n      var _w = document.createElement(\'div\');\n      _w.id = \'sg-diag-stale\';\n      _w.style.cssText=\'margin-bottom:12px;padding:8px 12px;background:rgba(210,153,34,0.12);border-radius:6px;border-left:3px solid #d29922;font-size:12px;color:#d29922;\';\n      _w.innerHTML=\'&#9888; Bypasses changed — <button onclick="sgDiagnose(window._diagActiveTicker)" style="background:none;border:none;color:#58a6ff;cursor:pointer;font-size:12px;text-decoration:underline;padding:0;">re-run diagnostic</button>\';\n      var _b=document.getElementById(\'sg-diag-body\');\n      if (_b) _b.insertBefore(_w,_b.firstChild);\n    }\n  }\n}\nwindow.sgToggleGate = sgToggleGate;\n'
 PAPER_JS = PAPER_JS.replace(
     'sg3Boot();\n\n})(); // end IIFE',
     _THRESH_IIFE_JS + 'sg3Boot();\n\n})(); // end IIFE'
@@ -3233,6 +5150,78 @@ PAPER_JS = PAPER_JS.replace(
     "  if(window.sgRenderGateToggles) { var _t=document.getElementById('ai-ticker'); if(_t) sgRenderGateToggles(_t.textContent.trim()); }"
 )
 
+# 6. Fix S1/S2 race condition: guard sg3SyncPositions until sg3Boot completes
+#    Inject _sg3Ready flag + visibilitychange inside the IIFE
+_RACE_FIX_JS = (
+    "// ── Race condition fix: don't sync positions until stagegate is loaded ──\n"
+    "let _sg3Ready = false;\n\n"
+)
+PAPER_JS = PAPER_JS.replace(
+    '// ── State ─────────────────────────────────────────────────────────────────────\n'
+    'let _sg3 = { stage1: [], stage2: [], stage3: [] };\n',
+    _RACE_FIX_JS +
+    '// ── State ─────────────────────────────────────────────────────────────────────\n'
+    'let _sg3 = { stage1: [], stage2: [], stage3: [] };\n'
+)
+
+# Mark ready at end of sg3Boot
+PAPER_JS = PAPER_JS.replace(
+    '  _sg3.stage1 = _sg3.stage1 || [];\n'
+    '  _sg3.stage2 = _sg3.stage2 || [];\n'
+    '  _sg3.stage3 = _sg3.stage3 || [];\n'
+    '  sg3Render();\n'
+    '}\n'
+    '\n'
+    '// Override old sgBoot',
+    '  _sg3.stage1 = _sg3.stage1 || [];\n'
+    '  _sg3.stage2 = _sg3.stage2 || [];\n'
+    '  _sg3.stage3 = _sg3.stage3 || [];\n'
+    '  sg3Render();\n'
+    '  _sg3Ready = true;  // stagegate loaded — safe to sync positions now\n'
+    '}\n'
+    '\n'
+    '// Override old sgBoot'
+)
+
+# Guard the wrapped load() — skip sg3SyncPositions until _sg3Ready
+PAPER_JS = PAPER_JS.replace(
+    "const _origLoad = load;\n"
+    "window.load = async function() {\n"
+    "  await _origLoad();\n"
+    "  try {\n"
+    "    const acct = await fetch('/api/paper/account').then(r => r.json());\n"
+    "    sg3SyncPositions(acct.positions || []);\n"
+    "  } catch(e) {}\n"
+    "};",
+    "const _origLoad = load;\n"
+    "window.load = async function() {\n"
+    "  await _origLoad();\n"
+    "  if (!_sg3Ready) return;  // sg3Boot not done yet — skip sync to prevent overwriting stagegate\n"
+    "  try {\n"
+    "    const acct = await fetch('/api/paper/account').then(r => r.json());\n"
+    "    sg3SyncPositions(acct.positions || []);\n"
+    "  } catch(e) {}\n"
+    "};"
+)
+
+# Add visibilitychange auto-sync and close sell modal on Escape (10b)
+PAPER_JS = PAPER_JS.replace(
+    "document.addEventListener('keydown', e => {\n"
+    "  if (e.key === 'Escape') { sg3SellCancel(); aiClose(); }\n"
+    "});",
+    "document.addEventListener('keydown', e => {\n"
+    "  if (e.key === 'Escape') { sg3SellCancel(); aiClose(); }\n"
+    "});\n"
+    "\n"
+    "// Auto-sync S1/S2 when user tabs back to this page\n"
+    "document.addEventListener('visibilitychange', () => {\n"
+    "  if (document.visibilityState === 'visible') {\n"
+    "    sg3Boot();  // re-fetch stagegate + signals\n"
+    "    load();     // re-fetch account + positions\n"
+    "  }\n"
+    "});"
+)
+
 
 # ── Threshold & gate override endpoints ──────────────────────────────────────
 @app.post("/api/paper/set-thresh")
@@ -3252,12 +5241,18 @@ async def api_set_thresh(request: Request):
 @app.post("/api/paper/set-gate")
 async def api_set_gate(request: Request):
     import json as _j
-    overrides = await request.json()
+    body      = await request.json()
+    # Body may be {model, overrides} (new) or a plain overrides dict (legacy)
+    if "overrides" in body:
+        model     = body.get("model", "standard")
+        overrides = body["overrides"]
+    else:
+        model     = "standard"
+        overrides = body
+    fname = "gate_overrides.json" if model == "standard" else f"gate_overrides_{model}.json"
     (ROOT / "data").mkdir(exist_ok=True)
-    (ROOT / "data" / "gate_overrides.json").write_text(
-        _j.dumps(overrides), encoding="utf-8"
-    )
-    return {"ok": True}
+    (ROOT / "data" / fname).write_text(_j.dumps(overrides), encoding="utf-8")
+    return {"ok": True, "model": model, "file": fname}
 
 
 def _apply_thresh_override():
@@ -3462,6 +5457,12 @@ PAPER_JS = PAPER_JS.replace(
     "      fetchSignalsOnce().catch(() => []),"
 )
 
+# ── Fix Run Now "Done" timestamp to show ET ──────────────────────────────────
+PAPER_JS = PAPER_JS.replace(
+    "new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})",
+    "new Date().toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'}) + ' ET'"
+)
+
 # ── Layout + tape fixes (2026-04-13) ─────────────────────────────────────────
 
 # 1. Make .p-tape-wrap sticky (tape stays visible while scrolling)
@@ -3569,13 +5570,13 @@ _AI_EXIT_JS = (
     "\n// ── AI Exit Toggle (Stage 3) ─────────────────────────────────────────────\n"
     "window._sg3aiExits = {};\n"
     "window.sg3LoadAiExits = async function() {\n"
-    "  try { window._sg3aiExits = await fetch('/api/ai-exits').then(r => r.json()); }\n"
+    "  try { window._sg3aiExits = await fetch('/api/paper/ai-exits').then(r => r.json()); }\n"
     "  catch(e) {}\n"
     "};\n"
     "window.sg3ToggleAiExit = async function(ticker) {\n"
     "  window._sg3aiExits[ticker] = !window._sg3aiExits[ticker];\n"
     "  try {\n"
-    "    await fetch('/api/ai-exits', {\n"
+    "    await fetch('/api/paper/ai-exits', {\n"
     "      method: 'POST',\n"
     "      headers: {'Content-Type': 'application/json'},\n"
     "      body: JSON.stringify({[ticker]: window._sg3aiExits[ticker]})\n"
@@ -3678,15 +5679,18 @@ PAPER_JS = PAPER_JS.replace(
 # ── Item 2b: Collapsible trade history grouped by date ────────────────────────
 _TRADE_OLD = (
     "      let h = '<table><tr><th>Time</th><th>Ticker</th><th>Action</th>"
-    "<th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th></tr>';\n"
+    "<th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th><th>Source</th></tr>';\n"
     "      for (const t of trades) {\n"
     "        const dt = t.timestamp\n"
-    "          ? new Date(t.timestamp + 'Z').toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})\n"
+    "          ? new Date(t.timestamp + 'Z').toLocaleString('en-US', {timeZone:'America/New_York',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})\n"
     "          : '\\u2014';\n"
+    "        const srcHtml = t.signal === 'MANUAL'\n"
+    "          ? '<span style=\"color:#8b949e\">\\ud83d\\udc64 Manual</span>'\n"
+    "          : '<span style=\"color:#58a6ff\" title=\"' + (t.signal || 'AI') + '\">\\ud83e\\udd16 AI</span>';\n"
     "        h += '<tr><td class=\"neu\" style=\"font-size:11px\">' + dt + '</td><td><strong>' + t.ticker +\n"
     "          '</strong></td><td class=\"' + (t.action==='BUY'?'up':'dn') + '\">' + t.action +\n"
     "          '</td><td>' + t.qty + '</td><td>' + fmt(t.price) + '</td><td>' + fmt(t.total, 0) +\n"
-    "          '</td><td class=\"neu\">' + fmt(t.cash_after, 0) + '</td></tr>';\n"
+    "          '</td><td class=\"neu\">' + fmt(t.cash_after, 0) + '</td><td style=\"font-size:11px\">' + srcHtml + '</td></tr>';\n"
     "      }\n"
     "      tw.innerHTML = h + '</table>';\n"
 )
@@ -3700,23 +5704,27 @@ _TRADE_NEW = (
     "        _byDate[dk].push(Object.assign({}, t, {_d: d}));\n"
     "      }\n"
     "      let h = '<table><tr><th>Time</th><th>Ticker</th><th>Action</th>"
-    "<th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th></tr>';\n"
+    "<th>Qty</th><th>Price</th><th>Total</th><th>Cash After</th><th>Source</th></tr>';\n"
     "      _dkeys.forEach(function(dk, i) {\n"
     "        const grp = _byDate[dk], exp = i === 0;\n"
     "        h += '<tr class=\"trade-date-hdr\" onclick=\"toggleTradeDate(this)\" data-date-key=\"' + dk\n"
     "           + '\" style=\"cursor:pointer;background:#161b22\">'\n"
-    "           + '<td colspan=\"7\" style=\"padding:6px 12px;font-size:11px;color:#8b949e;letter-spacing:.5px\">'\n"
+    "           + '<td colspan=\"8\" style=\"padding:6px 12px;font-size:11px;color:#8b949e;letter-spacing:.5px\">'\n"
     "           + (exp ? '&#9660;' : '&#9654;') + ' ' + dk\n"
     "           + ' <span style=\"color:#555\">(' + grp.length + ' trade' + (grp.length > 1 ? 's' : '') + ')</span></td></tr>';\n"
     "        grp.forEach(function(t) {\n"
-    "          const dt = t._d ? t._d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '\\u2014';\n"
+    "          const dt = t._d ? t._d.toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit'}) : '\\u2014';\n"
+    "          const srcH = t.signal === 'MANUAL'\n"
+    "            ? '<span style=\"color:#8b949e\">\\ud83d\\udc64 Manual</span>'\n"
+    "            : '<span style=\"color:#58a6ff\" title=\"' + (t.signal || 'AI') + '\">\\ud83e\\udd16 AI</span>';\n"
     "          h += '<tr class=\"trade-date-row\" data-date-parent=\"' + dk + '\" style=\"display:' + (exp ? '' : 'none') + '\">'\n"
     "             + '<td class=\"neu\" style=\"font-size:11px\">' + dt + '</td>'\n"
     "             + '<td><strong>' + t.ticker + '</strong></td>'\n"
     "             + '<td class=\"' + (t.action === 'BUY' ? 'up' : 'dn') + '\">' + t.action + '</td>'\n"
     "             + '<td>' + t.qty + '</td><td>' + fmt(t.price) + '</td>'\n"
     "             + '<td>' + fmt(t.total, 0) + '</td>'\n"
-    "             + '<td class=\"neu\">' + fmt(t.cash_after, 0) + '</td></tr>';\n"
+    "             + '<td class=\"neu\">' + fmt(t.cash_after, 0) + '</td>'\n"
+    "             + '<td style=\"font-size:11px\">' + srcH + '</td></tr>';\n"
     "        });\n"
     "      });\n"
     "      tw.innerHTML = h + '</table>';\n"
@@ -3740,3 +5748,1300 @@ function toggleTradeDate(hdr) {
 else:
     import sys as _sys
     print('[WARN] Item 2b: trade history target string not found in PAPER_JS', file=_sys.stderr)
+
+# ── Shared nav: inject into Paper page ───────────────────────────────────────
+PAPER_HTML = PAPER_HTML.replace('</style>', _NAV_CSS + '</style>', 1)
+PAPER_HTML = PAPER_HTML.replace(
+    '<a href="/" class="back-btn">&#8592; Dashboard</a>',
+    _nav_html('paper'),
+    1
+)
+
+# ── Model-switcher bar: injected just before </header> in PAPER_HTML ─────────
+_MODEL_NAV = (
+    '<div id="model-nav" style="display:flex;gap:6px;margin-left:auto;align-items:center;">'
+    '<span style="font-size:10px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase;">Model:</span>'
+    '<a href="/paper" id="mnav-standard" style="padding:3px 10px;border-radius:4px;border:1px solid #30363d;'
+    'background:#21262d;color:#8b949e;text-decoration:none;font-size:11px;">Standard</a>'
+    '<a href="/paper/relaxed" id="mnav-relaxed" style="padding:3px 10px;border-radius:4px;border:1px solid #30363d;'
+    'background:#21262d;color:#8b949e;text-decoration:none;font-size:11px;">Relaxed \u221225%</a>'
+    '<a href="/paper/very-relaxed" id="mnav-very-relaxed" style="padding:3px 10px;border-radius:4px;border:1px solid #30363d;'
+    'background:#21262d;color:#8b949e;text-decoration:none;font-size:11px;">Very Relaxed \u221250%</a>'
+    '<a href="/paper/claude" id="mnav-claude" style="padding:3px 10px;border-radius:4px;border:1px solid #30363d;'
+    'background:#21262d;color:#8b949e;text-decoration:none;font-size:11px;">\U0001f916 Claude</a>'
+    '<a href="/paper/compare" style="padding:3px 10px;border-radius:4px;border:1px solid #30363d;'
+    'background:#21262d;color:#8b949e;text-decoration:none;font-size:11px;">&#128200; Compare</a>'
+    '</div>'
+)
+PAPER_HTML = PAPER_HTML.replace('</header>', _MODEL_NAV + '</header>', 1)
+
+# ── Fix 1: Stage 3 card — fall back to pos.cur_price when signal price missing ─
+_SG3_PRICE_OLD = "  const price = s.current_price ? '$' + s.current_price.toFixed(2) : '';"
+_SG3_PRICE_NEW = (
+    "  const _curP = s.current_price || pos.cur_price;\n"
+    "  const price = _curP ? '$' + Number(_curP).toFixed(2) : '';"
+)
+if _SG3_PRICE_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SG3_PRICE_OLD, _SG3_PRICE_NEW)
+else:
+    import sys as _sys; print('[WARN] sg3 price fallback patch: target not found', file=_sys.stderr)
+
+# ── Fix 1b: sgCardHtml (old 2-stage) wrongly got pos.cur_price — remove it ────
+# sgCardHtml has no `pos` variable; strip the fallback using unique trailing context
+_SGCARD_BAD  = (
+    "  const _curP = s.current_price || pos.cur_price;\n"
+    "  const price = _curP ? '$' + Number(_curP).toFixed(2) : '';\n"
+    "  // Use data-t"
+)
+_SGCARD_GOOD = (
+    "  const _curP = s.current_price;\n"
+    "  const price = _curP ? '$' + Number(_curP).toFixed(2) : '';\n"
+    "  // Use data-t"
+)
+if _SGCARD_BAD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SGCARD_BAD, _SGCARD_GOOD)
+else:
+    import sys as _sys; print('[WARN] sgCardHtml pos.cur_price fix: target not found', file=_sys.stderr)
+
+# ── Multi-model fetch interceptor (prepend so it runs before any fetch call) ──
+_FETCH_INTERCEPTOR = (
+    "// ── Multi-model API routing ───────────────────────────────────────────────────\n"
+    "(function(){\n"
+    "  var _m = (typeof window !== 'undefined' && window._PAPER_MODEL) || 'standard';\n"
+    "  if (_m !== 'standard') {\n"
+    "    var _of = window.fetch;\n"
+    "    window.fetch = function(url, opts) {\n"
+    "      if (typeof url === 'string' && url.startsWith('/api/paper/')) {\n"
+    "        url = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'model=' + encodeURIComponent(_m);\n"
+    "      }\n"
+    "      return _of.call(this, url, opts);\n"
+    "    };\n"
+    "  }\n"
+    "})();\n\n"
+)
+PAPER_JS = _FETCH_INTERCEPTOR + PAPER_JS
+
+# ── Fix 2: AI exit toggle — load persisted state immediately on page load ─────
+# sg3Boot() already ran inside the IIFE before _AI_EXIT_JS wrapped it, so
+# _sg3aiExits is {} on first render. This snippet loads the saved state right away.
+PAPER_JS = PAPER_JS + (
+    "\n// ── Fix: load AI exit toggle state immediately on page load ─────────────────\n"
+    "(function() {\n"
+    "  function _initAiExits() {\n"
+    "    if (window.sg3LoadAiExits && window.sg3Render) {\n"
+    "      window.sg3LoadAiExits().then(function() { window.sg3Render(); });\n"
+    "    } else { setTimeout(_initAiExits, 150); }\n"
+    "  }\n"
+    "  _initAiExits();\n"
+    "})();\n"
+)
+
+# ── Fix 3: Stage 3 card — add daily P&L (today's $ change and %) ─────────────
+_SG3_DAILY_DECL_OLD = "  let meta = price;\n  let pnlHtml = '';"
+_SG3_DAILY_DECL_NEW = "  let meta = price;\n  let pnlHtml = '';\n  let dailyHtml = '';"
+if _SG3_DAILY_DECL_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SG3_DAILY_DECL_OLD, _SG3_DAILY_DECL_NEW)
+else:
+    import sys as _sys; print('[WARN] sg3 dailyHtml decl patch: target not found', file=_sys.stderr)
+
+_SG3_DAILY_CALC_OLD = (
+    "    pnlHtml = '<span class=\"sg3-pnl ' + pnlCls + '\">' + pnlStr + ' (' + pctStr + ')</span>';\n"
+    "  }"
+)
+_SG3_DAILY_CALC_NEW = (
+    "    pnlHtml = '<span class=\"sg3-pnl ' + pnlCls + '\">' + pnlStr + ' (' + pctStr + ')</span>';\n"
+    "    const _chgP = s.change_pct;\n"
+    "    if (_chgP != null) {\n"
+    "      const _dP = s.current_price || pos.cur_price || pos.avg_cost || 0;\n"
+    "      const _dayDol = pos.qty * _dP * (_chgP / 100);\n"
+    "      const _dayCls = _dayDol >= 0 ? 'up' : 'dn';\n"
+    "      const _dayStr = (_dayDol >= 0 ? '+' : '') + '$' + Math.abs(_dayDol).toFixed(0);\n"
+    "      const _dayPct = (_chgP >= 0 ? '+' : '') + Number(_chgP).toFixed(2) + '%';\n"
+    "      dailyHtml = '<span class=\"sg3-pnl ' + _dayCls + '\" style=\"font-size:9px;opacity:0.8\">Day ' + _dayStr + ' (' + _dayPct + ')</span>';\n"
+    "    }\n"
+    "  }"
+)
+if _SG3_DAILY_CALC_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SG3_DAILY_CALC_OLD, _SG3_DAILY_CALC_NEW)
+else:
+    import sys as _sys; print('[WARN] sg3 dailyHtml calc patch: target not found', file=_sys.stderr)
+
+_SG3_DAILY_RENDER_OLD = "    + pnlHtml\n    + statusHtml\n    + '<span class=\"sg3-sig '"
+_SG3_DAILY_RENDER_NEW = "    + pnlHtml\n    + dailyHtml\n    + statusHtml\n    + '<span class=\"sg3-sig '"
+if _SG3_DAILY_RENDER_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SG3_DAILY_RENDER_OLD, _SG3_DAILY_RENDER_NEW)
+else:
+    import sys as _sys; print('[WARN] sg3 dailyHtml render patch: target not found', file=_sys.stderr)
+
+# ── Stage 1/2 daily change display ────────────────────────────────────────────
+# After Fix 3 the if(stage==='3') block has dailyHtml for stage 3.
+# Add an else block so Stage 1 and Stage 2 cards also show today's move.
+_SG3_12_DAILY_OLD = (
+    "      dailyHtml = '<span class=\"sg3-pnl ' + _dayCls + '\" style=\"font-size:9px;opacity:0.8\">Day ' + _dayStr + ' (' + _dayPct + ')</span>';\n"
+    "    }\n"
+    "  }\n"
+    "\n"
+    "  let statusHtml = '';"
+)
+_SG3_12_DAILY_NEW = (
+    "      dailyHtml = '<span class=\"sg3-pnl ' + _dayCls + '\" style=\"font-size:9px;opacity:0.8\">Day ' + _dayStr + ' (' + _dayPct + ')</span>';\n"
+    "    }\n"
+    "  } else {\n"
+    "    const _chgP12 = s.change_pct;\n"
+    "    if (_chgP12 != null && _curP) {\n"
+    "      const _dayDol12 = _curP * (_chgP12 / 100);\n"
+    "      const _dayCls12 = _dayDol12 >= 0 ? 'up' : 'dn';\n"
+    "      const _dayStr12 = (_dayDol12 >= 0 ? '+' : '') + '$' + Math.abs(_dayDol12).toFixed(2);\n"
+    "      const _dayPct12 = (_chgP12 >= 0 ? '+' : '') + Number(_chgP12).toFixed(2) + '%';\n"
+    "      dailyHtml = '<span class=\"sg3-pnl ' + _dayCls12 + '\">' + _dayStr12 + ' (' + _dayPct12 + ')</span>';\n"
+    "    }\n"
+    "  }\n"
+    "\n"
+    "  let statusHtml = '';"
+)
+if _SG3_12_DAILY_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SG3_12_DAILY_OLD, _SG3_12_DAILY_NEW)
+else:
+    import sys as _sys; print('[WARN] sg3 stage1/2 daily patch: target not found', file=_sys.stderr)
+
+# ── Model nav active-link highlight ──────────────────────────────────────────
+PAPER_JS = PAPER_JS + (
+    "\n// ── Highlight active model in model-nav bar ─────────────────────────────────\n"
+    "(function(){\n"
+    "  var _m = window._PAPER_MODEL || 'standard';\n"
+    "  var _map = { standard: 'mnav-standard', relaxed: 'mnav-relaxed', very_relaxed: 'mnav-very-relaxed', claude: 'mnav-claude' };\n"
+    "  var el = document.getElementById(_map[_m]);\n"
+    "  if (el) { el.style.borderColor = '#58a6ff'; el.style.color = '#58a6ff';\n"
+    "             el.style.background = 'rgba(88,166,255,0.12)'; }\n"
+    "})();\n"
+)
+
+# ── /api/sg-quotes endpoint — live intraday price when market open, else EOD ──
+@app.get("/api/sg-quotes")
+def api_sg_quotes(tickers: str = ""):
+    """Return {ticker: {price, change_pct, change_dollar}} — live during market hours, else EOD."""
+    if not tickers:
+        return {}
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    result = {}
+    # Live prices first
+    for ticker in ticker_list:
+        live = _live_price(ticker)
+        if live:
+            chg_dollar = None
+            if live.get("prev_close") and live["price"]:
+                chg_dollar = round(live["price"] - live["prev_close"], 2)
+            result[ticker] = {
+                "price":        live["price"],
+                "change_pct":   live.get("change_pct"),
+                "change_dollar": chg_dollar,
+                "live":         True,
+            }
+    # EOD fallback
+    remaining = [t for t in ticker_list if t not in result]
+    if remaining:
+        try:
+            from models.database import init_db as _init_db, PriceHistory, Company
+            _, _Session = _init_db(config.database.url, echo=False)
+            with _Session() as s:
+                from collections import defaultdict as _dd
+                rows = (
+                    s.query(Company.ticker, PriceHistory.close, PriceHistory.date)
+                    .join(PriceHistory, PriceHistory.company_id == Company.id)
+                    .filter(Company.ticker.in_(remaining))
+                    .order_by(Company.ticker, PriceHistory.date.desc())
+                    .all()
+                )
+                by_ticker = _dd(list)
+                for ticker, close, date in rows:
+                    if len(by_ticker[ticker]) < 2 and close:
+                        by_ticker[ticker].append(float(close))
+                for ticker, prices in by_ticker.items():
+                    if not prices:
+                        continue
+                    price = prices[0]
+                    change_dollar = round(prices[0] - prices[1], 2) if len(prices) >= 2 and prices[1] else 0
+                    change_pct = round(change_dollar / prices[1] * 100, 2) if len(prices) >= 2 and prices[1] else 0
+                    result[ticker] = {"price": round(price, 2), "change_pct": change_pct, "change_dollar": change_dollar}
+        except Exception:
+            pass
+    return result
+
+# ── Patch sg3Boot to fetch sg-quotes for stage gate tickers missing price data ─
+_SG3_BOOT_QUOTES_OLD = (
+    "  _sg3.stage3 = _sg3.stage3 || [];\n"
+    "  sg3Render();\n"
+    "  _sg3Ready = true;  // stagegate loaded — safe to sync positions now\n"
+    "}"
+)
+_SG3_BOOT_QUOTES_NEW = (
+    "  _sg3.stage3 = _sg3.stage3 || [];\n"
+    "  // Fetch price + daily change for any stage gate ticker missing signal data\n"
+    "  try {\n"
+    "    const _allSgT = [...new Set([..._sg3.stage1, ..._sg3.stage2, ..._sg3.stage3])];\n"
+    "    const _missT = _allSgT.filter(t => !_sg3sigs[t] || _sg3sigs[t].current_price == null);\n"
+    "    if (_allSgT.length) {\n"
+    "      const _tq = _missT.length ? _missT : _allSgT;\n"
+    "      const _sq = await fetch('/api/sg-quotes?tickers=' + _tq.join(',')).then(r => r.json());\n"
+    "      Object.entries(_sq).forEach(([t, q]) => {\n"
+    "        if (!_sg3sigs[t]) _sg3sigs[t] = {ticker: t};\n"
+    "        if (!_sg3sigs[t].current_price && q.price) _sg3sigs[t].current_price = q.price;\n"
+    "        if (_sg3sigs[t].change_pct == null && q.change_pct != null) _sg3sigs[t].change_pct = q.change_pct;\n"
+    "        if (_sg3sigs[t].change_dollar == null && q.change_dollar != null) _sg3sigs[t].change_dollar = q.change_dollar;\n"
+    "      });\n"
+    "    }\n"
+    "  } catch(e) {}\n"
+    "  sg3Render();\n"
+    "  _sg3Ready = true;  // stagegate loaded — safe to sync positions now\n"
+    "}"
+)
+if _SG3_BOOT_QUOTES_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_SG3_BOOT_QUOTES_OLD, _SG3_BOOT_QUOTES_NEW)
+else:
+    import sys as _sys; print('[WARN] sg3Boot quotes patch: target not found', file=_sys.stderr)
+
+# ── Fix: pBuildTape — show ALL tickers deduped, change_pct arrows ─────────────
+# Override the function defined in _FEAT_JS which only showed BUY/SELL signals.
+PAPER_JS = PAPER_JS + """
+// ── Override pBuildTape: show all tickers, dedup, change_pct arrows ───────────
+window.pBuildTape = async function(sigs) {
+  const track = document.getElementById('p-tape');
+  if (!track) return;
+  const byT = new Map();
+  (sigs || []).forEach(s => { if (!byT.has(s.ticker)) byT.set(s.ticker, s); });
+  const items = [...byT.values()];
+  if (!items.length) { track.innerHTML = '<span class="pt-neu">No signals</span>'; return; }
+  const all = [...items, ...items];
+  track.innerHTML = all.map(s => {
+    const sig = (s.signal || '').toUpperCase();
+    const bull = sig === 'BUY' || sig === 'STRONG_BUY';
+    const bear = sig === 'SELL' || sig === 'STRONG_SELL';
+    const chg  = s.change_pct;
+    const up   = chg != null ? chg > 0 : null;
+    let cls, arr;
+    if (bull)             { cls = 'pt-bull';    arr = '&#9650;'; }
+    else if (bear)        { cls = 'pt-bear';    arr = '&#9660;'; }
+    else if (up === true) { cls = 'pt-chg-up';  arr = '&#9650;'; }
+    else if (up === false){ cls = 'pt-chg-dn';  arr = '&#9660;'; }
+    else                  { cls = 'pt-neu';     arr = '&#8212;'; }
+    const p = s.live_price || s.current_price;
+    return '<span class="' + cls + '">' + arr + ' ' + s.ticker + (p ? ' $' + Number(p).toFixed(2) : '') + '</span>'
+         + '<span class="pt-sep">|</span>';
+  }).join('');
+  track.style.animationDuration = Math.max(40, items.length * 0.8) + 's';
+};
+// Seed tape: try _sg3sigs first (fast), fall back to /api/signals fetch
+setTimeout(function() {
+  const sigsArr = Object.values(window._sg3sigs || {});
+  if (sigsArr.length) {
+    window.pBuildTape(sigsArr);
+  } else {
+    fetch('/api/signals').then(r => r.json()).then(function(sigs) {
+      if (sigs && sigs.length) window.pBuildTape(sigs);
+    }).catch(function() {});
+  }
+}, 600);
+"""
+
+# ── Paper Trade sticky banner wrapper ─────────────────────────────────────────
+PAPER_JS = PAPER_JS + """
+// ── Sticky wrapper: header + p-tape-wrap ─────────────────────────────────────
+(function() {
+  var h = document.querySelector('header');
+  if (!h || h.closest('.sticky-banner')) return;
+  var t = h.nextElementSibling;
+  var isTape = t && t.className && t.className.indexOf('tape') >= 0;
+  var w = document.createElement('div'); w.className = 'sticky-banner';
+  h.parentNode.insertBefore(w, h); w.appendChild(h);
+  if (isTape) w.appendChild(t);
+  // Page-info bar for Paper Trade
+  var INFO = '<b>Paper Trade</b> \u2014 $100k virtual account. Stage\u00a01: Monitoring. Stage\u00a02: Active AI auto-buys every 5\u00a0min (market hours). Stage\u00a03: Open positions with stop-loss & take-profit every 60s. AI exit toggle per position. Threshold model swim lanes.';
+  var bar = document.createElement('div');
+  bar.className = 'page-info-bar pib-collapsed'; bar.id = 'page-info-bar';
+  var togBtn = document.createElement('button');
+  togBtn.className = 'page-info-toggle';
+  togBtn.innerHTML = '\u2139\uFE0F About this page<span class="pib-arrow">&#9660;</span>';
+  togBtn.onclick = function() { bar.classList.toggle('pib-collapsed'); };
+  var content = document.createElement('div');
+  content.className = 'page-info-content';
+  content.innerHTML = INFO;
+  bar.appendChild(togBtn);
+  bar.appendChild(content);
+  w.insertAdjacentElement('afterend', bar);
+})();
+"""
+
+# ── Deferred re-load: ensures sg3SyncPositions runs after all wrappers are applied
+# The initial load() call in PAPER_JS fires before _SG3_JS wraps window.load,
+# so positions never sync on first render. This fires 400ms later with the full wrapper chain.
+PAPER_JS = PAPER_JS + (
+    "\n// ── Deferred sync: run after all JS wrappers applied ────────────────────────\n"
+    "setTimeout(function() {\n"
+    "  if (typeof load === 'function') load();\n"
+    "}, 400);\n"
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1a — /api/trade-diagnostic endpoint
+# Runs the full L2→L4 pipeline dry for a single ticker and returns
+# a structured JSON showing exactly which gate passed or failed.
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/api/trade-diagnostic")
+def api_trade_diagnostic(ticker: str, model: str = "standard"):
+    """
+    Dry-run the full AI pipeline for a single ticker using the specified model's
+    DecisionEngine, aggregator, and gate override file.
+    """
+    ticker = ticker.upper().strip()
+    model  = model.lower().strip()
+    try:
+        from paper.auto_scheduler import get_scheduler
+        sched = get_scheduler()
+        if sched is None or not sched._engines_ready:
+            return JSONResponse(
+                {"error": "Scheduler not ready — start the dashboard and wait for engine init"},
+                status_code=503
+            )
+
+        # Load price data with live intraday quote injected as today's bar
+        from paper.runner import _load_price_data as _lpd, _fetch_live_quotes as _flq
+        _live_q   = _flq([ticker])
+        price_data    = _lpd(sched._Session, ticker, live_quotes=_live_q)
+        closes        = price_data.get("closes", [])
+        highs         = price_data.get("highs", [])
+        lows          = price_data.get("lows", [])
+        volumes       = price_data.get("volumes", [])
+        current_price = price_data.get("current_price")
+        cik           = price_data.get("cik", "")
+
+        # L2: fundamental analysis
+        analysis = sched._analysis_engine.analyze_ticker(ticker)
+        if not analysis:
+            return {"ticker": ticker, "error": "No analysis data — ticker may not be in DB"}
+
+        # Optional signals
+        fft  = sched._fft.analyze(ticker, closes)                          if len(closes) >= 64  else None
+        fib  = sched._fib.analyze(ticker, highs, lows, closes)             if len(closes) >= 30  else None
+        ins  = sched._insider.score(ticker, cik, current_price)            if cik else None
+        vwap = sched._vwap.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5  else None
+        vol  = sched._vol.analyze(ticker, highs, lows, closes, volumes)    if len(closes) >= 10 else None
+
+        # VIX
+        try:
+            vix_q = sched._market_data.get_quote("$VIX")
+            vix_lvl = float(vix_q["last_price"]) if vix_q and vix_q.get("last_price") else 20.0
+        except Exception:
+            vix_lvl = 20.0
+        vix_regime = sched._vix.classify(vix_lvl)
+
+        # I-Tool cache
+        import json as _j
+        from pathlib import Path as _P
+        _it = {}
+        try:
+            _ic = _P("data/itool_scan.json")
+            if _ic.exists():
+                for r in _j.loads(_ic.read_text(encoding="utf-8")).get("results", []):
+                    if r.get("ticker") and r.get("signal"):
+                        _it[r["ticker"]] = r["signal"]
+        except Exception:
+            pass
+
+        # Resolve which model to use
+        _model_dict = next(
+            (m for m in sched._paper_models if m["name"] == model),
+            sched._paper_models[0]
+        )
+        _agg_instance = _model_dict.get("aggregator") or sched._aggregator
+        _de           = _model_dict["decision_engine"]
+
+        # Load model-specific gate overrides
+        gate_overrides = {}
+        _go_name = "gate_overrides.json" if model == "standard" else f"gate_overrides_{model}.json"
+        try:
+            _go = _P("data") / _go_name
+            if _go.exists():
+                gate_overrides = _j.loads(_go.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        bypasses = set(gate_overrides.get(ticker, []))
+        # Very Relaxed always bypasses FUD for all tickers (model-level policy)
+        if model == "very_relaxed":
+            bypasses.add("fud")
+
+        # For Claude model: if VIX bypass is active, use a neutral VIX so the
+        # aggregator's hard gate doesn't block the diagnostic
+        _diag_vix_lvl = vix_lvl
+        if model == "claude" and "vix" in bypasses:
+            _diag_vix_lvl = 15.0
+            vix_regime = sched._vix.classify(_diag_vix_lvl)
+
+        # L2 aggregate — use model's aggregator with correct buy threshold for this model
+        _bt = _model_dict.get("buy_threshold", 0.10)
+        _st = sched._st.analyze(ticker, highs, lows, closes, volumes) if (sched._st and len(closes) >= 20) else None
+        agg = _agg_instance.aggregate(
+            analysis=analysis, fft=fft, fib=fib, insider=ins,
+            vwap=vwap, vol_profile=vol, vix_regime=vix_regime,
+            current_price=current_price or analysis.current_price,
+            itool_signal=_it.get(ticker),
+            supertrend=_st,
+            buy_threshold_override=_bt,
+        )
+
+        # L3 FUD
+        l3 = sched._fud.analyze_ticker(ticker, agg)
+
+        # L4 Decision — use model's DecisionEngine with model-specific bypasses
+        decision = _de.decide(l3, portfolio_value=100_000, bypass_gates=bypasses)
+
+        scores = {
+            "fundamentals": round(agg.fundamentals_score, 3),
+            "momentum":     round(agg.momentum_score, 3),
+            "insider":      round(agg.insider_score, 3),
+            "technical":    round(agg.technical_score, 3),
+            "cycle":        round(agg.cycle_score, 3),
+            "volume":       round(agg.volume_score, 3),
+        }
+
+        return {
+            "ticker":          ticker,
+            "model":           model,
+            "investable":      analysis.is_investable,
+            "moat":            analysis.moat_strength,
+            "margin_of_safety": round(analysis.margin_of_safety or 0, 3),
+            "roic":            round(analysis.roic or 0, 4),
+            "wacc":            round(analysis.wacc or 0, 4),
+            "price_days":      len(closes),
+            "current_price":   current_price,
+            "vix":             round(vix_lvl, 1),
+            "vix_regime":      vix_regime.regime,
+            "scores":          scores,
+            "composite_score": round(agg.composite_score, 4),
+            "signal_l2":       agg.signal,
+            "fud_passed":      l3.proceed_to_execution,
+            "fud_score":       round(l3.fud_analysis.avg_fud_score if l3.fud_analysis else 0, 3),
+            "fud_adjusted_signal": l3.adjusted_signal,
+            "gate_results": {
+                "reynolds":  {"pass": not any("Reynolds: EXTREME" in g for g in decision.gates_failed), "regime": decision.reynolds_regime, "re": round(decision.reynolds_number, 2)},
+                "quantum":   {"pass": not any("Quantum:" in g for g in decision.gates_failed), "state": decision.quantum_dominant_state, "certainty": round(decision.quantum_certainty, 3)},
+                "ensemble":  {"pass": not any("Ensemble:" in g for g in decision.gates_failed), "p_bull": round(decision.ensemble_probability_bull, 3)},
+                "rr":        {"pass": not any("Risk/Reward:" in g for g in decision.gates_failed), "ratio": round(decision.risk_reward_ratio or 0, 2)},
+                "kalman":    {"pass": not any("Kalman:" in g for g in decision.gates_failed), "innovation_sigma": round(decision.kalman_innovation_sigma, 2), "trend": decision.kalman_trend},
+                "fud_signal":{"pass": not any("Composite signal:" in g for g in decision.gates_failed), "signal": l3.adjusted_signal},
+                "fud_gate":  {"pass": l3.proceed_to_execution},
+            },
+            "gates_passed":    decision.gates_passed,
+            "gates_failed":    decision.gates_failed,
+            "blocked_at":      decision.blocking_reason,
+            "go_no_go":        decision.go_no_go,
+            "action":          decision.action,
+            "why_buy":         agg.why_buy,
+            "why_wait":        agg.why_wait,
+        }
+
+    except Exception as e:
+        import traceback
+        return JSONResponse({"ticker": ticker, "error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+
+# ── Diagnose button on Stage 2 cards ─────────────────────────────────────────
+# Inject a 🔍 button that opens a modal with full gate diagnostics
+_DIAG_MODAL_HTML = """
+<div id="sg-diag-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;
+  background:rgba(0,0,0,0.7);z-index:9000;align-items:center;justify-content:center;">
+  <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;
+    max-width:680px;width:95%;max-height:85vh;overflow-y:auto;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <span id="sg-diag-title" style="font-size:15px;font-weight:700;color:#e6edf3;">
+        🔍 Trade Diagnostic</span>
+      <button onclick="document.getElementById('sg-diag-overlay').style.display='none'"
+        style="background:none;border:none;color:#8b949e;font-size:18px;cursor:pointer;">✕</button>
+    </div>
+    <div id="sg-diag-body" style="font-size:12px;color:#c9d1d9;line-height:1.8;"></div>
+  </div>
+</div>
+"""
+
+_DIAG_MODAL_OLD = '</body>'
+_DIAG_MODAL_NEW = _DIAG_MODAL_HTML + '</body>'
+if _DIAG_MODAL_OLD in PAPER_HTML:
+    PAPER_HTML = PAPER_HTML.replace(_DIAG_MODAL_OLD, _DIAG_MODAL_NEW, 1)
+
+# Add diagnose JS before </body>
+_DIAG_JS = """<script>
+async function sgDiagnose(ticker) {
+  var ov = document.getElementById('sg-diag-overlay');
+  var body = document.getElementById('sg-diag-body');
+  var title = document.getElementById('sg-diag-title');
+  title.textContent = '🔍 Diagnosing ' + ticker + '…';
+  body.innerHTML = '<span style="color:#8b949e">Running full AI pipeline…</span>';
+  var _stale = document.getElementById('sg-diag-stale');
+  if (_stale) _stale.remove();
+  ov.style.display = 'flex';
+  // Snapshot bypass state so we can detect staleness if user toggles afterward
+  window._diagActiveTicker = ticker;
+  window._diagBypassSnap = JSON.stringify(
+    JSON.parse(localStorage.getItem('sg3_gate_ov_' + ((window._PAPER_MODEL)||'standard')) || '{}')[ticker] || []
+  );
+  try {
+    var _diagModel = (typeof window !== 'undefined' && window._PAPER_MODEL) || 'standard';
+    var d = await fetch('/api/trade-diagnostic?ticker=' + ticker + '&model=' + _diagModel).then(r => r.json());
+    if (d.error) { body.innerHTML = '<span style="color:#f85149">Error: ' + d.error + '</span>'; return; }
+    var _mLabel = {standard:'Standard',relaxed:'Relaxed',very_relaxed:'Very Relaxed',claude:'Claude'}[d.model||'standard'] || d.model;
+    title.textContent = '🔍 ' + ticker + ' [' + _mLabel + '] — ' + (d.go_no_go ? '✅ GO: ' + d.action : '❌ NO-GO: BLOCKED');
+
+    function gateRow(name, obj) {
+      var pass = obj && obj.pass;
+      var icon = pass ? '✅' : '❌';
+      var detail = '';
+      if (obj) {
+        if (obj.regime) detail += ' regime=' + obj.regime;
+        if (obj.re !== undefined) detail += ' Re=' + obj.re;
+        if (obj.state) detail += ' state=' + obj.state;
+        if (obj.certainty !== undefined) detail += ' certainty=' + (obj.certainty*100).toFixed(0) + '%';
+        if (obj.p_bull !== undefined) detail += ' P(bull)=' + (obj.p_bull*100).toFixed(0) + '%';
+        if (obj.ratio !== undefined) detail += ' R/R=' + obj.ratio + ':1';
+        if (obj.innovation_sigma !== undefined) detail += ' σ=' + obj.innovation_sigma;
+        if (obj.trend) detail += ' trend=' + obj.trend;
+        if (obj.signal) detail += ' signal=' + obj.signal;
+      }
+      return '<tr><td style="padding:2px 8px;">' + icon + ' ' + name + '</td>'
+           + '<td style="padding:2px 8px;color:#8b949e;">' + detail + '</td></tr>';
+    }
+
+    var sc = d.scores || {};
+    var html = '<table style="width:100%;border-collapse:collapse;">'
+      + '<tr><td colspan="2" style="padding:4px 8px;border-bottom:1px solid #21262d;font-weight:700;color:#58a6ff;">Fundamental Analysis</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Investable</td><td style="padding:2px 8px;">' + (d.investable ? '✅ Yes' : '❌ No — missing EDGAR data') + '</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Moat</td><td style="padding:2px 8px;">' + (d.moat||'unknown') + '</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Margin of Safety</td><td style="padding:2px 8px;">' + ((d.margin_of_safety||0)*100).toFixed(1) + '%</td></tr>'
+      + '<tr><td style="padding:2px 8px;">ROIC / WACC</td><td style="padding:2px 8px;">' + ((d.roic||0)*100).toFixed(1) + '% / ' + ((d.wacc||0)*100).toFixed(1) + '%</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Price history</td><td style="padding:2px 8px;">' + (d.price_days||0) + ' days | VIX=' + d.vix + ' (' + d.vix_regime + ')</td></tr>'
+      + '<tr><td colspan="2" style="padding:4px 8px;border-bottom:1px solid #21262d;font-weight:700;color:#58a6ff;padding-top:10px;">Signal Scores (weighted composite: ' + (d.composite_score||0).toFixed(3) + ' → ' + (d.signal_l2||'?') + ')</td></tr>'
+      + Object.entries(sc).map(([k,v]) => '<tr><td style="padding:2px 8px;">' + k + '</td><td style="padding:2px 8px;color:' + (v>0?'#3fb950':v<0?'#f85149':'#8b949e') + ';">' + (v>=0?'+':'') + v.toFixed(3) + '</td></tr>').join('')
+      + '<tr><td colspan="2" style="padding:4px 8px;border-bottom:1px solid #21262d;font-weight:700;color:#58a6ff;padding-top:10px;">Decision Gates</td></tr>'
+      + gateRow('FUD filter', d.gate_results && d.gate_results.fud_gate)
+      + gateRow('Reynolds', d.gate_results && d.gate_results.reynolds)
+      + gateRow('Quantum', d.gate_results && d.gate_results.quantum)
+      + gateRow('Ensemble', d.gate_results && d.gate_results.ensemble)
+      + gateRow('Risk/Reward', d.gate_results && d.gate_results.rr)
+      + gateRow('Kalman', d.gate_results && d.gate_results.kalman)
+      + gateRow('FUD Signal', d.gate_results && d.gate_results.fud_signal)
+      + '</table>';
+    if (d.blocked_at) {
+      html += '<div style="margin-top:12px;padding:8px 12px;background:rgba(248,81,73,0.1);border-radius:6px;border-left:3px solid #f85149;">'
+            + '<b style="color:#f85149;">Blocked:</b> ' + d.blocked_at + '</div>';
+    }
+    if (d.why_buy && d.why_buy.length) {
+      html += '<div style="margin-top:10px;color:#3fb950;font-size:11px;"><b>Why Buy:</b><br>' + d.why_buy.join('<br>') + '</div>';
+    }
+    if (d.why_wait && d.why_wait.length) {
+      html += '<div style="margin-top:6px;color:#d29922;font-size:11px;"><b>Caution:</b><br>' + d.why_wait.join('<br>') + '</div>';
+    }
+    body.innerHTML = html;
+  } catch(e) {
+    body.innerHTML = '<span style="color:#f85149">Fetch error: ' + e.message + '</span>';
+  }
+}
+</script>"""
+
+if '</body>' in PAPER_HTML:
+    PAPER_HTML = PAPER_HTML.replace('</body>', _DIAG_JS + '</body>', 1)
+
+# ── Add 🔍 Diagnose button to Stage 2 cards ───────────────────────────────────
+# Stage 2 card has an AI button: sgActivateAI. We add the diagnose btn after it.
+# Inject diagnose + chart buttons after the info button in sg3CardHtml
+# Target (in runtime PAPER_JS, after _SG3_JS was merged):
+#   btns += '<button class="sg3-btn sg3-btn-info" ... title="AI Analysis">&#9432;</button>';
+_DIAG_BTN_OLD = (
+    "btns += '<button class=\"sg3-btn sg3-btn-info\" data-ticker=\"' + ticker + '\" "
+    "onclick=\"sgShowInfo(this.dataset.ticker)\" title=\"AI Analysis\">&#9432;</button>';"
+)
+_DIAG_BTN_NEW = (
+    "btns += '<button class=\"sg3-btn sg3-btn-info\" data-ticker=\"' + ticker + '\" "
+    "onclick=\"sgShowInfo(this.dataset.ticker)\" title=\"AI Analysis\">&#9432;</button>';\n"
+    "  btns += '<button style=\"font-size:10px;padding:2px 6px;border-radius:4px;"
+    "border:1px solid #30363d;background:#0d1117;color:#8b949e;cursor:pointer;margin-left:2px;\""
+    " onclick=\"sgDiagnose(\\'' + ticker + '\\')\" title=\"Full AI diagnostic\">&#128269;</button>';\n"
+    "  btns += '<a href=\"/charts?ticker=' + ticker + '\" target=\"_blank\" "
+    "style=\"font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid #30363d;"
+    "background:#0d1117;color:#8b949e;text-decoration:none;margin-left:2px;\""
+    " title=\"Open chart\">&#128200;</a>';"
+)
+if _DIAG_BTN_OLD in PAPER_JS:
+    PAPER_JS = PAPER_JS.replace(_DIAG_BTN_OLD, _DIAG_BTN_NEW)
+else:
+    import sys as _sys; print('[WARN] diagBtn injection: info btn not found', file=_sys.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2a — /api/chart-data and /api/chart-indicators endpoints
+# Serve OHLCV + EMA/VWAP/signal data in TradingView Lightweight Charts format
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/api/chart-data")
+def api_chart_data(ticker: str, days: int = 180):
+    """
+    Return OHLCV data for TradingView Lightweight Charts.
+    Format: [{time: "YYYY-MM-DD", open, high, low, close, volume}]
+    """
+    ticker = ticker.upper().strip()
+    try:
+        with Session() as session:
+            company = session.query(Company).filter_by(ticker=ticker).first()
+            if not company:
+                return JSONResponse({"error": f"Ticker {ticker} not found"}, status_code=404)
+
+            from datetime import timedelta
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            records = (
+                session.query(PriceHistory)
+                .filter(PriceHistory.company_id == company.id)
+                .filter(PriceHistory.date >= cutoff)
+                .order_by(PriceHistory.date)
+                .all()
+            )
+
+            candles = []
+            for r in records:
+                o = r.open or r.close
+                h = r.high or r.close
+                l = r.low  or r.close
+                c = r.adjusted_close or r.close
+                if not c:
+                    continue
+                candles.append({
+                    "time":   r.date.strftime("%Y-%m-%d"),
+                    "open":   round(float(o), 4),
+                    "high":   round(float(h), 4),
+                    "low":    round(float(l), 4),
+                    "close":  round(float(c), 4),
+                    "volume": int(r.volume or 0),
+                })
+
+            return {"ticker": ticker, "candles": candles}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/chart-intraday")
+def api_chart_intraday(ticker: str, freq: int = 5):
+    """
+    Return today's intraday OHLCV candles from Schwab.
+    Format: [{time (unix epoch seconds), open, high, low, close, volume}]
+    freq: 1 or 5 (minute bars)
+    """
+    ticker = ticker.upper().strip()
+    try:
+        from broker.market_data import SchwabMarketData
+        md = SchwabMarketData()
+        candles_raw = md.get_price_history_intraday(ticker, freq_minutes=freq)
+        candles = []
+        for c in candles_raw:
+            if not c.get("close"):
+                continue
+            candles.append({
+                "time":   int(c["date"].timestamp()),
+                "open":   round(float(c["open"]  or c["close"]), 4),
+                "high":   round(float(c["high"]  or c["close"]), 4),
+                "low":    round(float(c["low"]   or c["close"]), 4),
+                "close":  round(float(c["close"]),              4),
+                "volume": int(c["volume"] or 0),
+            })
+        return {"ticker": ticker, "candles": candles, "freq_minutes": freq}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/chart-indicators")
+def api_chart_indicators(ticker: str, days: int = 180):
+    """
+    Return technical indicators for TradingView overlay:
+    - ema20, ema50: [{time, value}]
+    - vwap_line: [{time, value}]
+    - signals: [{time, action, price}]
+    - fib_levels: {high, low, levels: [{name, price}]}
+    """
+    ticker = ticker.upper().strip()
+    try:
+        with Session() as session:
+            company = session.query(Company).filter_by(ticker=ticker).first()
+            if not company:
+                return JSONResponse({"error": f"Ticker {ticker} not found"}, status_code=404)
+
+            from datetime import timedelta
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            records = (
+                session.query(PriceHistory)
+                .filter(PriceHistory.company_id == company.id)
+                .filter(PriceHistory.date >= cutoff)
+                .order_by(PriceHistory.date)
+                .all()
+            )
+
+            times  = [r.date.strftime("%Y-%m-%d") for r in records]
+            closes = [float(r.adjusted_close or r.close or 0) for r in records]
+            highs  = [float(r.high  or r.close or 0) for r in records]
+            lows   = [float(r.low   or r.close or 0) for r in records]
+            vols   = [float(r.volume or 0) for r in records]
+
+            def _ema(values, period):
+                result = []
+                k = 2.0 / (period + 1)
+                ema = None
+                for v in values:
+                    if v <= 0:
+                        result.append(None)
+                        continue
+                    if ema is None:
+                        ema = v
+                    else:
+                        ema = v * k + ema * (1 - k)
+                    result.append(round(ema, 4))
+                return result
+
+            ema20 = _ema(closes, 20)
+            ema50 = _ema(closes, 50)
+
+            # VWAP (rolling daily using H+L+C/3 * volume / cum_volume)
+            vwap_line = []
+            cum_tpv = 0.0
+            cum_vol = 0.0
+            for i, (h, l, c, v) in enumerate(zip(highs, lows, closes, vols)):
+                tp = (h + l + c) / 3.0
+                cum_tpv += tp * v
+                cum_vol  += v
+                vwap = round(cum_tpv / cum_vol, 4) if cum_vol > 0 else None
+                vwap_line.append(vwap)
+
+            # Trade signals from DB
+            sig_rows = (
+                session.query(TradeSignal)
+                .filter(TradeSignal.company_id == company.id)
+                .filter(TradeSignal.generated_at >= cutoff)
+                .filter(TradeSignal.signal.in_(["BUY", "SELL"]))
+                .order_by(TradeSignal.generated_at)
+                .all()
+            )
+            signals = []
+            for s in sig_rows:
+                if s.generated_at and s.current_price:
+                    signals.append({
+                        "time":   s.generated_at.strftime("%Y-%m-%d"),
+                        "action": s.signal,
+                        "price":  round(float(s.current_price), 4),
+                    })
+
+            # Fibonacci levels (using range over the period)
+            fib_levels = None
+            if highs and lows:
+                period_high = max(h for h in highs if h > 0)
+                period_low  = min(l for l in lows  if l > 0)
+                diff = period_high - period_low
+                fib_levels = {
+                    "high": round(period_high, 4),
+                    "low":  round(period_low,  4),
+                    "levels": [
+                        {"name": "0%",     "price": round(period_low,              4)},
+                        {"name": "23.6%",  "price": round(period_low + 0.236*diff, 4)},
+                        {"name": "38.2%",  "price": round(period_low + 0.382*diff, 4)},
+                        {"name": "50%",    "price": round(period_low + 0.500*diff, 4)},
+                        {"name": "61.8%",  "price": round(period_low + 0.618*diff, 4)},
+                        {"name": "78.6%",  "price": round(period_low + 0.786*diff, 4)},
+                        {"name": "100%",   "price": round(period_high,             4)},
+                    ],
+                }
+
+            # Build time-indexed arrays for lightweight charts
+            def _zip(t, v):
+                return [{"time": t[i], "value": v[i]} for i in range(len(t)) if v[i] is not None]
+
+            return {
+                "ticker":     ticker,
+                "ema20":      _zip(times, ema20),
+                "ema50":      _zip(times, ema50),
+                "vwap_line":  _zip(times, vwap_line),
+                "signals":    signals,
+                "fib_levels": fib_levels,
+            }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2b — /charts page with TradingView Lightweight Charts
+# ═══════════════════════════════════════════════════════════════════════
+
+_CHARTS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NWO Charts</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',monospace; }
+  {NAV_CSS}
+  header { display:flex;align-items:center;gap:10px;padding:10px 16px;background:#161b22;
+           border-bottom:1px solid #30363d;flex-wrap:wrap; }
+  .chart-wrap { padding: 16px; }
+  .chart-controls { display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap; }
+  .chart-controls input { background:#161b22;border:1px solid #30363d;border-radius:6px;
+    color:#e6edf3;padding:6px 10px;font-size:13px;width:120px; }
+  .chart-controls input:focus { outline:none;border-color:#58a6ff; }
+  .period-btn { padding:4px 10px;border-radius:4px;border:1px solid #30363d;
+    background:#161b22;color:#8b949e;cursor:pointer;font-size:12px; }
+  .period-btn.active, .period-btn:hover { background:#1c2e50;color:#58a6ff;border-color:#58a6ff; }
+  .toggle-row { display:flex;gap:8px;flex-wrap:wrap; }
+  .ind-toggle { padding:3px 8px;border-radius:4px;border:1px solid #30363d;
+    background:#161b22;color:#8b949e;cursor:pointer;font-size:11px; }
+  .ind-toggle.on { border-color:#3fb950;color:#3fb950; }
+  #main-chart { width:100%;height:520px;border:1px solid #21262d;border-radius:6px;overflow:hidden; }
+  #rsi-chart   { width:100%;height:110px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
+  #vol-chart   { width:100%;height:90px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
+  .ai-bar { display:flex;gap:16px;align-items:center;margin-top:10px;padding:8px 12px;
+    background:#161b22;border:1px solid #21262d;border-radius:6px;font-size:12px;flex-wrap:wrap; }
+  .ai-bar span { color:#8b949e; }
+  .ai-bar b { color:#e6edf3; }
+  #chart-signal { padding:3px 8px;border-radius:4px;font-weight:700;font-size:12px; }
+  .fib-legend { display:flex;flex-wrap:wrap;gap:6px;margin-top:8px; }
+  .fib-badge { font-size:10px;padding:2px 6px;background:#161b22;border:1px solid #21262d;
+    border-radius:3px;color:#8b949e; }
+  .chart-title { font-size:14px;font-weight:700;color:#58a6ff; }
+</style>
+</head>
+<body>
+<header>
+  {NAV}
+</header>
+{TAPE_HTML}
+{PAGE_INFO}
+<div class="chart-wrap">
+  <div class="chart-controls">
+    <input id="chart-ticker" type="text" placeholder="AAPL" value="AAPL" />
+    <button class="period-btn" onclick="loadChartIntraday(_currentTicker)">1D</button>
+    <button class="period-btn" onclick="loadChart(_currentTicker,30)">1M</button>
+    <button class="period-btn active" onclick="loadChart(_currentTicker,90)">3M</button>
+    <button class="period-btn" onclick="loadChart(_currentTicker,180)">6M</button>
+    <button class="period-btn" onclick="loadChart(_currentTicker,365)">1Y</button>
+    <span id="chart-ticker-label" class="chart-title">AAPL</span>
+  </div>
+  <div class="toggle-row" style="margin-bottom:10px;">
+    <button class="ind-toggle on" id="tog-ema20" onclick="toggleInd('ema20')">EMA 20</button>
+    <button class="ind-toggle on" id="tog-ema50" onclick="toggleInd('ema50')">EMA 50</button>
+    <button class="ind-toggle on" id="tog-vwap"  onclick="toggleInd('vwap')">VWAP</button>
+    <button class="ind-toggle on" id="tog-fib"   onclick="toggleInd('fib')">Fibonacci</button>
+    <button class="ind-toggle on" id="tog-sigs"  onclick="toggleInd('sigs')">Signals</button>
+  </div>
+  <div id="main-chart"></div>
+  <div id="vol-chart"></div>
+  <div id="rsi-chart"></div>
+  <div class="ai-bar">
+    <span>AI Signal: <b id="chart-signal" style="background:#21262d;padding:3px 8px;border-radius:4px;">—</span>
+    <span>Composite: <b id="chart-composite">—</b></span>
+    <span>Momentum: <b id="chart-momentum">—</b></span>
+    <span>Margin of Safety: <b id="chart-mos">—</b></span>
+    <span>Investable: <b id="chart-investable">—</b></span>
+    <span>Gates Passed: <b id="chart-gates">—</b></span>
+    <button onclick="runDiagnostic()" style="padding:4px 10px;border-radius:4px;border:1px solid #58a6ff;
+      background:#1c2e50;color:#58a6ff;cursor:pointer;font-size:11px;">🔍 Full Diagnostic</button>
+  </div>
+  <div id="fib-legend" class="fib-legend"></div>
+</div>
+
+<!-- Diagnostic modal (reused from paper trade) -->
+<div id="sg-diag-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;
+  background:rgba(0,0,0,0.7);z-index:9000;align-items:center;justify-content:center;">
+  <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;
+    max-width:680px;width:95%;max-height:85vh;overflow-y:auto;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <span id="sg-diag-title" style="font-size:15px;font-weight:700;color:#e6edf3;">🔍 Trade Diagnostic</span>
+      <button onclick="document.getElementById('sg-diag-overlay').style.display='none'"
+        style="background:none;border:none;color:#8b949e;font-size:18px;cursor:pointer;">✕</button>
+    </div>
+    <div id="sg-diag-body" style="font-size:12px;color:#c9d1d9;line-height:1.8;"></div>
+  </div>
+</div>
+
+<script>
+var _chart, _volChart, _rsiChart, _candleSeries, _volSeries, _rsiSeries;
+var _ema20Series, _ema50Series, _vwapSeries;
+var _fibLines = [], _sigMarkers = [];
+var _indState = {ema20:true, ema50:true, vwap:true, fib:true, sigs:true};
+var _currentDays = 90;
+var _currentTicker = 'AAPL';
+var _currentIntraday = false;
+var _syncEnabled = false;
+
+function _createCharts() {
+  var mainEl = document.getElementById('main-chart');
+  var volEl  = document.getElementById('vol-chart');
+  var rsiEl  = document.getElementById('rsi-chart');
+
+  // Only create once — reuse across period/ticker changes to avoid ResizeObserver issues
+  if (_chart) return;
+
+  _fibLines = [];
+  _syncEnabled = false;
+
+  var w = mainEl.getBoundingClientRect().width || mainEl.clientWidth || 900;
+
+  _chart = LightweightCharts.createChart(mainEl, {
+    width: w, height: 520,
+    layout: { background: {color:'#0d1117'}, textColor:'#c9d1d9' },
+    grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor:'#30363d' },
+    timeScale: { borderColor:'#30363d', timeVisible:true },
+  });
+
+  _volChart = LightweightCharts.createChart(volEl, {
+    width: w, height: 90,
+    layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
+    grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
+    rightPriceScale: { borderColor:'#30363d' },
+    timeScale: { borderColor:'#30363d', timeVisible:true },
+  });
+
+  _rsiChart = LightweightCharts.createChart(rsiEl, {
+    width: w, height: 110,
+    layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
+    grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
+    rightPriceScale: { borderColor:'#30363d' },
+    timeScale: { borderColor:'#30363d', timeVisible:true },
+  });
+
+  _candleSeries = _chart.addCandlestickSeries({
+    upColor:'#3fb950', downColor:'#f85149',
+    borderUpColor:'#3fb950', borderDownColor:'#f85149',
+    wickUpColor:'#3fb950', wickDownColor:'#f85149',
+  });
+  _ema20Series  = _chart.addLineSeries({ color:'#3fb950', lineWidth:1, lineStyle:0 });
+  _ema50Series  = _chart.addLineSeries({ color:'#58a6ff', lineWidth:1, lineStyle:0 });
+  _vwapSeries   = _chart.addLineSeries({ color:'#d29922', lineWidth:1, lineStyle:1 });
+  _volSeries    = _volChart.addHistogramSeries({ color:'#1c2e50', priceFormat:{type:'volume'} });
+  _rsiSeries    = _rsiChart.addLineSeries({ color:'#a371f7', lineWidth:1 });
+
+  _chart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
+    if (!_syncEnabled || !range) return;
+    try { _volChart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
+    try { _rsiChart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
+  });
+
+  window.addEventListener('resize', function() {
+    var rw = mainEl.getBoundingClientRect().width || 900;
+    if (_chart)    _chart.resize(rw, 520);
+    if (_volChart) _volChart.resize(rw, 90);
+    if (_rsiChart) _rsiChart.resize(rw, 110);
+  });
+}
+
+// Retry setData in next RAF if LightweightCharts canvas isn't ready yet
+function _safeSetData(series, data) {
+  return new Promise(function(resolve) {
+    function attempt() {
+      try { series.setData(data); resolve(); }
+      catch(e) {
+        if (e && e.message === 'Value is null') {
+          requestAnimationFrame(attempt);
+        } else { resolve(); }
+      }
+    }
+    attempt();
+  });
+}
+
+function _computeRSI(closes, period) {
+  var result = [];
+  var gains = 0, losses = 0;
+  for (var i = 0; i < closes.length; i++) {
+    if (i < period) { result.push(null); continue; }
+    var change = closes[i].close - closes[i-1].close;
+    if (i === period) {
+      for (var j = 1; j <= period; j++) {
+        var ch = closes[j].close - closes[j-1].close;
+        if (ch > 0) gains += ch; else losses -= ch;
+      }
+      gains  /= period;
+      losses /= period;
+    } else {
+      var ch = change;
+      gains  = (gains  * (period-1) + (ch>0?ch:0)) / period;
+      losses = (losses * (period-1) + (ch<0?-ch:0)) / period;
+    }
+    var rs  = losses === 0 ? 100 : gains / losses;
+    var rsi = 100 - 100/(1+rs);
+    result.push({time: closes[i].time, value: Math.round(rsi*100)/100});
+  }
+  return result.filter(x => x !== null);
+}
+
+async function loadChart(tickerOverride, daysOverride) {
+  var t = tickerOverride || document.getElementById('chart-ticker').value.trim().toUpperCase();
+  var d = daysOverride || _currentDays;
+  if (!t) return;
+  _currentTicker = t;
+  _currentDays   = d;
+  document.getElementById('chart-ticker').value = t;
+  document.getElementById('chart-ticker-label').textContent = t;
+
+  // Update period buttons
+  document.querySelectorAll('.period-btn').forEach(function(b) {
+    b.classList.remove('active');
+    if ((d===30&&b.textContent==='1M')||(d===90&&b.textContent==='3M')||
+        (d===180&&b.textContent==='6M')||(d===365&&b.textContent==='1Y')) b.classList.add('active');
+  });
+  _currentIntraday = false;
+
+  // Create chart instances on first call; reuse on subsequent calls
+  _createCharts();
+
+  var [ohlcv, inds] = await Promise.all([
+    fetch('/api/chart-data?ticker=' + t + '&days=' + d).then(r=>r.json()),
+    fetch('/api/chart-indicators?ticker=' + t + '&days=' + d).then(r=>r.json()),
+  ]);
+
+  if (ohlcv.error || !ohlcv.candles) {
+    document.getElementById('chart-signal').textContent = 'No data';
+    return;
+  }
+
+  _syncEnabled = false;
+  await _safeSetData(_candleSeries, ohlcv.candles);
+  await _safeSetData(_ema20Series, _indState.ema20 ? (inds.ema20||[]) : []);
+  await _safeSetData(_ema50Series, _indState.ema50 ? (inds.ema50||[]) : []);
+  await _safeSetData(_vwapSeries,  _indState.vwap  ? (inds.vwap_line||[]) : []);
+
+  var volData = ohlcv.candles.map(function(c) {
+    return {time:c.time, value:c.volume, color: c.close>=c.open?'#1e4620':'#4d1f1f'};
+  });
+  await _safeSetData(_volSeries, volData);
+
+  var rsiData = _computeRSI(ohlcv.candles, 14);
+  await _safeSetData(_rsiSeries, rsiData);
+  _syncEnabled = true;
+
+  // Fibonacci lines
+  _fibLines.forEach(function(l) { try { _chart.removePriceLine(l); } catch(e) {} });
+  _fibLines = [];
+  if (_indState.fib && inds.fib_levels) {
+    var colors = ['#8b949e','#58a6ff','#3fb950','#d29922','#f85149','#a371f7','#8b949e'];
+    var legend = '';
+    inds.fib_levels.levels.forEach(function(lv, i) {
+      var pl = _candleSeries.createPriceLine({
+        price: lv.price, color: colors[i]||'#8b949e',
+        lineWidth:1, lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible:true, title: lv.name,
+      });
+      _fibLines.push(pl);
+      legend += '<span class="fib-badge">' + lv.name + ' $' + lv.price.toFixed(2) + '</span>';
+    });
+    document.getElementById('fib-legend').innerHTML = legend;
+  } else {
+    document.getElementById('fib-legend').innerHTML = '';
+  }
+
+  // Signal markers
+  if (_indState.sigs && inds.signals && inds.signals.length) {
+    var markers = inds.signals.map(function(s) {
+      return {
+        time: s.time,
+        position: s.action === 'BUY' ? 'belowBar' : 'aboveBar',
+        color: s.action === 'BUY' ? '#3fb950' : '#f85149',
+        shape: s.action === 'BUY' ? 'arrowUp' : 'arrowDown',
+        text: s.action,
+      };
+    });
+    _candleSeries.setMarkers(markers);
+  } else {
+    _candleSeries.setMarkers([]);
+  }
+
+  _chart.timeScale().fitContent();
+  _volChart.timeScale().fitContent();
+  _rsiChart.timeScale().fitContent();
+
+  // Load latest signal data for the AI bar
+  loadAiBar(t);
+}
+
+async function loadChartIntraday(tickerOverride) {
+  var t = tickerOverride || document.getElementById('chart-ticker').value.trim().toUpperCase();
+  if (!t) return;
+  _currentTicker  = t;
+  _currentIntraday = true;
+  document.getElementById('chart-ticker').value = t;
+  document.getElementById('chart-ticker-label').textContent = t + ' (1D intraday)';
+
+  document.querySelectorAll('.period-btn').forEach(function(b) {
+    b.classList.remove('active');
+    if (b.textContent === '1D') b.classList.add('active');
+  });
+
+  _createCharts();
+
+  var ohlcv = await fetch('/api/chart-intraday?ticker=' + t + '&freq=5').then(r=>r.json());
+  if (ohlcv.error || !ohlcv.candles || !ohlcv.candles.length) {
+    document.getElementById('chart-signal').textContent = 'No intraday data';
+    return;
+  }
+
+  // Intraday candles use unix epoch seconds; configure chart for that
+  _chart.applyOptions({ timeScale: { timeVisible: true, secondsVisible: false } });
+  _volChart.applyOptions({ timeScale: { timeVisible: true, secondsVisible: false } });
+  _rsiChart.applyOptions({ timeScale: { timeVisible: true, secondsVisible: false } });
+
+  _syncEnabled = false;
+  await _safeSetData(_candleSeries, ohlcv.candles);
+  await _safeSetData(_ema20Series, []);
+  await _safeSetData(_ema50Series, []);
+  await _safeSetData(_vwapSeries,  []);
+
+  var volData = ohlcv.candles.map(function(c) {
+    return {time:c.time, value:c.volume, color: c.close>=c.open?'#1e4620':'#4d1f1f'};
+  });
+  await _safeSetData(_volSeries, volData);
+
+  var rsiData = _computeRSI(ohlcv.candles, 14);
+  await _safeSetData(_rsiSeries, rsiData);
+  _syncEnabled = true;
+
+  _fibLines.forEach(function(l) { try { _chart.removePriceLine(l); } catch(e) {} });
+  _fibLines = [];
+  document.getElementById('fib-legend').innerHTML = '';
+  _candleSeries.setMarkers([]);
+
+  _chart.timeScale().fitContent();
+  _volChart.timeScale().fitContent();
+  _rsiChart.timeScale().fitContent();
+
+  loadAiBar(t);
+}
+
+async function loadAiBar(ticker) {
+  try {
+    var sigs = await fetch('/api/signals').then(r=>r.json());
+    var s = (sigs.signals||sigs||[]).find(x=>x.ticker===ticker);
+    if (s) {
+      var el = document.getElementById('chart-signal');
+      el.textContent = s.signal || '—';
+      el.style.background = s.signal==='BUY'||s.signal==='STRONG_BUY' ? 'rgba(63,185,80,0.2)'
+        : s.signal==='SELL'||s.signal==='STRONG_SELL' ? 'rgba(248,81,73,0.2)' : '#21262d';
+      el.style.color = s.signal==='BUY'||s.signal==='STRONG_BUY' ? '#3fb950'
+        : s.signal==='SELL'||s.signal==='STRONG_SELL' ? '#f85149' : '#e6edf3';
+      document.getElementById('chart-composite').textContent = s.composite_score!=null ? (s.composite_score>=0?'+':'') + s.composite_score.toFixed(3) : '—';
+      document.getElementById('chart-momentum').textContent  = s.momentum_score!=null  ? (s.momentum_score>=0?'+':'')  + s.momentum_score.toFixed(3)  : '—';
+      document.getElementById('chart-mos').textContent       = s.margin_of_safety!=null ? (s.margin_of_safety*100).toFixed(1)+'%' : '—';
+    } else {
+      document.getElementById('chart-signal').textContent = 'No signal';
+    }
+  } catch(e) {}
+}
+
+function toggleInd(key) {
+  _indState[key] = !_indState[key];
+  var btn = document.getElementById('tog-' + key);
+  if (btn) { btn.className = 'ind-toggle' + (_indState[key] ? ' on' : ''); }
+  loadChart(_currentTicker, _currentDays);
+}
+
+async function runDiagnostic() {
+  var ov = document.getElementById('sg-diag-overlay');
+  var body = document.getElementById('sg-diag-body');
+  var title = document.getElementById('sg-diag-title');
+  var ticker = _currentTicker;
+  title.textContent = '\\ud83d\\udd0d Diagnosing ' + ticker + '\\u2026';
+  body.innerHTML = '<span style="color:#8b949e">Running full AI pipeline…</span>';
+  ov.style.display = 'flex';
+  try {
+    var _diagModel = (typeof window !== 'undefined' && window._PAPER_MODEL) || 'standard';
+    var d = await fetch('/api/trade-diagnostic?ticker=' + ticker + '&model=' + _diagModel).then(r => r.json());
+    if (d.error) { body.innerHTML = '<span style="color:#f85149">Error: ' + d.error + '</span>'; return; }
+    title.textContent = '\\ud83d\\udd0d ' + ticker + ' — ' + (d.go_no_go ? '\\u2705 GO: ' + d.action : '\\u274c NO-GO: BLOCKED');
+    var sc = d.scores || {};
+    var html = '<table style="width:100%;border-collapse:collapse;">'
+      + '<tr><td colspan="2" style="padding:4px 8px;border-bottom:1px solid #21262d;font-weight:700;color:#58a6ff;">Fundamentals</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Investable</td><td>' + (d.investable ? '\\u2705 Yes' : '\\u274c No') + '</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Moat</td><td>' + (d.moat||'?') + '</td></tr>'
+      + '<tr><td style="padding:2px 8px;">Margin of Safety</td><td>' + ((d.margin_of_safety||0)*100).toFixed(1) + '%</td></tr>'
+      + '<tr><td style="padding:2px 8px;">ROIC/WACC</td><td>' + ((d.roic||0)*100).toFixed(1) + '%/' + ((d.wacc||0)*100).toFixed(1) + '%</td></tr>'
+      + '<tr><td colspan="2" style="padding:4px 8px;border-bottom:1px solid #21262d;font-weight:700;color:#58a6ff;padding-top:10px;">Scores — composite: ' + (d.composite_score||0).toFixed(3) + '</td></tr>'
+      + Object.entries(sc).map(([k,v]) => '<tr><td style="padding:2px 8px;">' + k + '</td><td style="color:' + (v>0?'#3fb950':v<0?'#f85149':'#8b949e') + ';">' + (v>=0?'+':'') + v.toFixed(3) + '</td></tr>').join('')
+      + '<tr><td colspan="2" style="padding:4px 8px;border-bottom:1px solid #21262d;font-weight:700;color:#58a6ff;padding-top:10px;">Gates</td></tr>'
+      + (d.gates_passed||[]).filter(g=>!g.includes('BYPASSED')).map(g=>'<tr><td colspan="2" style="padding:2px 8px;color:#3fb950;">\\u2713 '+g+'</td></tr>').join('')
+      + (d.gates_passed||[]).filter(g=>g.includes('BYPASSED')).map(g=>'<tr><td colspan="2" style="padding:2px 8px;color:#d29922;">\\u21bb '+g+'</td></tr>').join('')
+      + (d.gates_failed||[]).map(g=>'<tr><td colspan="2" style="padding:2px 8px;color:#f85149;">\\u2717 '+g+'</td></tr>').join('')
+      + '</table>';
+    if (d.blocked_at) html += '<div style="margin-top:10px;padding:8px;background:rgba(248,81,73,0.1);border-radius:6px;border-left:3px solid #f85149;"><b style="color:#f85149;">Blocked:</b> ' + d.blocked_at + '</div>';
+    body.innerHTML = html;
+  } catch(e) { body.innerHTML = '<span style="color:#f85149">Error: ' + e.message + '</span>'; }
+}
+
+document.getElementById('chart-ticker').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') loadChart(this.value.trim().toUpperCase(), _currentDays);
+});
+
+// Period buttons need ticker context — re-bind them
+document.querySelectorAll('.period-btn').forEach(function(b) {
+  b.onclick = function() {
+    var days = b.textContent==='1M'?30:b.textContent==='3M'?90:b.textContent==='6M'?180:365;
+    loadChart(_currentTicker, days);
+  };
+});
+
+// Frame 1: create chart instances (gives LightweightCharts one full frame to init its canvas)
+// Frame 2: load data — by this point the canvas context is guaranteed non-null
+requestAnimationFrame(function() {
+  _createCharts();
+  requestAnimationFrame(function() { loadChart('AAPL', 90); });
+});
+</script>
+</body>
+</html>"""
+
+# Fill in nav/tape/CSS
+_CHARTS_HTML = _CHARTS_HTML.replace("{NAV_CSS}", _NAV_CSS)
+_CHARTS_HTML = _CHARTS_HTML.replace("{NAV}", _nav_html("charts"))
+_CHARTS_HTML = _CHARTS_HTML.replace("{TAPE_HTML}", _NAV_TAPE_HTML)
+_CHARTS_HTML = _CHARTS_HTML.replace("{PAGE_INFO}", _page_info_html("charts"))
+
+
+@app.get("/charts", response_class=HTMLResponse)
+def page_charts():
+    return HTMLResponse(_CHARTS_HTML)
+
+
+# Add "Charts" page info entry
+if "charts" not in _PAGE_INFO:
+    _PAGE_INFO["charts"] = (
+        '<b>Charts</b> — TradingView Lightweight Charts with daily OHLCV candlesticks, '
+        'EMA 20/50, VWAP, Fibonacci retracement levels, and AI buy/sell signal markers. '
+        'Time range: 1M / 3M / 6M / 1Y. Click <b>Full Diagnostic</b> to run the live AI gate analysis for any ticker.'
+    )
+
+# Add "📈 Charts" nav button — update _nav_html to include charts
+_orig_nav_html = _nav_html
+
+
+def _nav_html(active: str = '') -> str:
+    html = _orig_nav_html(active)
+    btn_charts = (
+        f'<a href="/charts" class="brief-btn" id="charts-btn"'
+        + (' style="border-color:#58a6ff!important;background:rgba(88,166,255,0.15)!important;"' if active == 'charts' else '')
+        + '><span class="brief-btn-title">&#128200; Charts</span>'
+        + '<span class="brief-btn-preview" id="charts-preview">Candles &middot; EMA &middot; Fibonacci</span></a>'
+    )
+    # Insert charts button after itool button
+    return html.replace(
+        '<a href="/signals"',
+        btn_charts + '<a href="/signals"',
+    )
+
+
+# Phase 2c — Chart buttons already injected above in _DIAG_BTN patch.
+# (btns += chart link added alongside the diagnose button after the info button)
+
+
+# ── Rebuild _CHARTS_HTML with updated nav (includes Charts button) ─────────────
+_CHARTS_HTML = _CHARTS_HTML.replace(_orig_nav_html("charts"), _nav_html("charts"))
