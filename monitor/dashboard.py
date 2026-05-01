@@ -304,7 +304,7 @@ def _nav_html(active: str = '') -> str:
     return (
         back +
         btn('brief',   '/morning-brief',    '&#128202;', 'Morning Brief', 'Markets &middot; Futures &middot; WSB &middot; Crypto') +
-        btn('paper',   '/paper',            '&#127918;', 'Paper Trade',   '$100k Virtual &middot; 3-Stage AI Gate') +
+        btn('paper',   '/paper/compare',     '&#127918;', 'Paper Trade',   '$100k Virtual &middot; 3-Stage AI Gate') +
         btn('r2000',   '/paper/russell2000','&#128202;', 'Russell 2000',  'Curated 49-stock small-cap watchlist') +
         btn('live',    '/live-trading',     '&#128185;', 'Live Trading',  'Schwab API &middot; Coming Soon') +
         btn('wheel',   '/wheel',            '&#127905;', 'Wheel',         'CSP &middot; Covered Call &middot; IV Rank') +
@@ -964,11 +964,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="header-nav">
     <a href="/morning-brief" class="brief-btn" id="brief-btn">&#128202; Morning Brief</a>
     <a href="/i-tool"        class="brief-btn" id="itool-btn">&#128225; I-Tool</a>
-    <a href="/paper"         class="brief-btn" id="paper-btn">&#127918; Paper Trade</a>
+    <a href="/paper/compare" class="brief-btn" id="paper-btn">&#127918; Paper Trade</a>
     <a href="/paper/russell2000" class="brief-btn" id="r2000-btn">&#128202; Russell 2000</a>
     <a href="/wheel"         class="brief-btn" id="wheel-btn">&#127905; Wheel</a>
     <a href="/signals"       class="brief-btn" id="signals-btn">&#128200; Signal Monitor</a>
-    <a href="/paper/compare" class="brief-btn" style="border-color:#30363d;background:#161b22;color:#8b949e;">&#128300; Compare</a>
   </div>
 </header>
 <div class="tape-wrap"><div class="tape-track" id="main-tape"><span class="mt-neu">Loading signals...</span></div></div>
@@ -7045,3 +7044,332 @@ def _nav_html(active: str = '') -> str:
 
 # ── Rebuild _CHARTS_HTML with updated nav (includes Charts button) ─────────────
 _CHARTS_HTML = _CHARTS_HTML.replace(_orig_nav_html("charts"), _nav_html("charts"))
+
+
+# ── Redesigned Paper Trade Dashboard (compare page) ───────────────────────────
+# Overrides the _COMPARE_HTML defined earlier.  /paper/compare now shows the
+# full 4-model view with two swim lanes per model: Open Positions + Trade History
+# grouped by date.  Main-nav "Paper Trade" button already redirected here above.
+_COMPARE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paper Trade Dashboard &mdash; NWO</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', monospace; font-size: 14px; }
+  a { color: inherit; text-decoration: none; }
+  header { background: #161b22; padding: 10px 20px; border-bottom: 1px solid #30363d;
+           display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+           position: sticky; top: 0; z-index: 100; }
+  .back-btn { padding: 4px 10px; border-radius: 5px; border: 1px solid #30363d;
+              background: #21262d; color: #8b949e; font-size: 12px; }
+  header h1 { font-size: 16px; font-weight: 700; color: #58a6ff; }
+  .hdr-btns { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .hdr-btn { padding: 4px 12px; border-radius: 5px; border: 1px solid #30363d;
+             background: #21262d; color: #8b949e; cursor: pointer; font-size: 12px; }
+  .hdr-btn:hover { color: #e6edf3; border-color: #8b949e; }
+
+  /* Model-info panel */
+  .model-info { background: #161b22; border-bottom: 1px solid #30363d; padding: 14px 20px; }
+  .info-hdr { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 10px; }
+  .info-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .info-card { background: #0d1117; border-radius: 6px; padding: 10px 12px; border-left: 3px solid #30363d; }
+  .info-card.c-std  { border-left-color: #8b949e; }
+  .info-card.c-rel  { border-left-color: #d29922; }
+  .info-card.c-vrel { border-left-color: #3fb950; }
+  .info-card.c-ai   { border-left-color: #58a6ff; }
+  .info-name { font-size: 11px; font-weight: 700; margin-bottom: 3px; }
+  .c-std .info-name  { color: #8b949e; }
+  .c-rel .info-name  { color: #d29922; }
+  .c-vrel .info-name { color: #3fb950; }
+  .c-ai .info-name   { color: #58a6ff; }
+  .info-desc { font-size: 10px; color: #8b949e; line-height: 1.5; }
+  @media (max-width: 1000px) { .info-grid { grid-template-columns: 1fr 1fr; } }
+
+  main { padding: 14px; }
+
+  /* 4 model columns */
+  .model-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 1200px) { .model-cols { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 620px)  { .model-cols { grid-template-columns: 1fr; } }
+
+  .model-col { display: flex; flex-direction: column; border-radius: 8px; overflow: hidden;
+               background: #161b22; border: 1px solid #30363d; }
+
+  /* Column header */
+  .col-hdr { padding: 10px 12px; border-bottom: 1px solid #21262d; }
+  .col-standard    .col-hdr { border-top: 3px solid #8b949e; }
+  .col-relaxed     .col-hdr { border-top: 3px solid #d29922; }
+  .col-very-relaxed .col-hdr { border-top: 3px solid #3fb950; }
+  .col-claude      .col-hdr { border-top: 3px solid #58a6ff; }
+  .col-title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; }
+  .col-title { font-size: 13px; font-weight: 700; }
+  .col-standard    .col-title { color: #8b949e; }
+  .col-relaxed     .col-title { color: #d29922; }
+  .col-very-relaxed .col-title { color: #3fb950; }
+  .col-claude      .col-title { color: #58a6ff; }
+  .col-open-link { font-size: 10px; color: #58a6ff; }
+  .col-open-link:hover { text-decoration: underline; }
+  .col-sub { font-size: 10px; color: #8b949e; margin-bottom: 8px; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px; }
+  .stat-lbl { font-size: 9px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; }
+  .stat-val { font-size: 12px; font-weight: 700; }
+  .up { color: #3fb950; } .dn { color: #f85149; } .neu { color: #8b949e; }
+
+  /* Swim lanes */
+  .swim-lane { border-top: 1px solid #21262d; display: flex; flex-direction: column; }
+  .lane-hd { padding: 5px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+             text-transform: uppercase; display: flex; align-items: center; justify-content: space-between; }
+  .lane-hd-pos  { color: #3fb950; border-top: 2px solid rgba(63,185,80,0.35);
+                  background: rgba(63,185,80,0.04); }
+  .lane-hd-hist { color: #58a6ff; border-top: 2px solid rgba(88,166,255,0.35);
+                  background: rgba(88,166,255,0.04); }
+  .lane-cnt { font-size: 9px; background: #21262d; padding: 1px 6px; border-radius: 8px;
+              color: #8b949e; font-weight: 400; letter-spacing: 0; }
+  .lane-body { max-height: 240px; overflow-y: auto; padding: 6px; display: flex;
+               flex-direction: column; gap: 3px; }
+  .lane-body::-webkit-scrollbar { width: 4px; }
+  .lane-body::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+  .lane-empty { color: #8b949e; font-size: 11px; font-style: italic; text-align: center; padding: 14px 0; }
+
+  /* Position cards */
+  .pos-card { background: #0d1117; border: 1px solid #21262d; border-radius: 5px;
+              padding: 5px 8px; }
+  .pos-top { display: flex; align-items: center; gap: 6px; }
+  .pos-ticker { font-size: 12px; font-weight: 700; }
+  .pos-pnl { margin-left: auto; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .pos-detail { font-size: 10px; color: #8b949e; margin-top: 2px; }
+
+  /* Trade history */
+  .date-hdr { font-size: 10px; font-weight: 700; color: #8b949e; padding: 5px 2px 2px;
+              border-bottom: 1px solid #21262d; margin-top: 3px; letter-spacing: 0.3px; }
+  .date-hdr:first-child { margin-top: 0; padding-top: 2px; }
+  .trade-row { display: grid; grid-template-columns: auto 1fr auto auto auto;
+               align-items: center; gap: 4px; font-size: 11px;
+               padding: 3px 2px; border-radius: 3px; }
+  .trade-row:hover { background: #1c2128; }
+  .act-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px;
+               white-space: nowrap; min-width: 30px; text-align: center; }
+  .badge-buy  { background: rgba(63,185,80,0.15); color: #3fb950;
+                border: 1px solid rgba(63,185,80,0.4); }
+  .badge-sell { background: rgba(248,81,73,0.15); color: #f85149;
+                border: 1px solid rgba(248,81,73,0.4); }
+  .tr-ticker { font-weight: 700; font-size: 11px; }
+  .tr-detail { color: #8b949e; font-size: 10px; overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; }
+  .tr-total  { font-size: 11px; color: #c9d1d9; text-align: right; white-space: nowrap; }
+  .tr-src    { font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/" class="back-btn">&#8592; Dashboard</a>
+  <h1>&#127918; Paper Trade Dashboard</h1>
+  <div class="hdr-btns">
+    <button class="hdr-btn" onclick="toggleInfo()" id="info-btn">&#8505; Model Info</button>
+    <a href="/paper/daily-report" class="hdr-btn">&#128196; Daily Report</a>
+    <a href="/paper/russell2000"  class="hdr-btn">&#128202; R2000</a>
+    <button class="hdr-btn" onclick="loadAll()">&#8635; Refresh</button>
+  </div>
+</header>
+
+<div class="model-info" id="model-info" style="display:none">
+  <div class="info-hdr">Model Philosophies</div>
+  <div class="info-grid">
+    <div class="info-card c-std">
+      <div class="info-name">Standard</div>
+      <div class="info-desc">Full 6-layer pipeline at designed thresholds. The control group &mdash; requires strong fundamentals, ensemble bull prob &ge;45%, and passing Kalman/Reynolds filters. Trades only on unambiguous evidence.</div>
+    </div>
+    <div class="info-card c-rel">
+      <div class="info-name">Relaxed &minus;25%</div>
+      <div class="info-desc">Same pipeline as Standard, all gates reduced &minus;25%. Tests whether Standard is over-cautious. Accepts moderate conviction setups. Higher expected variance.</div>
+    </div>
+    <div class="info-card c-vrel">
+      <div class="info-name">Very Relaxed &minus;50%</div>
+      <div class="info-desc">Gates halved. High-frequency trend follower &mdash; weak-signal entries with stop-loss discipline. Stress-tests minimum-threshold alpha. High drawdown expected.</div>
+    </div>
+    <div class="info-card c-ai">
+      <div class="info-name">&#129302; Claude (AI Momentum)</div>
+      <div class="info-desc">ST&times;0.35 &middot; Mom&times;0.30 &middot; Insider&times;0.20 &middot; Technical&times;0.10 &middot; Fundamentals&times;0.05. Hard VIX gate &gt;30. Built to capture trending breakouts that pure value models miss.</div>
+    </div>
+  </div>
+</div>
+
+<main>
+  <div class="model-cols" id="cols"></div>
+</main>
+
+<script>
+var MODELS = [
+  { key: 'standard',     label: 'Standard',                sub: 'Thresholds &times;1.00',                         cls: 'col-standard',     href: '/paper' },
+  { key: 'relaxed',      label: 'Relaxed &minus;25%',      sub: 'Thresholds &times;0.75',                         cls: 'col-relaxed',      href: '/paper/relaxed' },
+  { key: 'very_relaxed', label: 'Very Relaxed &minus;50%', sub: 'Thresholds &times;0.50',                         cls: 'col-very-relaxed', href: '/paper/very-relaxed' },
+  { key: 'claude',       label: '&#129302; Claude',        sub: 'ST&times;0.35 &middot; Mom&times;0.30 &middot; VIX gate', cls: 'col-claude', href: '/paper/claude' },
+];
+var _trData = {};
+
+function fmt(n, d) {
+  if (d === undefined) d = 2;
+  if (n == null) return '—';
+  return '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d});
+}
+function fmtPct(n) { return n == null ? '—' : (n >= 0 ? '+' : '') + n.toFixed(2) + '%'; }
+function cls(n) { return n > 0 ? 'up' : n < 0 ? 'dn' : 'neu'; }
+
+function fmtDateHdr(s) {
+  if (!s || s === 'unknown') return 'Unknown date';
+  var p = s.split('-');
+  var mon = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return mon[+p[1]-1] + ' ' + +p[2] + ', ' + p[0];
+}
+
+function trBadge(ticker) {
+  var d = _trData[ticker] || {};
+  var ss = d.smart_score;
+  if (ss == null) return '';
+  var bg  = ss >= 8 ? '#1a4731' : ss >= 4 ? '#3d2b00' : '#4a1519';
+  var col = ss >= 8 ? '#3fb950' : ss >= 4 ? '#d29922' : '#f85149';
+  return ' <span style="background:' + bg + ';color:' + col + ';border:1px solid ' + col
+       + ';font-size:9px;padding:1px 4px;border-radius:3px;font-weight:700">&#9733;' + ss + '</span>';
+}
+
+function buildCols() {
+  var wrap = document.getElementById('cols');
+  wrap.innerHTML = MODELS.map(function(m) {
+    return '<div class="model-col ' + m.cls + '" id="col-' + m.key + '">'
+      + '<div class="col-hdr">'
+        + '<div class="col-title-row">'
+          + '<span class="col-title">' + m.label + '</span>'
+          + '<a class="col-open-link" href="' + m.href + '">Full view &rarr;</a>'
+        + '</div>'
+        + '<div class="col-sub">' + m.sub + '</div>'
+        + '<div class="col-stats"><span style="color:#8b949e;font-size:11px">Loading&hellip;</span></div>'
+      + '</div>'
+      + '<div class="swim-lane">'
+        + '<div class="lane-hd lane-hd-pos">&#128200; Open Positions'
+          + ' <span class="lane-cnt lane-cnt-pos">&mdash;</span></div>'
+        + '<div class="lane-body lane-body-pos"><div class="lane-empty">Loading&hellip;</div></div>'
+      + '</div>'
+      + '<div class="swim-lane">'
+        + '<div class="lane-hd lane-hd-hist">&#128203; Trade History'
+          + ' <span class="lane-cnt lane-cnt-hist">&mdash;</span></div>'
+        + '<div class="lane-body lane-body-hist"><div class="lane-empty">Loading&hellip;</div></div>'
+      + '</div>'
+    + '</div>';
+  }).join('');
+}
+
+function renderCol(m, acct, trades) {
+  var colEl = document.getElementById('col-' + m.key);
+  if (!colEl) return;
+
+  // ── Account stats ──────────────────────────────────────────────────────────
+  var statsEl = colEl.querySelector('.col-stats');
+  var pC = cls(acct.total_pnl || 0), dC = cls(acct.daily_pnl || 0);
+  var pS = (acct.total_pnl || 0) >= 0 ? '+' : '', dS = (acct.daily_pnl || 0) >= 0 ? '+' : '';
+  statsEl.innerHTML =
+    '<div class="stat-grid">'
+    + '<div><div class="stat-lbl">Equity</div>'
+      + '<div class="stat-val neu">' + fmt(acct.total_equity, 0) + '</div></div>'
+    + '<div><div class="stat-lbl">Cash</div>'
+      + '<div class="stat-val neu">' + fmt(acct.cash, 0) + '</div></div>'
+    + '<div><div class="stat-lbl">Total P&amp;L</div>'
+      + '<div class="stat-val ' + pC + '">' + pS + fmt(acct.total_pnl, 0)
+      + ' <span style="font-size:10px;font-weight:400">(' + fmtPct(acct.total_pnl_pct) + ')</span></div></div>'
+    + '<div><div class="stat-lbl">Daily P&amp;L</div>'
+      + '<div class="stat-val ' + dC + '">' + dS + fmt(acct.daily_pnl, 0)
+      + ' <span style="font-size:10px;font-weight:400">(' + fmtPct(acct.daily_pnl_pct) + ')</span></div></div>'
+    + '</div>';
+
+  // ── Open Positions swim lane ───────────────────────────────────────────────
+  var posEl  = colEl.querySelector('.lane-body-pos');
+  var posCnt = colEl.querySelector('.lane-cnt-pos');
+  var positions = acct.positions || [];
+  if (posCnt) posCnt.textContent = positions.length;
+  if (!positions.length) {
+    posEl.innerHTML = '<div class="lane-empty">No open positions</div>';
+  } else {
+    posEl.innerHTML = positions.map(function(p) {
+      var pC2 = cls(p.pnl || 0);
+      var pStr = (p.pnl >= 0 ? '+' : '') + fmt(p.pnl) + ' (' + fmtPct(p.pnl_pct) + ')';
+      return '<div class="pos-card">'
+        + '<div class="pos-top">'
+          + '<span class="pos-ticker">' + p.ticker + trBadge(p.ticker) + '</span>'
+          + '<span class="pos-pnl ' + pC2 + '">' + pStr + '</span>'
+        + '</div>'
+        + '<div class="pos-detail">'
+          + p.qty + ' sh &nbsp;&middot;&nbsp; avg ' + fmt(p.avg_cost)
+          + ' &rarr; ' + fmt(p.cur_price)
+        + '</div>'
+      + '</div>';
+    }).join('');
+  }
+
+  // ── Trade History swim lane (grouped by date, newest first) ───────────────
+  var histEl  = colEl.querySelector('.lane-body-hist');
+  var histCnt = colEl.querySelector('.lane-cnt-hist');
+  var tradeArr = trades || [];
+  if (histCnt) histCnt.textContent = tradeArr.length;
+  if (!tradeArr.length) {
+    histEl.innerHTML = '<div class="lane-empty">No trades yet</div>';
+    return;
+  }
+  var groups = {}, order = [];
+  tradeArr.forEach(function(t) {
+    var dt = t.timestamp ? t.timestamp.slice(0, 10) : 'unknown';
+    if (!groups[dt]) { groups[dt] = []; order.push(dt); }
+    groups[dt].push(t);
+  });
+  var html = '';
+  order.forEach(function(dateStr) {
+    html += '<div class="date-hdr">' + fmtDateHdr(dateStr) + '</div>';
+    groups[dateStr].forEach(function(t) {
+      var isBuy = t.action === 'BUY';
+      var src  = t.signal === 'MANUAL' ? '&#128100;' : '&#129302;';
+      var timeStr = t.timestamp ? t.timestamp.slice(11, 16) : '';
+      html += '<div class="trade-row">'
+        + '<span class="act-badge ' + (isBuy ? 'badge-buy' : 'badge-sell') + '">' + t.action + '</span>'
+        + '<span class="tr-ticker">' + t.ticker + '</span>'
+        + '<span class="tr-detail">' + t.qty + 'sh @ ' + fmt(t.price) + (timeStr ? ' ' + timeStr : '') + '</span>'
+        + '<span class="tr-total">' + fmt(Math.abs(t.total || 0), 0) + '</span>'
+        + '<span class="tr-src">' + src + '</span>'
+        + '</div>';
+    });
+  });
+  histEl.innerHTML = html;
+}
+
+async function loadModel(m) {
+  try {
+    var results = await Promise.all([
+      fetch('/api/paper/account?model=' + m.key).then(function(r) { return r.json(); }),
+      fetch('/api/paper/trades?model='  + m.key).then(function(r) { return r.json(); }),
+    ]);
+    renderCol(m, results[0], results[1]);
+  } catch(e) {
+    var el = document.getElementById('col-' + m.key);
+    if (el) el.querySelector('.col-stats').innerHTML =
+      '<span style="color:#f85149;font-size:11px">Error: ' + e.message + '</span>';
+  }
+}
+
+async function loadAll() {
+  try { _trData = await fetch('/api/tipranks/all').then(function(r) { return r.json(); }); } catch(e) {}
+  await Promise.all(MODELS.map(function(m) { return loadModel(m); }));
+}
+
+function toggleInfo() {
+  var el  = document.getElementById('model-info');
+  var btn = document.getElementById('info-btn');
+  if (el.style.display === 'none') { el.style.display = 'block'; btn.textContent = '✕ Hide Info'; }
+  else { el.style.display = 'none'; btn.textContent = 'ℹ Model Info'; }
+}
+
+buildCols();
+loadAll();
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>"""
