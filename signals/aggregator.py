@@ -35,6 +35,7 @@ from signals.market_microstructure import VWAPResult, VolumeProfileResult, VIXRe
 from signals.momentum import MomentumAnalyzer, MomentumResult
 from signals.supertrend import SuperTrendAnalyzer, SuperTrendResult
 from signals.tipranks_signal import TipRanksResult
+from signals.three_green_arrows import ThreeGreenArrowsResult
 
 
 @dataclass
@@ -102,18 +103,28 @@ class AggregatedSignal:
     tipranks_smart_score: Optional[int] = None
     tipranks_buy_pct: Optional[float] = None
 
+    # 3 Green Arrows fields (ThinkorSwim emulation)
+    tga_arrows_count: int = 0         # 0-3 primary arrows active
+    tga_signal: str = "neutral"       # "buy" | "watch" | "neutral"
+    tga_sma_arrow: bool = False
+    tga_macd_arrow: bool = False
+    tga_stoch_arrow: bool = False
+    tga_volume_spike: bool = False
+    tga_reason: str = ""
+
 
 # Signal weights (must sum to 1.0)
-# Rebalanced to add momentum + SuperTrend + TipRanks
+# Rebalanced to add momentum + SuperTrend + TipRanks + 3GA
 SIGNAL_WEIGHTS = {
     "fundamentals": 0.22,
     "momentum":     0.20,   # RVOL, MACD, MA stack, 52w breakout
-    "insider":      0.18,
-    "technical":    0.15,
+    "insider":      0.17,   # Form 4 cluster buys
+    "technical":    0.13,   # Fib + VWAP composite
     "supertrend":   0.10,   # ATR trend direction + TP favourability
     "tipranks":     0.10,   # Smart Score + analyst consensus
-    "cycle":        0.03,   # FFT cycles (confirmation only)
-    "volume":       0.02,   # Volume profile (confirmation only)
+    "tga":          0.05,   # 3 Green Arrows (SMA cross, MACD, Stochastic)
+    "cycle":        0.02,   # FFT cycles (confirmation only)
+    "volume":       0.01,   # Volume profile POC/Value Area
 }
 
 # Buy signal threshold — must match L3 reclassification threshold in filter_engine.py
@@ -241,6 +252,12 @@ class SignalAggregator:
         if tr is None:
             return 0.0
         return max(-1.0, min(1.0, tr.composite_score))
+
+    def _normalize_tga_score(self, tga: Optional[ThreeGreenArrowsResult]) -> float:
+        """3 Green Arrows: arrows_count 0-3 → -0.2 to +1.0."""
+        if tga is None:
+            return 0.0
+        return {3: 1.0, 2: 0.4, 1: 0.0, 0: -0.2}.get(tga.arrows_count, 0.0)
 
     def _normalize_supertrend_score(self, st: Optional[SuperTrendResult]) -> float:
         """SuperTrend direction + TP favourability → -1.0 to +1.0."""
@@ -375,6 +392,7 @@ class SignalAggregator:
         momentum: Optional[MomentumResult] = None,
         supertrend: Optional[SuperTrendResult] = None,  # ATR trend + TP favourability
         tipranks: Optional[TipRanksResult] = None,      # Smart Score + analyst consensus
+        tga: Optional[ThreeGreenArrowsResult] = None,   # 3 Green Arrows (TOS emulation)
         floor_fundamentals: bool = False,   # AI Watch override: floor f_score at 0
         buy_threshold_override: float = None,  # Per-model threshold (None = use BUY_THRESHOLD)
     ) -> AggregatedSignal:
@@ -408,6 +426,9 @@ class SignalAggregator:
         # TipRanks score
         tr_score = self._normalize_tipranks_score(tipranks)
 
+        # 3 Green Arrows score
+        tga_score = self._normalize_tga_score(tga)
+
         # Momentum-aware fundamental floor: for non-investable tickers with strong
         # momentum signals, soften the -0.5 penalty to 0.0 so momentum/breakout
         # plays aren't permanently blocked by pure value criteria.
@@ -423,6 +444,7 @@ class SignalAggregator:
             "technical":    t_score,
             "supertrend":   st_score,
             "tipranks":     tr_score,
+            "tga":          tga_score,
             "cycle":        c_score,
             "volume":       v_score,
         }
@@ -456,23 +478,36 @@ class SignalAggregator:
         tp1 = tp2 = None
         rr_ratio = None
 
+        # ATR available for both paths — compute once here.
+        _atr = supertrend.atr if (supertrend and supertrend.atr > 0) else None
+
         if fib and current_price and fib.stop_loss_level:
             stop_loss = fib.stop_loss_level
             tp1 = fib.take_profit_1
             tp2 = fib.take_profit_2
 
+            # ATR floor: Fibonacci stops can be as tight as 1–3%.
+            # During normal volatility a 2× ATR stop keeps the trade alive through
+            # daily fluctuations without eating into the signal.
+            if _atr and stop_loss:
+                min_stop_dist = 2.0 * _atr
+                if (current_price - stop_loss) < min_stop_dist:
+                    stop_loss = round(current_price - min_stop_dist, 2)
+
             if stop_loss and tp1 and current_price:
                 risk   = current_price - stop_loss
                 reward = tp1 - current_price
                 if risk > 0:
-                    rr_ratio = reward / risk
+                    rr_ratio = round(reward / risk, 2)
 
         elif current_price and analysis.current_price:
-            # Fallback: 3% stop, 9% target (3:1 R/R)
-            stop_loss = current_price * 0.97
+            # ATR-scaled stop: 2.5× ATR gives each stock room proportional to its volatility.
+            # Fallback to 5% when SuperTrend ATR isn't available. Floor at -15%.
+            _stop_dist = (2.5 * _atr) if _atr else (current_price * 0.05)
+            stop_loss = round(max(current_price - _stop_dist, current_price * 0.85), 2)
             tp1       = current_price * 1.09
             tp2       = current_price * 1.15
-            rr_ratio  = 3.0
+            rr_ratio  = round((tp1 - current_price) / _stop_dist, 2) if _stop_dist > 0 else 3.0
 
         # ── Narrative ────────────────────────────────────────────
         why_buy, why_wait, risks = self._build_narrative(analysis, fib, vwap, insider, fft, vol_profile)
@@ -484,8 +519,8 @@ class SignalAggregator:
         logger.info(
             f"[AGG] {analysis.ticker} scores: "
             f"F={f_score:.2f} M={m_score:.2f} I={i_score:.2f} T={t_score:.2f} "
-            f"ST={st_score:.2f} TR={tr_score:.2f} C={c_score:.2f} V={v_score:.2f} "
-            f"| I-Tool={itool_signal or 'n/a'}"
+            f"ST={st_score:.2f} TR={tr_score:.2f} TGA={tga_score:.2f}({tga.arrows_count if tga else 0}/3) "
+            f"C={c_score:.2f} V={v_score:.2f} | I-Tool={itool_signal or 'n/a'}"
         )
 
         rvol_val = vol_profile.rvol if vol_profile else (momentum.rvol if momentum else 1.0)
@@ -535,6 +570,13 @@ class SignalAggregator:
             tipranks_score=tr_score,
             tipranks_smart_score=tipranks.smart_score if tipranks else None,
             tipranks_buy_pct=tipranks.buy_pct if tipranks else None,
+            tga_arrows_count=tga.arrows_count if tga else 0,
+            tga_signal=tga.signal if tga else "neutral",
+            tga_sma_arrow=tga.sma_arrow if tga else False,
+            tga_macd_arrow=tga.macd_arrow if tga else False,
+            tga_stoch_arrow=tga.stoch_arrow if tga else False,
+            tga_volume_spike=tga.volume_spike if tga else False,
+            tga_reason=tga.reason if tga else "",
         )
 
 class ClaudeMomentumAggregator(SignalAggregator):
@@ -553,8 +595,10 @@ class ClaudeMomentumAggregator(SignalAggregator):
         "fundamentals": 0.05,
         "momentum":     0.30,
         "insider":      0.20,
-        "technical":    0.10,
+        "technical":    0.08,
         "supertrend":   0.35,
+        "tipranks":     0.00,
+        "tga":          0.02,
         "cycle":        0.00,
         "volume":       0.00,
     }
@@ -566,12 +610,12 @@ class ClaudeMomentumAggregator(SignalAggregator):
     def aggregate(self, analysis, fft=None, fib=None, insider=None, vwap=None,
                   vol_profile=None, vix_regime=None, current_price=None,
                   itool_signal=None, momentum=None, supertrend=None,
-                  tipranks=None, floor_fundamentals=True, buy_threshold_override=None):
+                  tipranks=None, tga=None, floor_fundamentals=True, buy_threshold_override=None):
         result = super().aggregate(
             analysis=analysis, fft=fft, fib=fib, insider=insider,
             vwap=vwap, vol_profile=vol_profile, vix_regime=vix_regime,
             current_price=current_price, itool_signal=itool_signal,
-            momentum=momentum, supertrend=supertrend, tipranks=tipranks,
+            momentum=momentum, supertrend=supertrend, tipranks=tipranks, tga=tga,
             floor_fundamentals=True,
             buy_threshold_override=buy_threshold_override,
         )

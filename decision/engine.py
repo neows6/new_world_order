@@ -67,6 +67,17 @@ from decision.quantum_kalman import QuantumStateAnalyzer, KalmanPriceFilter, Qua
 from decision.ensemble_kelly import EnsembleKellyEngine, EnsembleForecastResult
 
 
+def _ema_value(values: list, period: int) -> Optional[float]:
+    """Wilder/exponential moving average of the last `period` bars. Returns None if insufficient data."""
+    if not values or len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = float(values[0])
+    for v in values[1:]:
+        ema = float(v) * k + ema * (1 - k)
+    return ema
+
+
 @dataclass
 class DecisionResult:
     """
@@ -248,6 +259,8 @@ class DecisionEngine:
         ensemble: EnsembleForecastResult,
         rr_ratio: float,
         bypass_gates: set = None,
+        closes: list = None,
+        current_price: float = None,
     ) -> tuple:
         """
         Run all decision gates.
@@ -278,6 +291,11 @@ class DecisionEngine:
                 passed.append(f"Reynolds: TRANSIENT flow (Re={reynolds.reynolds_number:.2f}) — acceptable, normal sizing")
             else:
                 passed.append(f"Reynolds: TURBULENT (Re={reynolds.reynolds_number:.2f}) — passing but position size reduced to 40%")
+        elif reynolds.reynolds_number <= self.MAX_REYNOLDS:
+            # Re > 5.0 but within this model's extended threshold — allow with reduced sizing
+            reynolds.allow_entry = True
+            reynolds.position_multiplier = 0.10
+            passed.append(f"Reynolds: EXTENDED (Re={reynolds.reynolds_number:.2f} ≤ {self.MAX_REYNOLDS:.1f} model max) — size capped at 10%")
         else:
             failed.append(f"Reynolds: EXTREME TURBULENCE (Re={reynolds.reynolds_number:.2f}) — market too chaotic, no entry (bypass 'Re' to override)")
             blocker = blocker or f"Market in extreme turbulence (Re={reynolds.reynolds_number:.2f}) — wait for calmer conditions"
@@ -353,6 +371,29 @@ class DecisionEngine:
                 f"Composite signal is {layer3.adjusted_signal.upper()} — "
                 f"overall momentum/fundamental score is below the buy threshold. "
                 f"Gate overrides do not affect this gate. Wait for a stronger signal."
+            )
+
+        # Gate 8: EMA(10) trend filter — price must be at or above the 10-day EMA.
+        # Prevents buying mid-plunge when short-term momentum is negative.
+        # Bypass key: 'ema'
+        ema10 = _ema_value(closes, 10) if closes and len(closes) >= 10 else None
+        if 'ema' in _bypass:
+            passed.append(f"Trend filter: BYPASSED (EMA10 gate) — user override")
+        elif ema10 is None or current_price is None:
+            passed.append("Trend filter: skipped — insufficient price history")
+        elif current_price >= ema10 * 0.995:
+            passed.append(
+                f"Trend filter: ${current_price:.2f} >= EMA(10) ${ema10:.2f} — entry with trend"
+            )
+        else:
+            failed.append(
+                f"Trend filter: ${current_price:.2f} < EMA(10) ${ema10:.2f} "
+                f"({(current_price/ema10 - 1)*100:+.1f}%) — buying into downtrend "
+                f"(bypass 'ema' to override)"
+            )
+            blocker = blocker or (
+                f"Price ${current_price:.2f} is below its 10-day EMA ${ema10:.2f} — "
+                f"short-term trend is down; wait for price to reclaim EMA or use 'ema' bypass"
             )
 
         go_no_go = len(failed) == 0 and blocker is None
@@ -493,6 +534,8 @@ class DecisionEngine:
             layer3_result, reynolds_result, quantum_result,
             kalman_result, ensemble_result, rr_ratio,
             bypass_gates=bypass_gates,
+            closes=closes,
+            current_price=current_price,
         )
 
         # ── 6. Position specification ──────────────────────────────
@@ -606,6 +649,13 @@ class DecisionEngine:
                         "rvol": getattr(agg, "rvol", 1.0),
                         "is_52w_breakout": getattr(agg, "is_52w_breakout", False),
                         "macd_signal_direction": getattr(agg, "macd_signal_direction", "neutral"),
+                        "tga_arrows": getattr(agg, "tga_arrows_count", 0),
+                        "tga_signal": getattr(agg, "tga_signal", "neutral"),
+                        "tga_sma": getattr(agg, "tga_sma_arrow", False),
+                        "tga_macd": getattr(agg, "tga_macd_arrow", False),
+                        "tga_stoch": getattr(agg, "tga_stoch_arrow", False),
+                        "tga_vol": getattr(agg, "tga_volume_spike", False),
+                        "tga_reason": getattr(agg, "tga_reason", ""),
                         "reynolds_regime": result.reynolds_regime,
                         "quantum_state": result.quantum_dominant_state,
                         "p_bull": result.ensemble_probability_bull,

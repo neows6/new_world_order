@@ -84,6 +84,30 @@ NEWS_FEEDS = [
 
 # ── Helpers ───────────────────────────────────────────────────
 
+def _fetch_index_sparklines() -> dict:
+    """Fetch 30-day daily close history for the main US indices — used for sparklines."""
+    sparklines = {}
+    syms = {"S&P 500": "^GSPC", "Dow": "^DJI", "Nasdaq": "^IXIC", "VIX": "^VIX"}
+    try:
+        df = yf.download(list(syms.values()), period="35d", interval="1d",
+                         progress=False, threads=True)
+        closes = df["Close"] if "Close" in df else df.get("close")
+        if closes is None:
+            return sparklines
+        for name, sym in syms.items():
+            try:
+                col = closes[sym] if sym in closes.columns else closes.get(sym)
+                if col is not None:
+                    vals = [round(float(v), 2) for v in col.dropna().tolist()[-30:]]
+                    if vals:
+                        sparklines[name] = vals
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"Index sparkline fetch failed: {e}")
+    return sparklines
+
+
 def _safe_fetch(symbols: dict, period: str = "2d", interval: str = "1d") -> dict:
     """Download yfinance data for a group of symbols, return clean dict."""
     results = {}
@@ -367,16 +391,17 @@ Be direct. No filler. Institutional tone. Use <span class="up"> for positive num
 
         # Fetch all data in sequence (yfinance handles internal threading)
         raw = {
-            "generated_at":    datetime.utcnow().isoformat(),
-            "indices":         _safe_fetch(INDICES),
-            "futures":         _safe_fetch(FUTURES),
-            "global_markets":  _safe_fetch(GLOBAL),
-            "commodities":     _safe_fetch(COMMODITIES),
-            "crypto":          _safe_fetch(CRYPTO),
-            "rates":           _safe_fetch(RATES),
-            "headlines":       _fetch_news(),
-            "wsb":             _fetch_wsb_sentiment(),
-            "congress_trades": _fetch_congress_trades(),
+            "generated_at":     datetime.utcnow().isoformat(),
+            "indices":          _safe_fetch(INDICES),
+            "futures":          _safe_fetch(FUTURES),
+            "global_markets":   _safe_fetch(GLOBAL),
+            "commodities":      _safe_fetch(COMMODITIES),
+            "crypto":           _safe_fetch(CRYPTO),
+            "rates":            _safe_fetch(RATES),
+            "headlines":        _fetch_news(),
+            "wsb":              _fetch_wsb_sentiment(),
+            "congress_trades":  _fetch_congress_trades(),
+            "indices_sparklines": _fetch_index_sparklines(),
         }
 
         # AI narrative — Gemini primary, Anthropic fallback, empty if no key

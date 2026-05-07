@@ -36,6 +36,9 @@ app = FastAPI(title="NWO Monitor", docs_url=None, redoc_url=None)
 from monitor.wheel import wheel_router
 app.include_router(wheel_router)
 
+from monitor.alfred import alfred_router
+app.include_router(alfred_router)
+
 # ── Mount signals dashboard under /signals ────────────────────────────────────
 from monitor.signals_dashboard import app as _signals_app, _latest_signals as _get_live_signals
 app.mount("/signals", _signals_app)
@@ -241,6 +244,13 @@ def _recent_signals(limit: int = 50) -> list:
                 "rvol":                 rsn.get("rvol", 1.0),
                 "is_52w_breakout":      rsn.get("is_52w_breakout", False),
                 "macd_direction":       rsn.get("macd_signal_direction", "neutral"),
+                "tga_arrows":           rsn.get("tga_arrows", 0),
+                "tga_signal":           rsn.get("tga_signal", "neutral"),
+                "tga_sma":              rsn.get("tga_sma", False),
+                "tga_macd":             rsn.get("tga_macd", False),
+                "tga_stoch":            rsn.get("tga_stoch", False),
+                "tga_vol":              rsn.get("tga_vol", False),
+                "tga_reason":           rsn.get("tga_reason", ""),
                 # If signal IS a buy, it passed all gates — treat as approved regardless of stale JSON
                 "approved":             (s.signal or "").upper() in ("BUY", "STRONG_BUY") or rsn.get("approved", False),
                 "why_buy":              rsn.get("why_buy", ""),
@@ -272,6 +282,10 @@ _PAGE_INFO = {
                 'Reynolds filter, Quantum score, Ensemble, Risk/Reward, Kalman trend, momentum, RVOL. '
                 'One row per watchlist ticker — current state only. '
                 'Distinct from <i>AI Signal History</i> on the main page (that is a chronological event log; this shows now).'),
+    'alfred':  ('<b>Alfred</b> — CME futures 5-day high/low forecasting dashboard for /ES, /MES, /NQ, /MNQ. '
+                'ATR&times;&radic;N range model with VIX-regime scaling, RSI/MACD/SuperTrend bias, and TipRanks analyst targets (SPY/QQQ proxy). '
+                'Refreshes every 5&nbsp;min during futures hours. Daily anchor tracks forecast revisions. '
+                'Walk-forward backtest calibrates multipliers to 70% containment. Designed for selling naked calls and cash-secured puts.'),
 }
 
 
@@ -293,7 +307,7 @@ def _page_info_html(key: str) -> str:
 
 def _nav_html(active: str = '') -> str:
     """Shared nav bar. active = 'brief'|'paper'|'r2000'|'live'|'wheel'|'itool'|'signals'"""
-    back = ('<a href="/" style="padding:5px 12px;border-radius:6px;border:1px solid #30363d;'
+    back = ('<a href="/" class="nav-back-link" style="padding:5px 12px;border-radius:6px;border:1px solid #30363d;'
             'background:#21262d;color:#8b949e;text-decoration:none;font-size:12px;'
             'white-space:nowrap;align-self:center;">&#8592; NWO Monitor</a>')
     def btn(key, href, emoji, label, preview_text):
@@ -301,16 +315,26 @@ def _nav_html(active: str = '') -> str:
         return (f'<a href="{href}" class="brief-btn" id="{key}-btn"{hi}>'
                 f'<span class="brief-btn-title">{emoji} {label}</span>'
                 f'<span class="brief-btn-preview" id="{key}-preview">{preview_text}</span></a>')
-    return (
-        back +
-        btn('brief',   '/morning-brief',    '&#128202;', 'Morning Brief', 'Markets &middot; Futures &middot; WSB &middot; Crypto') +
-        btn('paper',   '/paper/compare',     '&#127918;', 'Paper Trade',   '$100k Virtual &middot; 3-Stage AI Gate') +
-        btn('r2000',   '/paper/russell2000','&#128202;', 'Russell 2000',  'Curated 49-stock small-cap watchlist') +
-        btn('live',    '/live-trading',     '&#128185;', 'Live Trading',  'Schwab API &middot; Coming Soon') +
-        btn('wheel',   '/wheel',            '&#127905;', 'Wheel',         'CSP &middot; Covered Call &middot; IV Rank') +
-        btn('itool',   '/i-tool',           '&#128225;', 'I-Tool',        'S&amp;P 500 Technical Scanner') +
-        btn('signals', '/signals',          '&#128200;', 'Signal Monitor','Gates &middot; Momentum &middot; RVOL &middot; Kalman')
+    burger = (
+        '<button class="nav-burger" aria-label="Menu"'
+        ' onclick="(function(b){var h=b.closest(\'header\');if(h)h.classList.toggle(\'nav-open\');})(this)"'
+        '>&#9776;</button>'
     )
+    links = (
+        '<div class="nav-links">'
+        + back
+        + btn('brief',   '/morning-brief',    '&#128202;', 'Morning Brief', 'Markets &middot; Futures &middot; WSB &middot; Crypto')
+        + btn('paper',   '/paper/compare',     '&#127918;', 'Paper Trade',   '$100k Virtual &middot; 3-Stage AI Gate')
+        + btn('r2000',   '/paper/russell2000','&#128202;', 'Russell 2000',  'Curated 49-stock small-cap watchlist')
+        + btn('live',    '/live-trading',     '&#128185;', 'Live Trading',  'Schwab API &middot; Coming Soon')
+        + btn('wheel',   '/wheel',            '&#127905;', 'Wheel',         'CSP &middot; Covered Call &middot; IV Rank')
+        + btn('itool',   '/i-tool',           '&#128225;', 'I-Tool',        'S&amp;P 500 Technical Scanner')
+        + btn('charts',  '/charts',           '&#128200;', 'Charts',        'Candles &middot; EMA &middot; TGA Panel')
+        + btn('signals', '/signals',          '&#128200;', 'Signal Monitor','Gates &middot; Momentum &middot; RVOL &middot; Kalman')
+        + btn('alfred',  '/alfred',           '&#128270;', 'Alfred',        'CME Futures &middot; 5-Day Forecast &middot; Backtest')
+        + '</div>'
+    )
+    return burger + links
 
 
 _NAV_CSS = """
@@ -349,6 +373,28 @@ _NAV_CSS = """
   .page-info-bar.pib-collapsed .page-info-content { display: none; }
   .pib-arrow { display: inline-block; transition: transform 0.2s; font-size: 10px; margin-left: auto; }
   .page-info-bar.pib-collapsed .pib-arrow { transform: rotate(-90deg); }
+  /* ── Nav: desktop layout ─────────────────────────────────────── */
+  .nav-links { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .nav-burger { display: none; align-items: center; justify-content: center;
+                min-width: 34px; height: 30px; padding: 0 10px;
+                background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+                color: #e6edf3; font-size: 18px; cursor: pointer; flex-shrink: 0; }
+  /* ── Mobile nav ──────────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    .nav-burger { display: flex; }
+    .nav-links { display: none; flex-direction: column; gap: 4px; order: 99;
+                 width: 100%; padding-top: 8px; margin-top: 4px;
+                 border-top: 1px solid #21262d; }
+    header.nav-open .nav-links { display: flex; }
+    .brief-btn { width: 100%; }
+    .brief-btn-preview { white-space: normal; }
+    #model-nav { overflow-x: auto; flex-wrap: nowrap !important;
+                 margin-left: 0 !important; width: 100%; padding-bottom: 2px;
+                 scrollbar-width: none; }
+    #model-nav::-webkit-scrollbar { display: none; }
+    header { padding: 8px 12px !important; }
+    header h1 { font-size: 15px !important; }
+  }
 """
 
 _NAV_TAPE_HTML = (
@@ -376,7 +422,8 @@ _NAV_TAPE_JS = """<script>
     'live-btn':    '<b>Live Trading</b> \u2014 <span style="color:#d29922">&#9888; Coming Soon.</span> Real Schwab Trader API execution using the identical 6-layer pipeline. Dry-run stays ON until the account owner explicitly enables it. All risk controls enforced.',
     'wheel-btn':   '<b>Wheel Strategy</b> \u2014 Options income scanner. Screens top-100 S&amp;P 500 for IV\u00a0Rank\u00a0&gt;50%, 30\u0394 CSP at 30\u201345\u00a0DTE, spread\u00a0&lt;5% of mid. Tracks CSP \u2192 Shares \u2192 Covered Call \u2192 Closed.',
     'itool-btn':   '<b>I-Tool</b> \u2014 S&amp;P 500 technical scanner: Fibonacci, VWAP, RSI, MACD, Bollinger Bands. Sortable columns. +S1/+S2 buttons push directly to Stage Gate. Scan cache persists between visits. Does not run the AI fundamental pipeline.',
-    'signals-btn': '<b>Signal Monitor</b> \u2014 Live per-ticker AI gate breakdown: Reynolds, Quantum, Ensemble, R/R, Kalman, momentum, RVOL. One row per ticker \u2014 current state only. Distinct from AI Signal History on the main page (that is a chronological event log).'
+    'signals-btn': '<b>Signal Monitor</b> \u2014 Live per-ticker AI gate breakdown: Reynolds, Quantum, Ensemble, R/R, Kalman, momentum, RVOL. One row per ticker \u2014 current state only. Distinct from AI Signal History on the main page (that is a chronological event log).',
+    'alfred-btn':  '<b>Alfred</b> \u2014 CME futures 5-day high/low forecast for /ES, /MES, /NQ, /MNQ. ATR\u00d7\u221aN model with VIX-regime scaling, RSI/MACD/SuperTrend bias &amp; TipRanks analyst targets (SPY/QQQ proxy). Updated every 5\u00a0min. Daily anchor tracks revisions. Backtest-calibrated to 70% containment.'
   };
   var activeKey = '';
   Object.keys(INFO).forEach(function(k) {
@@ -967,7 +1014,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <a href="/paper/compare" class="brief-btn" id="paper-btn">&#127918; Paper Trade</a>
     <a href="/paper/russell2000" class="brief-btn" id="r2000-btn">&#128202; Russell 2000</a>
     <a href="/wheel"         class="brief-btn" id="wheel-btn">&#127905; Wheel</a>
+    <a href="/charts"        class="brief-btn" id="charts-btn">&#128200; Charts</a>
     <a href="/signals"       class="brief-btn" id="signals-btn">&#128200; Signal Monitor</a>
+    <a href="/alfred"        class="brief-btn" id="alfred-btn">&#128270; Alfred</a>
   </div>
 </header>
 <div class="tape-wrap"><div class="tape-track" id="main-tape"><span class="mt-neu">Loading signals...</span></div></div>
@@ -1348,8 +1397,16 @@ function renderSignals(signals) {
       ? ` <span style="background:${_ssBg};color:${_ssCol};border:1px solid ${_ssCol};font-size:9px;padding:1px 5px;border-radius:3px;vertical-align:middle;font-weight:700" title="${_ssTip}">&#9733;${_ss}</span>`
       : '';
 
+    // 3 Green Arrows badge
+    const _tgaN = s.tga_arrows || 0;
+    const _tgaCol = _tgaN === 3 ? '#3fb950' : _tgaN === 2 ? '#d29922' : '#30363d';
+    const _tgaTip = `3GA: SMA${s.tga_sma?'✓':'✗'} MACD${s.tga_macd?'✓':'✗'} Stoch${s.tga_stoch?'✓':'✗'}` + (s.tga_reason ? ` | ${s.tga_reason}` : '');
+    const tgaBadge = _tgaN > 0
+      ? ` <span style="color:${_tgaCol};font-size:10px;letter-spacing:-1px;vertical-align:middle" title="${_tgaTip}">${'▲'.repeat(_tgaN)}${'▽'.repeat(3-_tgaN)}</span>`
+      : '';
+
     html += `<tr${!_isPrimary ? ` class="sig-hist-row" data-ticker="${s.ticker}" style="display:none;opacity:0.75"` : ''}>
-      <td><strong>${s.ticker}</strong>${aiWatchBadge}${trBadge}${acted}${_isPrimary && _hasHistory ? `<span onclick="toggleSigHistory('${s.ticker}')" style="cursor:pointer;color:#8b949e;font-size:10px;margin-left:5px;user-select:none" title="${_grp[_tk].length-1} older entr${_grp[_tk].length>2?'ies':'y'}">&#9654;</span>` : ''}</td>
+      <td><strong>${s.ticker}</strong>${aiWatchBadge}${trBadge}${tgaBadge}${acted}${_isPrimary && _hasHistory ? `<span onclick="toggleSigHistory('${s.ticker}')" style="cursor:pointer;color:#8b949e;font-size:10px;margin-left:5px;user-select:none" title="${_grp[_tk].length-1} older entr${_grp[_tk].length>2?'ies':'y'}">&#9654;</span>` : ''}</td>
       <td class="${origCls}">${dispSignal}</td>
       <td style="min-width:110px">${compositeCell}</td>
       <td style="min-width:100px">${momentumCell}</td>
@@ -2007,12 +2064,46 @@ function buildHeadlines(headlines) {
 let _pollTimer = null;
 let _lastGenTime = null;
 
+function svgSparkline(vals, w, h) {
+  w = w || 80; h = h || 28;
+  if (!vals || vals.length < 2) return '';
+  var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
+  var rng = mx - mn || 1;
+  var pts = vals.map(function(v, i) {
+    return (i * (w / (vals.length - 1))).toFixed(1) + ',' + (h - (v - mn) / rng * (h - 2) - 1).toFixed(1);
+  }).join(' ');
+  var col = vals[vals.length - 1] >= vals[0] ? '#3fb950' : '#f85149';
+  return '<svg width="' + w + '" height="' + h + '" style="vertical-align:middle;margin-left:8px;flex-shrink:0">'
+       + '<polyline points="' + pts + '" fill="none" stroke="' + col + '" stroke-width="1.5" stroke-linejoin="round"/>'
+       + '</svg>';
+}
+
+function buildIndicesWithSparklines(indices, sparklines) {
+  if (!indices || !Object.keys(indices).length) return '<p class="neu">No index data.</p>';
+  var sp = sparklines || {};
+  var rows = Object.entries(indices).map(function(e) {
+    var name = e[0], v = e[1];
+    if (!v) return '';
+    var pct = v.pct || 0, cls = pct > 0 ? 'pos' : pct < 0 ? 'neg' : 'neu';
+    var sign = pct > 0 ? '+' : '';
+    var price = v.price > 1000 ? v.price.toLocaleString('en-US', {maximumFractionDigits:2}) : v.price.toFixed(2);
+    var spark = svgSparkline(sp[name]);
+    return '<tr>'
+      + '<td style="white-space:nowrap">' + name + '</td>'
+      + '<td>' + price + '</td>'
+      + '<td class="' + cls + '">' + sign + pct.toFixed(2) + '%</td>'
+      + '<td>' + spark + '</td>'
+      + '</tr>';
+  }).join('');
+  return '<table>' + rows + '</table>';
+}
+
 function renderBrief(d) {
   const gt = d.generated_at ? new Date(d.generated_at + 'Z').toLocaleString('en-US', {timeZone:'America/New_York',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) + ' ET' : '—';
   document.getElementById('gen-time').textContent = 'Generated: ' + gt;
 
   document.getElementById('futures-table').innerHTML     = buildTable(d.futures);
-  document.getElementById('indices-table').innerHTML     = buildTable(d.indices);
+  document.getElementById('indices-table').innerHTML     = buildIndicesWithSparklines(d.indices, d.indices_sparklines);
   document.getElementById('global-table').innerHTML      = buildTable(d.global_markets);
   document.getElementById('rates-table').innerHTML       = buildTable(d.rates);
   document.getElementById('commodities-table').innerHTML = buildTable(d.commodities);
@@ -6178,7 +6269,7 @@ def api_trade_diagnostic(ticker: str, model: str = "standard"):
 
         # L2 aggregate — use model's aggregator with correct buy threshold for this model
         _bt = _model_dict.get("buy_threshold", 0.10)
-        _st = sched._st.analyze(ticker, highs, lows, closes, volumes) if (sched._st and len(closes) >= 20) else None
+        _st = sched._st_analyzer.analyze(ticker, highs, lows, closes, volumes) if (sched._st_analyzer and len(closes) >= 20) else None
         agg = _agg_instance.aggregate(
             analysis=analysis, fft=fft, fib=fib, insider=ins,
             vwap=vwap, vol_profile=vol, vix_regime=vix_regime,
@@ -6199,8 +6290,20 @@ def api_trade_diagnostic(ticker: str, model: str = "standard"):
             "momentum":     round(agg.momentum_score, 3),
             "insider":      round(agg.insider_score, 3),
             "technical":    round(agg.technical_score, 3),
+            "supertrend":   round(agg.supertrend_favourability * 2 - 1, 3),
+            "tipranks":     round(agg.tipranks_score, 3),
+            "3GA":          round({3: 1.0, 2: 0.4, 1: 0.0, 0: -0.2}.get(agg.tga_arrows_count, 0.0), 3),
             "cycle":        round(agg.cycle_score, 3),
             "volume":       round(agg.volume_score, 3),
+        }
+        tga_info = {
+            "arrows": agg.tga_arrows_count,
+            "signal": agg.tga_signal,
+            "sma":    agg.tga_sma_arrow,
+            "macd":   agg.tga_macd_arrow,
+            "stoch":  agg.tga_stoch_arrow,
+            "vol":    agg.tga_volume_spike,
+            "reason": agg.tga_reason,
         }
 
         return {
@@ -6237,6 +6340,7 @@ def api_trade_diagnostic(ticker: str, model: str = "standard"):
             "action":          decision.action,
             "why_buy":         agg.why_buy,
             "why_wait":        agg.why_wait,
+            "tga":             tga_info,
         }
 
     except Exception as e:
@@ -6338,6 +6442,23 @@ async function sgDiagnose(ticker) {
     if (d.why_wait && d.why_wait.length) {
       html += '<div style="margin-top:6px;color:#d29922;font-size:11px;"><b>Caution:</b><br>' + d.why_wait.join('<br>') + '</div>';
     }
+    if (d.tga) {
+      var tg = d.tga;
+      var arrowCols = ['#f85149','#d29922','#d29922','#3fb950'];
+      var tgaCol = arrowCols[Math.min(tg.arrows||0, 3)];
+      var arrow = function(on) { return '<span style="color:' + (on ? '#3fb950' : '#30363d') + ';font-size:14px;">▲</span>'; };
+      html += '<div style="margin-top:10px;padding:8px 12px;background:#0d1117;border-radius:6px;border:1px solid #30363d;">'
+            + '<div style="font-size:11px;font-weight:700;color:' + tgaCol + ';margin-bottom:5px;">3 Green Arrows (TOS): '
+            + (tg.arrows||0) + '/3 — ' + (tg.signal||'neutral').toUpperCase()
+            + (tg.vol ? ' <span style="color:#d29922;font-size:10px;">+ vol spike</span>' : '') + '</div>'
+            + '<div style="display:flex;gap:12px;font-size:11px;color:#c9d1d9;">'
+            + '<span>' + arrow(tg.sma)  + ' SMA(30)</span>'
+            + '<span>' + arrow(tg.macd) + ' MACD(8,17,9)</span>'
+            + '<span>' + arrow(tg.stoch)+ ' Stoch(14,5)</span>'
+            + '</div>'
+            + (tg.reason ? '<div style="margin-top:4px;font-size:10px;color:#8b949e;">' + tg.reason + '</div>' : '')
+            + '</div>';
+    }
     body.innerHTML = html;
   } catch(e) {
     body.innerHTML = '<span style="color:#f85149">Fetch error: ' + e.message + '</span>';
@@ -6402,7 +6523,8 @@ def api_chart_data(ticker: str, days: int = 180):
                 .all()
             )
 
-            candles = []
+            # Build candle map keyed by date string; later entries (higher time) overwrite
+            candle_map: dict = {}
             for r in records:
                 o = r.open or r.close
                 h = r.high or r.close
@@ -6410,15 +6532,17 @@ def api_chart_data(ticker: str, days: int = 180):
                 c = r.adjusted_close or r.close
                 if not c:
                     continue
-                candles.append({
-                    "time":   r.date.strftime("%Y-%m-%d"),
+                date_key = r.date.strftime("%Y-%m-%d")
+                candle_map[date_key] = {
+                    "time":   date_key,
                     "open":   round(float(o), 4),
                     "high":   round(float(h), 4),
                     "low":    round(float(l), 4),
                     "close":  round(float(c), 4),
                     "volume": int(r.volume or 0),
-                })
+                }
 
+            candles = sorted(candle_map.values(), key=lambda x: x["time"])
             return {"ticker": ticker, "candles": candles}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -6427,16 +6551,17 @@ def api_chart_data(ticker: str, days: int = 180):
 @app.get("/api/chart-intraday")
 def api_chart_intraday(ticker: str, freq: int = 5):
     """
-    Return today's intraday OHLCV candles from Schwab.
+    Return today's intraday OHLCV candles.
+    Tries Schwab live API first; falls back to yfinance if unavailable.
     Format: [{time (unix epoch seconds), open, high, low, close, volume}]
-    freq: 1 or 5 (minute bars)
     """
     ticker = ticker.upper().strip()
+    candles = []
+    source = "schwab"
     try:
         from broker.market_data import SchwabMarketData
         md = SchwabMarketData()
         candles_raw = md.get_price_history_intraday(ticker, freq_minutes=freq)
-        candles = []
         for c in candles_raw:
             if not c.get("close"):
                 continue
@@ -6448,9 +6573,39 @@ def api_chart_intraday(ticker: str, freq: int = 5):
                 "close":  round(float(c["close"]),              4),
                 "volume": int(c["volume"] or 0),
             })
-        return {"ticker": ticker, "candles": candles, "freq_minutes": freq}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        pass
+
+    if not candles:
+        # Fallback: yfinance 5-minute bars for most recent trading session
+        source = "yfinance"
+        try:
+            import yfinance as yf
+            df = yf.download(ticker, period="2d", interval=f"{freq}m", progress=False, auto_adjust=True)
+            if not df.empty:
+                import pandas as pd
+                # Flatten MultiIndex columns (yfinance 0.2.x returns (Col, Ticker) tuples)
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                # Keep only rows from the last trading day in the data
+                df.index = pd.to_datetime(df.index)
+                last_day = df.index.normalize().max()
+                df = df[df.index.normalize() == last_day]
+                for ts, row in df.iterrows():
+                    c = float(row["Close"])
+                    if not c:
+                        continue
+                    candles.append({
+                        "time":   int(ts.timestamp()),
+                        "open":   round(float(row["Open"]  or c), 4),
+                        "high":   round(float(row["High"]  or c), 4),
+                        "low":    round(float(row["Low"]   or c), 4),
+                        "close":  round(c,                        4),
+                        "volume": int(row["Volume"] or 0),
+                    })
+        except Exception as e:
+            return JSONResponse({"error": f"yfinance fallback failed: {e}"}, status_code=500)
+
+    return {"ticker": ticker, "candles": candles, "freq_minutes": freq, "source": source}
 
 
 @app.get("/api/chart-indicators")
@@ -6479,11 +6634,17 @@ def api_chart_indicators(ticker: str, days: int = 180):
                 .all()
             )
 
-            times  = [r.date.strftime("%Y-%m-%d") for r in records]
-            closes = [float(r.adjusted_close or r.close or 0) for r in records]
-            highs  = [float(r.high  or r.close or 0) for r in records]
-            lows   = [float(r.low   or r.close or 0) for r in records]
-            vols   = [float(r.volume or 0) for r in records]
+            # Deduplicate by date string; later rows (higher timestamp) overwrite earlier
+            row_map: dict = {}
+            for r in records:
+                row_map[r.date.strftime("%Y-%m-%d")] = r
+            deduped = sorted(row_map.values(), key=lambda r: r.date)
+
+            times  = [r.date.strftime("%Y-%m-%d") for r in deduped]
+            closes = [float(r.adjusted_close or r.close or 0) for r in deduped]
+            highs  = [float(r.high  or r.close or 0) for r in deduped]
+            lows   = [float(r.low   or r.close or 0) for r in deduped]
+            vols   = [float(r.volume or 0) for r in deduped]
 
             def _ema(values, period):
                 result = []
@@ -6523,14 +6684,20 @@ def api_chart_indicators(ticker: str, days: int = 180):
                 .order_by(TradeSignal.generated_at)
                 .all()
             )
-            signals = []
+            # Deduplicate: keep only the latest signal per calendar date
+            _sig_by_date: dict = {}
             for s in sig_rows:
                 if s.generated_at and s.current_price:
-                    signals.append({
-                        "time":   s.generated_at.strftime("%Y-%m-%d"),
-                        "action": s.signal,
-                        "price":  round(float(s.current_price), 4),
-                    })
+                    date_key = s.generated_at.strftime("%Y-%m-%d")
+                    if date_key not in _sig_by_date or s.generated_at > _sig_by_date[date_key]["_ts"]:
+                        _sig_by_date[date_key] = {
+                            "time":   date_key,
+                            "action": s.signal,
+                            "price":  round(float(s.current_price), 4),
+                            "_ts":    s.generated_at,
+                        }
+            signals = [{"time": v["time"], "action": v["action"], "price": v["price"]}
+                       for v in sorted(_sig_by_date.values(), key=lambda x: x["time"])]
 
             # Fibonacci levels (using range over the period)
             fib_levels = None
@@ -6542,13 +6709,11 @@ def api_chart_indicators(ticker: str, days: int = 180):
                     "high": round(period_high, 4),
                     "low":  round(period_low,  4),
                     "levels": [
-                        {"name": "0%",     "price": round(period_low,              4)},
-                        {"name": "23.6%",  "price": round(period_low + 0.236*diff, 4)},
-                        {"name": "38.2%",  "price": round(period_low + 0.382*diff, 4)},
-                        {"name": "50%",    "price": round(period_low + 0.500*diff, 4)},
-                        {"name": "61.8%",  "price": round(period_low + 0.618*diff, 4)},
-                        {"name": "78.6%",  "price": round(period_low + 0.786*diff, 4)},
-                        {"name": "100%",   "price": round(period_high,             4)},
+                        {"name": "0%",    "price": round(period_low,              4)},
+                        {"name": "38.2%", "price": round(period_low + 0.382*diff, 4)},
+                        {"name": "50%",   "price": round(period_low + 0.500*diff, 4)},
+                        {"name": "61.8%", "price": round(period_low + 0.618*diff, 4)},
+                        {"name": "100%",  "price": round(period_high,             4)},
                     ],
                 }
 
@@ -6566,6 +6731,112 @@ def api_chart_indicators(ticker: str, days: int = 180):
             }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/chart-tga-panel")
+def api_chart_tga_panel(ticker: str, days: int = 180):
+    """
+    Return per-bar TGA indicator series for chart overlay:
+    SMA(30), MACD(8,17,9,EMA) histogram, Stochastic(14,5) FullD,
+    volume spike markers, SMA cross markers, SuperTrend line.
+    """
+    ticker = ticker.upper().strip()
+    try:
+        with Session() as session:
+            company = session.query(Company).filter_by(ticker=ticker).first()
+            if not company:
+                return JSONResponse({"error": f"Ticker {ticker} not found"}, status_code=404)
+
+            from datetime import timedelta
+            # Load extra history for warmup
+            cutoff = datetime.utcnow() - timedelta(days=days + 90)
+            records = (
+                session.query(PriceHistory)
+                .filter(PriceHistory.company_id == company.id)
+                .filter(PriceHistory.date >= cutoff)
+                .order_by(PriceHistory.date)
+                .all()
+            )
+            if not records:
+                return {"ticker": ticker, "sma30": [], "macd_hist": [], "stoch_fulld": [],
+                        "volume_spike_markers": [], "sma_cross_markers": [], "supertrend": []}
+
+            # Deduplicate by date string; later rows (higher timestamp) overwrite earlier
+            _row_map: dict = {}
+            for r in records:
+                _row_map[r.date.strftime("%Y-%m-%d")] = r
+            _deduped = sorted(_row_map.values(), key=lambda r: r.date)
+
+            times  = [r.date.strftime("%Y-%m-%d") for r in _deduped]
+            closes = [float(r.adjusted_close or r.close or 0) for r in _deduped]
+            highs  = [float(r.high or r.close or 0) for r in _deduped]
+            lows   = [float(r.low or r.close or 0) for r in _deduped]
+            vols   = [float(r.volume or 0) for r in _deduped]
+
+            # TGA indicators
+            from signals.three_green_arrows import ThreeGreenArrowsAnalyzer
+            tga_series = ThreeGreenArrowsAnalyzer().analyze_series(times, closes, highs, lows, vols)
+
+            # SuperTrend series (Wilder ATR, factor=3, period=10)
+            def _supertrend_series(ts, cs, hs, ls, atr_p=10, factor=3.0):
+                n = min(len(ts), len(cs), len(hs), len(ls))
+                out = []
+                trs = [hs[0] - ls[0]]
+                for i in range(1, n):
+                    trs.append(max(hs[i]-ls[i], abs(hs[i]-cs[i-1]), abs(ls[i]-cs[i-1])))
+                atr = [0.0] * n
+                if n >= atr_p:
+                    atr[atr_p-1] = sum(trs[:atr_p]) / atr_p
+                    for i in range(atr_p, n):
+                        atr[i] = (atr[i-1]*(atr_p-1) + trs[i]) / atr_p
+                direction = 1
+                prev_up = prev_lo = 0.0
+                for i in range(n):
+                    if atr[i] == 0.0:
+                        continue
+                    hl2 = (hs[i] + ls[i]) / 2
+                    b_up = hl2 + factor * atr[i]
+                    b_lo = hl2 - factor * atr[i]
+                    if i == 0:
+                        up, lo = b_up, b_lo
+                    else:
+                        up = b_up if (b_up < prev_up or cs[i-1] > prev_up) else prev_up
+                        lo = b_lo if (b_lo > prev_lo or cs[i-1] < prev_lo) else prev_lo
+                    if i == 0:
+                        direction = 1 if cs[i] > lo else -1
+                    elif direction == 1:
+                        direction = -1 if cs[i] < lo else 1
+                    else:
+                        direction = 1 if cs[i] > up else -1
+                    st_val = lo if direction == 1 else up
+                    prev_up, prev_lo = up, lo
+                    if i >= atr_p:
+                        out.append({"time": ts[i], "value": round(st_val, 4),
+                                    "direction": "uptrend" if direction == 1 else "downtrend"})
+                return out
+
+            st_series = _supertrend_series(times, closes, highs, lows)
+
+            # Trim all series to requested days window
+            cutoff_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            def _trim(lst):
+                return [x for x in lst if x.get("time", "") >= cutoff_date]
+
+            return {
+                "ticker":               ticker,
+                "sma30":               _trim(tga_series["sma30"]),
+                "macd_hist":           _trim(tga_series["macd_hist"]),
+                "stoch_fulld":         _trim(tga_series["stoch_fulld"]),
+                "stoch_overbought":    75,
+                "stoch_oversold":      25,
+                "volume_spike_markers": _trim(tga_series["volume_spike_markers"]),
+                "sma_cross_markers":   _trim(tga_series["sma_cross_markers"]),
+                "supertrend":          _trim(st_series),
+            }
+    except Exception as e:
+        import traceback
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -6596,9 +6867,23 @@ _CHARTS_HTML = """<!DOCTYPE html>
   .ind-toggle { padding:3px 8px;border-radius:4px;border:1px solid #30363d;
     background:#161b22;color:#8b949e;cursor:pointer;font-size:11px; }
   .ind-toggle.on { border-color:#3fb950;color:#3fb950; }
-  #main-chart { width:100%;height:520px;border:1px solid #21262d;border-radius:6px;overflow:hidden; }
+  #main-chart  { width:100%;height:520px;border:1px solid #21262d;border-radius:6px;overflow:hidden; }
   #rsi-chart   { width:100%;height:110px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
   #vol-chart   { width:100%;height:90px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
+  #macd-chart  { width:100%;height:100px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
+  #stoch-chart { width:100%;height:100px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
+  .pane-label  { font-size:11px;color:#8b949e;padding:2px 8px;margin-top:4px;display:flex;align-items:center;gap:8px; }
+  .pane-label b { color:#c9d1d9; }
+  .ohlcv-bar { font-size:11px;color:#8b949e;padding:4px 8px;margin-bottom:4px;
+    display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+    background:#0d1117;border:1px solid #21262d;border-radius:4px; }
+  .ohlcv-bar span { white-space:nowrap; }
+  .ohlcv-bar .ob-o { color:#8b949e; }
+  .ohlcv-bar .ob-h { color:#3fb950; }
+  .ohlcv-bar .ob-l { color:#f85149; }
+  .ohlcv-bar .ob-c-up   { color:#3fb950;font-weight:700; }
+  .ohlcv-bar .ob-c-down { color:#f85149;font-weight:700; }
+  .ohlcv-bar .ob-v { color:#8b949e; }
   .ai-bar { display:flex;gap:16px;align-items:center;margin-top:10px;padding:8px 12px;
     background:#161b22;border:1px solid #21262d;border-radius:6px;font-size:12px;flex-wrap:wrap; }
   .ai-bar span { color:#8b949e; }
@@ -6606,8 +6891,15 @@ _CHARTS_HTML = """<!DOCTYPE html>
   #chart-signal { padding:3px 8px;border-radius:4px;font-weight:700;font-size:12px; }
   .fib-legend { display:flex;flex-wrap:wrap;gap:6px;margin-top:8px; }
   .fib-badge { font-size:10px;padding:2px 6px;background:#161b22;border:1px solid #21262d;
-    border-radius:3px;color:#8b949e; }
+    border-radius:3px; }
   .chart-title { font-size:14px;font-weight:700;color:#58a6ff; }
+  .ind-info-btn { padding:3px 8px;border-radius:4px;border:1px solid #30363d;
+    background:#161b22;color:#58a6ff;cursor:pointer;font-size:11px;margin-left:4px; }
+  #ind-info-panel { display:none;position:absolute;z-index:500;background:#161b22;
+    border:1px solid #30363d;border-radius:8px;padding:14px 16px;font-size:11px;
+    color:#8b949e;line-height:1.8;min-width:280px;box-shadow:0 4px 20px rgba(0,0,0,0.5); }
+  #ind-info-panel b { color:#e6edf3; }
+  .chart-wrap { position:relative; }
 </style>
 </head>
 <body>
@@ -6632,14 +6924,43 @@ _CHARTS_HTML = """<!DOCTYPE html>
     <button class="ind-toggle on" id="tog-vwap"  onclick="toggleInd('vwap')">VWAP</button>
     <button class="ind-toggle on" id="tog-fib"   onclick="toggleInd('fib')">Fibonacci</button>
     <button class="ind-toggle on" id="tog-sigs"  onclick="toggleInd('sigs')">Signals</button>
+    <span style="color:#30363d;margin:0 2px;">|</span>
+    <button class="ind-toggle" id="tog-sma30" onclick="toggleInd('sma30')" title="SMA(30) cross arrows — TOS Study 1">SMA 30</button>
+    <button class="ind-toggle" id="tog-st"    onclick="toggleInd('st')"    title="SuperTrend (ATR×3, period 10) — green uptrend / red downtrend">SuperTrend</button>
+    <button class="ind-toggle" id="tog-tga"   onclick="toggleInd('tga')"   title="3 Green Arrows panel — MACD(8,17,9) + Stochastic(14,5) panes">3GA Panel</button>
+    <button class="ind-info-btn" id="ind-info-btn" onclick="toggleIndInfo(event)">?</button>
+    <div id="ind-info-panel">
+      <b>EMA 20 / EMA 50</b> — Exponential moving averages. Price above both = bullish trend.<br>
+      <b>VWAP</b> — Volume-weighted avg price (cumulative for period). Institutional reference level.<br>
+      <b>Fibonacci</b> — Retracement levels from period high/low: 0%, 38.2%, 50%, 61.8%, 100%.<br>
+      <b>Signals</b> — BUY/SELL markers from the NWO AI pipeline (one per trading day).<br>
+      <b>SMA 30</b> — TOS Study 1: 30-bar SMA with cross-above arrows (orange).<br>
+      <b>SuperTrend</b> — ATR×3 trailing stop. Green = uptrend, Red = downtrend.<br>
+      <b>3GA Panel</b> — TOS 3 Green Arrows: MACD(8,17,9) histogram + Stochastic(14,5) sub-panes.
+    </div>
+  </div>
+  <div class="ohlcv-bar" id="ohlcv-bar">
+    <span style="color:#58a6ff;font-weight:700;" id="ob-ticker">—</span>
+    <span class="ob-o">O: <b id="ob-o">—</b></span>
+    <span class="ob-h">H: <b id="ob-h">—</b></span>
+    <span class="ob-l">L: <b id="ob-l">—</b></span>
+    <span>C: <b id="ob-c">—</b></span>
+    <span class="ob-v">V: <b id="ob-v">—</b></span>
   </div>
   <div id="main-chart"></div>
+  <div id="vol-label" class="pane-label">Volume <b id="vol-val"></b></div>
   <div id="vol-chart"></div>
+  <div id="rsi-label" class="pane-label">RSI (14) <b id="rsi-val"></b></div>
   <div id="rsi-chart"></div>
+  <div id="macd-label"  class="pane-label" style="display:none;">MACD (8,17,9 EMA) <b id="macd-val"></b></div>
+  <div id="macd-chart"  style="display:none;"></div>
+  <div id="stoch-label" class="pane-label" style="display:none;">Stochastic FullD (14,5) <b id="stoch-val"></b> <span style="color:#8b949e;font-size:10px;">OB:75 / OS:25</span></div>
+  <div id="stoch-chart" style="display:none;"></div>
   <div class="ai-bar">
     <span>AI Signal: <b id="chart-signal" style="background:#21262d;padding:3px 8px;border-radius:4px;">—</span>
     <span>Composite: <b id="chart-composite">—</b></span>
     <span>Momentum: <b id="chart-momentum">—</b></span>
+    <span>3GA: <b id="chart-tga" style="color:#8b949e;">—</b></span>
     <span>Margin of Safety: <b id="chart-mos">—</b></span>
     <span>Investable: <b id="chart-investable">—</b></span>
     <span>Gates Passed: <b id="chart-gates">—</b></span>
@@ -6664,19 +6985,45 @@ _CHARTS_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-var _chart, _volChart, _rsiChart, _candleSeries, _volSeries, _rsiSeries;
-var _ema20Series, _ema50Series, _vwapSeries;
-var _fibLines = [], _sigMarkers = [];
-var _indState = {ema20:true, ema50:true, vwap:true, fib:true, sigs:true};
+var _chart, _volChart, _rsiChart, _macdChart, _stochChart;
+var _candleSeries, _volSeries, _rsiSeries, _macdSeries, _stochSeries;
+var _ema20Series, _ema50Series, _vwapSeries, _sma30Series, _stUpSeries, _stDownSeries;
+var _fibLines = [], _sigMarkers = [], _tgaData = null;
+var _indState = {ema20:true, ema50:true, vwap:true, fib:true, sigs:true, sma30:false, st:false, tga:false};
 var _currentDays = 90;
 var _currentTicker = 'AAPL';
 var _currentIntraday = false;
 var _syncEnabled = false;
+var _ohlcvMap = {};
+
+function _updateOhlcvBar(param) {
+  var el = document.getElementById('ob-ticker');
+  if (el) el.textContent = _currentTicker || '—';
+  if (!param || !param.time) return;
+  var c = _ohlcvMap[param.time];
+  if (!c) return;
+  var isUp = c.close >= c.open;
+  var cEl = document.getElementById('ob-c');
+  if (cEl) { cEl.textContent = c.close.toFixed(2); cEl.parentElement.className = isUp ? 'ob-c-up' : 'ob-c-down'; }
+  var oEl = document.getElementById('ob-o'); if (oEl) oEl.textContent = c.open.toFixed(2);
+  var hEl = document.getElementById('ob-h'); if (hEl) hEl.textContent = c.high.toFixed(2);
+  var lEl = document.getElementById('ob-l'); if (lEl) lEl.textContent = c.low.toFixed(2);
+  var vol = c.volume>=1e6?(c.volume/1e6).toFixed(2)+'M':c.volume>=1e3?(c.volume/1e3).toFixed(0)+'K':String(c.volume);
+  var vEl = document.getElementById('ob-v'); if (vEl) vEl.textContent = vol;
+  if (!param.seriesData) return;
+  var vd = param.seriesData.get(_volSeries);
+  if (vd) { var vv=vd.value>=1e6?(vd.value/1e6).toFixed(2)+'M':vd.value>=1e3?(vd.value/1e3).toFixed(0)+'K':String(vd.value||0); var vvEl=document.getElementById('vol-val'); if(vvEl) vvEl.textContent=vv; }
+  var rd=param.seriesData.get(_rsiSeries);   var rvEl=document.getElementById('rsi-val');   if(rd&&rvEl)  rvEl.textContent=(rd.value||0).toFixed(1);
+  var md=param.seriesData.get(_macdSeries);  var mvEl=document.getElementById('macd-val');  if(md&&mvEl)  mvEl.textContent=(md.value||0).toFixed(4);
+  var sd=param.seriesData.get(_stochSeries); var svEl=document.getElementById('stoch-val'); if(sd&&svEl)  svEl.textContent=(sd.value||0).toFixed(1);
+}
 
 function _createCharts() {
-  var mainEl = document.getElementById('main-chart');
-  var volEl  = document.getElementById('vol-chart');
-  var rsiEl  = document.getElementById('rsi-chart');
+  var mainEl  = document.getElementById('main-chart');
+  var volEl   = document.getElementById('vol-chart');
+  var rsiEl   = document.getElementById('rsi-chart');
+  var macdEl  = document.getElementById('macd-chart');
+  var stochEl = document.getElementById('stoch-chart');
 
   // Only create once — reuse across period/ticker changes to avoid ResizeObserver issues
   if (_chart) return;
@@ -6711,6 +7058,22 @@ function _createCharts() {
     timeScale: { borderColor:'#30363d', timeVisible:true },
   });
 
+  _macdChart = LightweightCharts.createChart(macdEl, {
+    width: w, height: 100,
+    layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
+    grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
+    rightPriceScale: { borderColor:'#30363d' },
+    timeScale: { borderColor:'#30363d', timeVisible:true },
+  });
+
+  _stochChart = LightweightCharts.createChart(stochEl, {
+    width: w, height: 100,
+    layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
+    grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
+    rightPriceScale: { borderColor:'#30363d', scaleMargins:{top:0.02, bottom:0.02}, autoScale:false },
+    timeScale: { borderColor:'#30363d', timeVisible:true },
+  });
+
   _candleSeries = _chart.addCandlestickSeries({
     upColor:'#3fb950', downColor:'#f85149',
     borderUpColor:'#3fb950', borderDownColor:'#f85149',
@@ -6719,20 +7082,43 @@ function _createCharts() {
   _ema20Series  = _chart.addLineSeries({ color:'#3fb950', lineWidth:1, lineStyle:0 });
   _ema50Series  = _chart.addLineSeries({ color:'#58a6ff', lineWidth:1, lineStyle:0 });
   _vwapSeries   = _chart.addLineSeries({ color:'#d29922', lineWidth:1, lineStyle:1 });
-  _volSeries    = _volChart.addHistogramSeries({ color:'#1c2e50', priceFormat:{type:'volume'} });
-  _rsiSeries    = _rsiChart.addLineSeries({ color:'#a371f7', lineWidth:1 });
+  _sma30Series  = _chart.addLineSeries({ color:'#e3a02c', lineWidth:2, lineStyle:0, title:'SMA30' });
+  _stUpSeries   = _chart.addLineSeries({ color:'#3fb950', lineWidth:2, lineStyle:0 });
+  _stDownSeries = _chart.addLineSeries({ color:'#f85149', lineWidth:2, lineStyle:0 });
+  _volSeries    = _volChart.addHistogramSeries({ color:'#1f6feb', priceFormat:{type:'volume'} });
+  _rsiSeries    = _rsiChart.addLineSeries({ color:'#a371f7', lineWidth:2 });
+  _macdSeries   = _macdChart.addHistogramSeries({ priceFormat:{type:'price', precision:4, minMove:0.0001} });
+  _stochSeries  = _stochChart.addLineSeries({ color:'#58a6ff', lineWidth:2 });
+  // Stochastic OB/OS reference lines
+  _stochSeries.createPriceLine({ price:75, color:'#d29922', lineWidth:1, lineStyle:2, axisLabelVisible:true, title:'OB' });
+  _stochSeries.createPriceLine({ price:25, color:'#3fb950', lineWidth:1, lineStyle:2, axisLabelVisible:true, title:'OS' });
+  // MACD zero line
+  _macdSeries.createPriceLine({ price:0, color:'#30363d', lineWidth:1, lineStyle:0, axisLabelVisible:false });
+
+  // Pin stoch scale at 0–100 with invisible anchors
+  _stochSeries.createPriceLine({ price:0,   color:'transparent', lineWidth:0, axisLabelVisible:false });
+  _stochSeries.createPriceLine({ price:100, color:'transparent', lineWidth:0, axisLabelVisible:false });
+
+  // Wire crosshair to module-level _updateOhlcvBar + _ohlcvMap
+  _chart.subscribeCrosshairMove(function(param) { _updateOhlcvBar(param); });
 
   _chart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
     if (!_syncEnabled || !range) return;
     try { _volChart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
     try { _rsiChart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
+    if (_indState.tga) {
+      try { _macdChart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
+      try { _stochChart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
+    }
   });
 
   window.addEventListener('resize', function() {
     var rw = mainEl.getBoundingClientRect().width || 900;
-    if (_chart)    _chart.resize(rw, 520);
-    if (_volChart) _volChart.resize(rw, 90);
-    if (_rsiChart) _rsiChart.resize(rw, 110);
+    if (_chart)     _chart.resize(rw, 520);
+    if (_volChart)  _volChart.resize(rw, 90);
+    if (_rsiChart)  _rsiChart.resize(rw, 110);
+    if (_macdChart && _indState.tga)  _macdChart.resize(rw, 100);
+    if (_stochChart && _indState.tga) _stochChart.resize(rw, 100);
   });
 }
 
@@ -6776,6 +7162,72 @@ function _computeRSI(closes, period) {
   return result.filter(x => x !== null);
 }
 
+async function _loadTgaPanel(t, d) {
+  _tgaData = null;
+  if (!_indState.sma30 && !_indState.st && !_indState.tga) {
+    _safeSetData(_sma30Series, []);
+    _safeSetData(_stUpSeries,  []);
+    _safeSetData(_stDownSeries,[]);
+    _safeSetData(_macdSeries,  []);
+    _safeSetData(_stochSeries, []);
+    return;
+  }
+  try {
+    var data = await fetch('/api/chart-tga-panel?ticker=' + t + '&days=' + d).then(r=>r.json());
+    if (data.error) { console.warn('TGA panel error', data.error); return; }
+    _tgaData = data;
+    _applyTgaData();
+    if (_indState.tga) {
+      try { _macdChart.timeScale().fitContent(); } catch(e) {}
+      try { _stochChart.timeScale().fitContent(); } catch(e) {}
+    }
+  } catch(e) { console.warn('TGA panel fetch failed', e); }
+}
+
+function _applyTgaData() {
+  if (!_tgaData) return;
+  var d = _tgaData;
+
+  // SMA(30) overlay — orange line on main chart
+  _safeSetData(_sma30Series, _indState.sma30 ? (d.sma30||[]) : []);
+
+  // SuperTrend — two colored segments (green uptrend / red downtrend)
+  if (_indState.st && d.supertrend && d.supertrend.length) {
+    var stUp = [], stDown = [];
+    d.supertrend.forEach(function(p) {
+      if (p.direction === 'uptrend') stUp.push({time:p.time, value:p.value});
+      else                          stDown.push({time:p.time, value:p.value});
+    });
+    _safeSetData(_stUpSeries,   stUp);
+    _safeSetData(_stDownSeries, stDown);
+  } else {
+    _safeSetData(_stUpSeries,   []);
+    _safeSetData(_stDownSeries, []);
+  }
+
+  // MACD histogram with TOS color scheme
+  _safeSetData(_macdSeries, _indState.tga ? (d.macd_hist||[]) : []);
+
+  // Stochastic FullD
+  _safeSetData(_stochSeries, _indState.tga ? (d.stoch_fulld||[]) : []);
+
+  // SMA cross markers — merge with signal markers
+  var allMarkers = _sigMarkers.slice();
+  if (_indState.sma30 && d.sma_cross_markers) {
+    d.sma_cross_markers.forEach(function(m) {
+      allMarkers.push({
+        time:     m.time,
+        position: m.dir === 'above' ? 'belowBar' : 'aboveBar',
+        color:    m.dir === 'above' ? '#e3a02c' : '#8b949e',
+        shape:    m.dir === 'above' ? 'arrowUp' : 'arrowDown',
+        text:     'SMA',
+      });
+    });
+  }
+  allMarkers.sort(function(a,b){ return a.time < b.time ? -1 : 1; });
+  _candleSeries.setMarkers(allMarkers);
+}
+
 async function loadChart(tickerOverride, daysOverride) {
   var t = tickerOverride || document.getElementById('chart-ticker').value.trim().toUpperCase();
   var d = daysOverride || _currentDays;
@@ -6807,59 +7259,74 @@ async function loadChart(tickerOverride, daysOverride) {
   }
 
   _syncEnabled = false;
+
+  // Build OHLCV lookup map for crosshair hover
+  _ohlcvMap = {};
+  ohlcv.candles.forEach(function(c) { _ohlcvMap[c.time] = c; });
+  // Seed OHLCV bar with last candle
+  if (ohlcv.candles.length) {
+    var last = ohlcv.candles[ohlcv.candles.length - 1];
+    _updateOhlcvBar({ time: last.time, seriesData: new Map() });
+  }
+
   await _safeSetData(_candleSeries, ohlcv.candles);
   await _safeSetData(_ema20Series, _indState.ema20 ? (inds.ema20||[]) : []);
   await _safeSetData(_ema50Series, _indState.ema50 ? (inds.ema50||[]) : []);
   await _safeSetData(_vwapSeries,  _indState.vwap  ? (inds.vwap_line||[]) : []);
 
   var volData = ohlcv.candles.map(function(c) {
-    return {time:c.time, value:c.volume, color: c.close>=c.open?'#1e4620':'#4d1f1f'};
+    return {time:c.time, value:c.volume, color: c.close>=c.open?'#1f6feb':'#8b2020'};
   });
   await _safeSetData(_volSeries, volData);
 
   var rsiData = _computeRSI(ohlcv.candles, 14);
   await _safeSetData(_rsiSeries, rsiData);
-  _syncEnabled = true;
 
   // Fibonacci lines
-  _fibLines.forEach(function(l) { try { _chart.removePriceLine(l); } catch(e) {} });
+  _fibLines.forEach(function(l) { try { _candleSeries.removePriceLine(l); } catch(e) {} });
   _fibLines = [];
   if (_indState.fib && inds.fib_levels) {
-    var colors = ['#8b949e','#58a6ff','#3fb950','#d29922','#f85149','#a371f7','#8b949e'];
+    var colors = ['#8b949e','#3fb950','#d29922','#58a6ff','#8b949e'];
     var legend = '';
     inds.fib_levels.levels.forEach(function(lv, i) {
       var pl = _candleSeries.createPriceLine({
         price: lv.price, color: colors[i]||'#8b949e',
-        lineWidth:1, lineStyle: LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible:true, title: lv.name,
+        lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: false, title: lv.name,
       });
       _fibLines.push(pl);
-      legend += '<span class="fib-badge">' + lv.name + ' $' + lv.price.toFixed(2) + '</span>';
+      legend += '<span class="fib-badge" style="color:' + (colors[i]||'#8b949e') + '">'
+              + lv.name + ' $' + lv.price.toFixed(2) + '</span>';
     });
     document.getElementById('fib-legend').innerHTML = legend;
   } else {
     document.getElementById('fib-legend').innerHTML = '';
   }
 
-  // Signal markers
+  // Signal markers — store for TGA merge
+  _sigMarkers = [];
   if (_indState.sigs && inds.signals && inds.signals.length) {
-    var markers = inds.signals.map(function(s) {
+    _sigMarkers = inds.signals.map(function(s) {
       return {
-        time: s.time,
+        time:     s.time,
         position: s.action === 'BUY' ? 'belowBar' : 'aboveBar',
-        color: s.action === 'BUY' ? '#3fb950' : '#f85149',
-        shape: s.action === 'BUY' ? 'arrowUp' : 'arrowDown',
-        text: s.action,
+        color:    s.action === 'BUY' ? '#3fb950' : '#f85149',
+        shape:    s.action === 'BUY' ? 'arrowUp' : 'arrowDown',
+        text:     s.action,
       };
     });
-    _candleSeries.setMarkers(markers);
+    _candleSeries.setMarkers(_sigMarkers);
   } else {
     _candleSeries.setMarkers([]);
   }
 
+  _syncEnabled = true;
   _chart.timeScale().fitContent();
   _volChart.timeScale().fitContent();
   _rsiChart.timeScale().fitContent();
+
+  // TGA panel — async, non-blocking
+  _loadTgaPanel(t, d);
 
   // Load latest signal data for the AI bar
   loadAiBar(t);
@@ -6880,9 +7347,16 @@ async function loadChartIntraday(tickerOverride) {
 
   _createCharts();
 
-  var ohlcv = await fetch('/api/chart-intraday?ticker=' + t + '&freq=5').then(r=>r.json());
+  var ohlcv = await fetch('/api/chart-intraday?ticker=' + t + '&freq=5').then(r=>r.json()).catch(function(){return{error:'fetch failed'};});
   if (ohlcv.error || !ohlcv.candles || !ohlcv.candles.length) {
-    document.getElementById('chart-signal').textContent = 'No intraday data';
+    document.getElementById('chart-ticker-label').textContent = t + ' (1D — unavailable, showing daily)';
+    document.querySelectorAll('.period-btn').forEach(function(b) {
+      b.classList.remove('active');
+      if (b.textContent==='3M') b.classList.add('active');
+    });
+    _currentIntraday = false;
+    _currentDays = 90;
+    await loadChart(t, 90);
     return;
   }
 
@@ -6892,21 +7366,28 @@ async function loadChartIntraday(tickerOverride) {
   _rsiChart.applyOptions({ timeScale: { timeVisible: true, secondsVisible: false } });
 
   _syncEnabled = false;
-  await _safeSetData(_candleSeries, ohlcv.candles);
-  await _safeSetData(_ema20Series, []);
-  await _safeSetData(_ema50Series, []);
-  await _safeSetData(_vwapSeries,  []);
+  await _safeSetData(_candleSeries,  ohlcv.candles);
+  await _safeSetData(_ema20Series,   []);
+  await _safeSetData(_ema50Series,   []);
+  await _safeSetData(_vwapSeries,    []);
+  await _safeSetData(_sma30Series,   []);
+  await _safeSetData(_stUpSeries,    []);
+  await _safeSetData(_stDownSeries,  []);
+  await _safeSetData(_macdSeries,    []);
+  await _safeSetData(_stochSeries,   []);
 
   var volData = ohlcv.candles.map(function(c) {
-    return {time:c.time, value:c.volume, color: c.close>=c.open?'#1e4620':'#4d1f1f'};
+    return {time:c.time, value:c.volume, color: c.close>=c.open?'#1f6feb':'#8b2020'};
   });
   await _safeSetData(_volSeries, volData);
 
   var rsiData = _computeRSI(ohlcv.candles, 14);
   await _safeSetData(_rsiSeries, rsiData);
+  _tgaData = null;
+  _sigMarkers = [];
   _syncEnabled = true;
 
-  _fibLines.forEach(function(l) { try { _chart.removePriceLine(l); } catch(e) {} });
+  _fibLines.forEach(function(l) { try { _candleSeries.removePriceLine(l); } catch(e) {} });
   _fibLines = [];
   document.getElementById('fib-legend').innerHTML = '';
   _candleSeries.setMarkers([]);
@@ -6932,16 +7413,82 @@ async function loadAiBar(ticker) {
       document.getElementById('chart-composite').textContent = s.composite_score!=null ? (s.composite_score>=0?'+':'') + s.composite_score.toFixed(3) : '—';
       document.getElementById('chart-momentum').textContent  = s.momentum_score!=null  ? (s.momentum_score>=0?'+':'')  + s.momentum_score.toFixed(3)  : '—';
       document.getElementById('chart-mos').textContent       = s.margin_of_safety!=null ? (s.margin_of_safety*100).toFixed(1)+'%' : '—';
+      var tgaN = s.tga_arrows != null ? s.tga_arrows : (s.tga_arrows_count != null ? s.tga_arrows_count : null);
+      var tgaEl = document.getElementById('chart-tga');
+      if (tgaEl) {
+        if (tgaN != null) {
+          var tgaCol = tgaN===3?'#3fb950':tgaN===2?'#d29922':'#8b949e';
+          tgaEl.textContent = tgaN + '/3 \\u25b2';
+          tgaEl.style.color = tgaCol;
+          tgaEl.title = s.tga_reason || '';
+        } else {
+          tgaEl.textContent = '—';
+          tgaEl.style.color = '#8b949e';
+        }
+      }
     } else {
       document.getElementById('chart-signal').textContent = 'No signal';
     }
   } catch(e) {}
 }
 
+function toggleIndInfo(e) {
+  var panel = document.getElementById('ind-info-panel');
+  var btn   = document.getElementById('ind-info-btn');
+  var show  = panel.style.display === 'none' || !panel.style.display;
+  panel.style.display = show ? 'block' : 'none';
+  if (show) {
+    var rect = btn.getBoundingClientRect();
+    var wrap = btn.closest('.chart-wrap');
+    var wrapRect = wrap ? wrap.getBoundingClientRect() : {left:0,top:0};
+    panel.style.top  = (rect.bottom - wrapRect.top + 4) + 'px';
+    panel.style.left = Math.max(0, rect.left - wrapRect.left - 60) + 'px';
+  }
+  e.stopPropagation();
+}
+document.addEventListener('click', function(e) {
+  var panel = document.getElementById('ind-info-panel');
+  if (panel && !panel.contains(e.target) && e.target.id !== 'ind-info-btn') {
+    panel.style.display = 'none';
+  }
+});
+
 function toggleInd(key) {
   _indState[key] = !_indState[key];
+  var on = _indState[key];
   var btn = document.getElementById('tog-' + key);
-  if (btn) { btn.className = 'ind-toggle' + (_indState[key] ? ' on' : ''); }
+  if (btn) { btn.className = 'ind-toggle' + (on ? ' on' : ''); }
+
+  // TGA pane visibility
+  if (key === 'tga') {
+    var show = on ? 'block' : 'none';
+    ['macd-label','macd-chart','stoch-label','stoch-chart'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = show;
+    });
+    if (on) {
+      if (!_tgaData) {
+        _loadTgaPanel(_currentTicker, _currentDays);
+      } else {
+        _applyTgaData();
+      }
+      return;
+    }
+    return;
+  }
+
+  // SMA30 / SuperTrend — load TGA panel if not yet fetched
+  if ((key === 'sma30' || key === 'st') && on && !_tgaData) {
+    _loadTgaPanel(_currentTicker, _currentDays);
+    return;
+  }
+
+  // For SMA30/ST toggle off, just reapply to clear the series
+  if ((key === 'sma30' || key === 'st') && _tgaData) {
+    _applyTgaData();
+    return;
+  }
+
   loadChart(_currentTicker, _currentDays);
 }
 
@@ -6993,7 +7540,9 @@ document.querySelectorAll('.period-btn').forEach(function(b) {
 // Frame 2: load data — by this point the canvas context is guaranteed non-null
 requestAnimationFrame(function() {
   _createCharts();
-  requestAnimationFrame(function() { loadChart('AAPL', 90); });
+  var _initTicker = new URLSearchParams(window.location.search).get('ticker') || 'AAPL';
+  var _initDays   = parseInt(new URLSearchParams(window.location.search).get('days') || '90', 10);
+  requestAnimationFrame(function() { loadChart(_initTicker, _initDays); });
 });
 </script>
 </body>
@@ -7019,31 +7568,8 @@ if "charts" not in _PAGE_INFO:
         'Time range: 1M / 3M / 6M / 1Y. Click <b>Full Diagnostic</b> to run the live AI gate analysis for any ticker.'
     )
 
-# Add "📈 Charts" nav button — update _nav_html to include charts
-_orig_nav_html = _nav_html
-
-
-def _nav_html(active: str = '') -> str:
-    html = _orig_nav_html(active)
-    btn_charts = (
-        f'<a href="/charts" class="brief-btn" id="charts-btn"'
-        + (' style="border-color:#58a6ff!important;background:rgba(88,166,255,0.15)!important;"' if active == 'charts' else '')
-        + '><span class="brief-btn-title">&#128200; Charts</span>'
-        + '<span class="brief-btn-preview" id="charts-preview">Candles &middot; EMA &middot; Fibonacci</span></a>'
-    )
-    # Insert charts button after itool button
-    return html.replace(
-        '<a href="/signals"',
-        btn_charts + '<a href="/signals"',
-    )
-
-
 # Phase 2c — Chart buttons already injected above in _DIAG_BTN patch.
 # (btns += chart link added alongside the diagnose button after the info button)
-
-
-# ── Rebuild _CHARTS_HTML with updated nav (includes Charts button) ─────────────
-_CHARTS_HTML = _CHARTS_HTML.replace(_orig_nav_html("charts"), _nav_html("charts"))
 
 
 # ── Redesigned Paper Trade Dashboard (compare page) ───────────────────────────

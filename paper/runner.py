@@ -14,7 +14,7 @@ Can run alongside main.py (uses a separate DB and port-less — no web server).
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,12 +34,13 @@ from signals.insider_flow import InsiderFlowAnalyzer
 from signals.market_microstructure import VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
 from signals.aggregator import SignalAggregator, ClaudeMomentumAggregator
 from signals.supertrend import SuperTrendAnalyzer
+from signals.three_green_arrows import ThreeGreenArrowsAnalyzer
 from fud.filter_engine import FUDFilterEngine
 from decision.engine import DecisionEngine
 from risk.manager import RiskManager
 from broker.market_data import SchwabMarketData
 
-from paper.account import init_paper_db
+from paper.account import init_paper_db, PaperPosition
 from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS
 
 # Base buy threshold (must match signals/aggregator.py BUY_THRESHOLD)
@@ -294,6 +295,7 @@ def run_paper_cycle(
     risk_manager,
     market_data: SchwabMarketData,
     st_analyzer: SuperTrendAnalyzer = None,
+    tga_analyzer: ThreeGreenArrowsAnalyzer = None,
     models: list = None,
 ):
     """
@@ -365,6 +367,44 @@ def run_paper_cycle(
     _live_prices = {t: round(float(q["last_price"]), 2)
                     for t, q in _live_quotes.items() if q.get("last_price")}
 
+    # ── Stop-loss / take-profit monitoring ────────────────────────────────────
+    # Open positions may hold tickers not in the Stage 2 watchlist, so extend
+    # live quotes to cover them before checking stop/TP levels.
+    _open_pos_tickers: list = []
+    for m in models:
+        try:
+            with m["executor"].Session() as _s:
+                _open_pos_tickers.extend(p.ticker for p in _s.query(PaperPosition).all())
+        except Exception:
+            pass
+    _extra_pos_tickers = list(set(_open_pos_tickers) - set(_all_sg_tickers))
+    if _extra_pos_tickers:
+        _extra_pos_quotes = _fetch_live_quotes(_extra_pos_tickers)
+        _live_quotes.update(_extra_pos_quotes)
+        _live_prices.update({t: round(float(q["last_price"]), 2)
+                             for t, q in _extra_pos_quotes.items() if q.get("last_price")})
+
+    for m in models:
+        ex = m["executor"]
+        try:
+            with ex.Session() as _s:
+                _positions = _s.query(PaperPosition).all()
+                _pos_snap  = [(p.ticker, p.stop_loss, p.take_profit_1) for p in _positions]
+            for ticker, sl, tp1 in _pos_snap:
+                cur_p = _live_prices.get(ticker)
+                if not cur_p:
+                    continue
+                reason = None
+                if sl and cur_p <= sl:
+                    reason = f"STOP LOSS: ${cur_p:.2f} <= SL ${sl:.2f}"
+                elif tp1 and cur_p >= tp1:
+                    reason = f"TAKE PROFIT: ${cur_p:.2f} >= TP1 ${tp1:.2f}"
+                if reason:
+                    logger.info(f"[{m['name'].upper()}][STOP/TP] {ticker}: {reason} — selling")
+                    ex.execute_sell(ticker, cur_p, reason=reason)
+        except Exception as e:
+            logger.error(f"[{m['name'].upper()}][STOP/TP] monitoring failed: {e}")
+
     # ── Per-model log header ───────────────────────────────────────────────────
     for m in models:
         try:
@@ -409,6 +449,7 @@ def run_paper_cycle(
                 vwap       = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5  else None
                 vol_profile = vol_analyzer.analyze(ticker, highs, lows, closes, volumes)  if len(closes) >= 10 else None
                 st         = st_analyzer.analyze(ticker, highs, lows, closes, volumes)    if (st_analyzer and len(closes) >= 20) else None
+                tga        = tga_analyzer.analyze(ticker, closes, highs, lows, volumes)   if (tga_analyzer and len(closes) >= 35) else None
 
                 _tr_raw = _tr_get(ticker)
                 _tr_result = None
@@ -430,7 +471,7 @@ def run_paper_cycle(
                     vwap=vwap, vol_profile=vol_profile,
                     vix_regime=vix_regime, current_price=current_price,
                     itool_signal=_itool_signals.get(ticker),
-                    supertrend=st, tipranks=_tr_result,
+                    supertrend=st, tipranks=_tr_result, tga=tga,
                     buy_threshold_override=bt,
                 )
                 l3 = fud_engine.analyze_ticker(ticker, agg)
@@ -531,6 +572,7 @@ def run_paper_cycle(
                 vwap       = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5  else None
                 vol_p      = vol_analyzer.analyze(ticker, highs, lows, closes, volumes)   if len(closes) >= 10 else None
                 st         = st_analyzer.analyze(ticker, highs, lows, closes, volumes)    if (st_analyzer and len(closes) >= 20) else None
+                tga2       = tga_analyzer.analyze(ticker, closes, highs, lows, volumes)   if (tga_analyzer and len(closes) >= 35) else None
 
                 _tr_raw2 = _tr_get(ticker)
                 _tr_result2 = None
@@ -551,7 +593,7 @@ def run_paper_cycle(
                     analysis=analysis, fft=fft, fib=fib, insider=insider,
                     vwap=vwap, vol_profile=vol_p, vix_regime=vix_regime,
                     current_price=cur_p, itool_signal=_itool_signals.get(ticker),
-                    supertrend=st, tipranks=_tr_result2, buy_threshold_override=bt,
+                    supertrend=st, tipranks=_tr_result2, tga=tga2, buy_threshold_override=bt,
                 )
                 l3 = fud_engine.analyze_ticker(ticker, agg)
                 _elp = {ticker: round(float(_exit_quotes[ticker]["last_price"]), 2)} \
@@ -567,8 +609,23 @@ def run_paper_cycle(
                 if dec:
                     sig = (dec.action or "").upper()
                     if sig == "SELL":
-                        logger.info(f"[{m['name'].upper()}][AI EXIT] {ticker}: {sig} — triggering SELL")
-                        ex.execute_sell(ticker, cur_p or 0.0, reason=f"AI EXIT: {sig}")
+                        _ok_to_sell = True
+                        try:
+                            with ex.Session() as _s:
+                                _pos = _s.query(PaperPosition).filter_by(ticker=ticker).first()
+                                if _pos and _pos.opened_at:
+                                    _opened = _pos.opened_at
+                                    if _opened.tzinfo is None:
+                                        _opened = _opened.replace(tzinfo=timezone.utc)
+                                    _held_h = (datetime.now(timezone.utc) - _opened).total_seconds() / 3600
+                                    if _held_h < 2.0:
+                                        logger.info(f"[{m['name'].upper()}][AI EXIT] {ticker}: SELL suppressed — held {_held_h:.1f}h < 2h minimum")
+                                        _ok_to_sell = False
+                        except Exception:
+                            pass
+                        if _ok_to_sell:
+                            logger.info(f"[{m['name'].upper()}][AI EXIT] {ticker}: {sig} — triggering SELL")
+                            ex.execute_sell(ticker, cur_p or 0.0, reason=f"AI EXIT: {sig}")
             except Exception as e:
                 logger.error(f"[{m['name'].upper()}][AI EXIT] Failed for {ticker}: {e}")
 
@@ -630,6 +687,7 @@ def main():
     vix_detector     = VIXRegimeDetector()
     aggregator       = SignalAggregator()
     st_analyzer      = SuperTrendAnalyzer()
+    tga_analyzer     = ThreeGreenArrowsAnalyzer()
     fud_engine       = FUDFilterEngine(db_session_factory=Session)
     risk_manager     = RiskManager(db_session_factory=Session)
     market_data      = SchwabMarketData()
@@ -647,7 +705,7 @@ def main():
             fft_detector, fib_analyzer, insider_analyzer,
             vwap_calc, vol_analyzer, vix_detector, aggregator,
             fud_engine, risk_manager, market_data,
-            st_analyzer, paper_models,
+            st_analyzer, tga_analyzer, paper_models,
         ),
         trigger=CronTrigger(day_of_week="mon-fri", hour="9-16", minute="*/5"),
         id="paper_trading_cycle",

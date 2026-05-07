@@ -402,6 +402,37 @@ def main():
         replace_existing=True,
     )
 
+    def _run_alfred():
+        try:
+            from monitor.alfred import _compute_alfred
+            _compute_alfred()
+        except Exception as e:
+            logger.warning(f"[Alfred] scheduler failed: {e}")
+
+    scheduler.add_job(
+        func=_run_alfred,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="0-23", minute="*/5"),
+        id="alfred_forecast",
+        name="Alfred CME futures forecast (Mon-Fri)",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        func=_run_alfred,
+        trigger=CronTrigger(day_of_week="sun", hour="18-23", minute="*/5"),
+        id="alfred_forecast_sunday",
+        name="Alfred CME futures forecast (Sunday evening)",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        func=lambda: __import__('monitor.alfred', fromlist=['_run_backtest_all'])._run_backtest_all(),
+        trigger=CronTrigger(day_of_week="sun", hour=3),
+        id="alfred_backtest_weekly",
+        name="Alfred weekly backtest + calibration",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info("Scheduler started. Press Ctrl+C to stop.")
 
