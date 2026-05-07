@@ -17,7 +17,7 @@ import json
 import math
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -69,6 +69,11 @@ VIX_MULT_TABLE = [
 ]
 
 CHANGE_THRESHOLD_PTS = 5.0  # flag "REVISED" if forecast delta > this
+
+# ── Options model constants ───────────────────────────────────────────────────
+
+CONTRACT_MULTIPLIERS = {"/ES": 50,  "/MES": 5,  "/NQ": 20,  "/MNQ": 2}
+STRIKE_INTERVALS     = {"/ES": 5,   "/MES": 5,  "/NQ": 25,  "/MNQ": 25}
 
 # ── Market hours gate ────────────────────────────────────────────────────────
 
@@ -207,6 +212,55 @@ def _vix_mult(vix: float) -> float:
     return 1.6
 
 
+# ── Black-76 options model (pure stdlib — no scipy) ───────────────────────────
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erf."""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def _norm_ppf_approx(p: float) -> float:
+    """Rational approximation of the standard normal quantile (Beasley-Springer-Moro)."""
+    if p <= 0.0:
+        return -8.0
+    if p >= 1.0:
+        return 8.0
+    flip = p < 0.5
+    q = p if flip else 1.0 - p
+    t = math.sqrt(-2.0 * math.log(q))
+    c = (2.515517, 0.802853, 0.010328)
+    d = (1.432788, 0.189269, 0.001308)
+    approx = t - (c[0] + c[1]*t + c[2]*t*t) / (1.0 + d[0]*t + d[1]*t*t + d[2]*t*t*t)
+    return -approx if flip else approx
+
+
+def _black76_price(F: float, K: float, sigma: float, T: float, opt_type: str) -> float:
+    """Black-76 theoretical price for a European futures option (r=0)."""
+    if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    try:
+        d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+    d2 = d1 - sigma * sqrtT
+    if opt_type == "call":
+        return max(0.0, F * _norm_cdf(d1) - K * _norm_cdf(d2))
+    return max(0.0, K * _norm_cdf(-d2) - F * _norm_cdf(-d1))
+
+
+def _prob_worthless(F: float, K: float, sigma: float, T: float, opt_type: str) -> float:
+    """Risk-neutral probability that the option expires OTM (worthless to its buyer)."""
+    if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    try:
+        d2 = (math.log(F / K) - 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+    return _norm_cdf(-d2) if opt_type == "call" else _norm_cdf(d2)
+
+
 # ── Data fetchers ────────────────────────────────────────────────────────────
 
 def _fetch_ohlcv(yf_sym: str,
@@ -249,6 +303,25 @@ def _fetch_vix() -> float:
     return 20.0
 
 
+def _fetch_nq_vol(vix_fallback: float) -> float:
+    """
+    Annualized implied vol for /NQ and /MNQ via ^VXN (Nasdaq-100 volatility index).
+    Falls back to VIX × 1.25 if unavailable.
+    """
+    try:
+        df = yf.download("^VXN", period="5d", interval="1d",
+                         progress=False, auto_adjust=True)
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        closes = df["Close"].dropna().tolist()
+        if closes:
+            val = float(closes[-1]) / 100.0
+            logger.debug(f"[Alfred] VXN = {val*100:.1f}%")
+            return val
+    except Exception as exc:
+        logger.debug(f"[Alfred] VXN fetch failed: {exc}")
+    return vix_fallback * 1.25
+
+
 def _fetch_tipranks_bias(tr_ticker: str) -> float:
     """
     Return analyst implied upside fraction for SPY or QQQ.
@@ -275,6 +348,81 @@ def _fetch_tipranks_bias(tr_ticker: str) -> float:
     except Exception as exc:
         logger.debug(f"[Alfred] TipRanks bias ({tr_ticker}): {exc}")
     return 0.0
+
+
+# ── Options strike recommendation ────────────────────────────────────────────
+
+def _compute_options_strikes(sym: str, price: float, sigma_annual: float,
+                              sigma_source: str = "VIX") -> dict:
+    """
+    Black-76 strike recommendations for selling OTM calls and puts on CME futures.
+    Finds strikes with ≥75% probability of expiring worthless for each of 3 days.
+    Returns dollar premium and meets_150 flag using CONTRACT_MULTIPLIERS.
+    """
+    mult     = CONTRACT_MULTIPLIERS.get(sym, 50)
+    interval = STRIKE_INTERVALS.get(sym, 5)
+    z75      = _norm_ppf_approx(0.75)   # ≈ 0.6745
+
+    # Compute next 3 trading-day expiry labels (skip weekends)
+    today = datetime.now(_ET).date()
+    expiry_dates: dict = {}
+    d = today
+    count = 0
+    while count < 3:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+            expiry_dates[count] = d
+
+    result: dict = {
+        "sigma_annual": round(sigma_annual, 4),
+        "sigma_source": sigma_source,
+    }
+
+    for n in range(1, 4):
+        T     = n / 252.0
+        sqrtT = math.sqrt(T)
+        shift = z75 * sigma_annual * sqrtT
+
+        # Raw 75%-probability strikes
+        k_call_raw = price * math.exp(+shift)
+        k_put_raw  = price * math.exp(-shift)
+
+        # Round to nearest valid CME strike interval
+        k_call = round(round(k_call_raw / interval) * interval, 2)
+        k_put  = round(round(k_put_raw  / interval) * interval, 2)
+
+        # Actual probability and premium at rounded strikes
+        prob_call     = _prob_worthless(price, k_call, sigma_annual, T, "call")
+        prob_put      = _prob_worthless(price, k_put,  sigma_annual, T, "put")
+        prem_call_pts = _black76_price(price, k_call, sigma_annual, T, "call")
+        prem_put_pts  = _black76_price(price, k_put,  sigma_annual, T, "put")
+        prem_call_usd = int(round(prem_call_pts * mult))
+        prem_put_usd  = int(round(prem_put_pts  * mult))
+
+        # Cross-platform date label (Windows doesn't support %-m/%-d)
+        exp_d = expiry_dates.get(n)
+        exp_label = (exp_d.strftime("%a") + f" {exp_d.month}/{exp_d.day}") if exp_d else f"+{n}d"
+
+        result[str(n)] = {
+            "expiry_label": exp_label,
+            "call": {
+                "strike":      k_call,
+                "premium_pts": round(prem_call_pts, 2),
+                "premium_$":   prem_call_usd,
+                "prob":        round(prob_call, 4),
+                "meets_150":   prem_call_usd >= 150,
+            },
+            "put": {
+                "strike":      k_put,
+                "premium_pts": round(prem_put_pts, 2),
+                "premium_$":   prem_put_usd,
+                "prob":        round(prob_put, 4),
+                "meets_150":   prem_put_usd >= 150,
+            },
+        }
+
+    return result
 
 
 # ── Core forecast engine ─────────────────────────────────────────────────────
@@ -580,6 +728,10 @@ def _compute_alfred(force: bool = False) -> bool:
         for proxy in set(TIPRANKS_PROXIES.values()):
             tr_cache[proxy] = _fetch_tipranks_bias(proxy)
 
+        # Vol for options model — VIX for /ES,/MES; ^VXN for /NQ,/MNQ
+        vix_dec  = vix / 100.0
+        nq_sigma = _fetch_nq_vol(vix_dec)
+
         now_et  = datetime.now(_ET)
         ts_str  = now_et.strftime("%Y-%m-%d %H:%M:%S ET")
         forecast_syms: dict = {}
@@ -593,6 +745,10 @@ def _compute_alfred(force: bool = False) -> bool:
                 sym=sym, highs=h, lows=l, closes=c,
                 vix=vix, calib=calib, tr_bias_raw=tr_cache.get(proxy, 0.0),
             )
+            if "error" not in fc:
+                sigma    = nq_sigma if sym in ("/NQ", "/MNQ") else vix_dec
+                sig_src  = "VXN" if sym in ("/NQ", "/MNQ") else "VIX"
+                fc["options"] = _compute_options_strikes(sym, fc["price"], sigma, sig_src)
             forecast_syms[sym] = fc
 
         payload = {
@@ -713,6 +869,93 @@ def _build_alfred_html(forecast: dict, anchor: dict, backtest: dict) -> str:
         st_dir = fc.get("st_direction", "")
         st_col = "#3fb950" if st_dir == "BULLISH" else "#f85149"
 
+        # ── Options strikes section ──────────────────────────────────────────
+        opts = fc.get("options", {})
+        opts_html = ""
+        if opts:
+            mult_val = CONTRACT_MULTIPLIERS.get(sym, 50)
+            sigma_pct = round(opts.get("sigma_annual", 0) * 100, 1)
+            sig_src   = opts.get("sigma_source", "VIX")
+            below_150_syms = []
+
+            def _prem_cell(info: dict, side: str) -> str:
+                usd  = info.get("premium_$", 0)
+                pts  = info.get("premium_pts", 0)
+                if usd >= 150:
+                    col   = "#3fb950"
+                    badge = " &#10003;"
+                elif usd >= 75:
+                    col   = "#d29922"
+                    badge = ""
+                else:
+                    col   = "#f85149"
+                    n_ct  = max(2, math.ceil(150 / usd)) if usd > 0 else "?"
+                    badge = f" <span style='font-size:9px;'>({n_ct}&times;)</span>"
+                txt_col = "#58a6ff" if side == "call" else "#f85149"
+                return (f'<td style="color:{col};font-weight:700;">'
+                        f'${usd:,}{badge}'
+                        f'<br><span style="color:#8b949e;font-weight:400;font-size:10px;">{pts:.1f}pts</span>'
+                        f'</td>')
+
+            opts_rows = ""
+            any_below = False
+            for n in range(1, 4):
+                nd = opts.get(str(n), {})
+                if not nd:
+                    continue
+                ci    = nd.get("call", {})
+                pi    = nd.get("put",  {})
+                exp_l = nd.get("expiry_label", f"+{n}d")
+                c_str = _fmt_price(ci.get("strike"))
+                p_str = _fmt_price(pi.get("strike"))
+                c_prob = ci.get("prob", 0) * 100
+                p_prob = pi.get("prob", 0) * 100
+                if not ci.get("meets_150") or not pi.get("meets_150"):
+                    any_below = True
+                opts_rows += (
+                    f'<tr>'
+                    f'<td class="alf-day">{exp_l}</td>'
+                    f'<td class="alf-hi" style="font-size:13px;">{c_str}</td>'
+                    f'{_prem_cell(ci, "call")}'
+                    f'<td style="color:#8b949e;font-size:11px;">{c_prob:.1f}%</td>'
+                    f'<td class="alf-opts-divider alf-lo" style="font-size:13px;">{p_str}</td>'
+                    f'{_prem_cell(pi, "put")}'
+                    f'<td style="color:#8b949e;font-size:11px;">{p_prob:.1f}%</td>'
+                    f'</tr>'
+                )
+
+            micro_note = ""
+            if any_below:
+                # compute minimum contracts needed for $150 from Day 1 call premium
+                d1_prem = opts.get("1", {}).get("call", {}).get("premium_$", 0)
+                n_needed = max(2, math.ceil(150 / d1_prem)) if d1_prem > 0 else "?"
+                micro_note = (f'<div class="alf-opts-note">&#9432; Micro contract: '
+                              f'~{n_needed} contracts needed per side to collect $150. '
+                              f'Consider the full-size equivalent for single-contract trades.</div>')
+
+            opts_html = f"""
+  <div class="alf-opts-wrap">
+    <div class="alf-opts-hdr">
+      <span>OPTIONS STRIKES &mdash; SELL FOR PREMIUM</span>
+      <span class="alf-opts-sigma">&sigma;&nbsp;=&nbsp;{sigma_pct}% ({sig_src}) &nbsp;&bull;&nbsp; ${mult_val}/pt &nbsp;&bull;&nbsp; 75%+ P(worthless)</span>
+    </div>
+    <table class="alf-opts-tbl">
+      <thead>
+        <tr>
+          <th>Expiry</th>
+          <th style="color:#3fb950;">CALL Strike &#9650;</th>
+          <th style="color:#3fb950;">Premium</th>
+          <th>P(OTM)</th>
+          <th style="color:#f85149;padding-left:8px;">PUT Strike &#9660;</th>
+          <th style="color:#f85149;">Premium</th>
+          <th>P(OTM)</th>
+        </tr>
+      </thead>
+      <tbody>{opts_rows}</tbody>
+    </table>
+    {micro_note}
+  </div>"""
+
         return f"""
 <div class="alf-card">
   <div class="alf-card-hdr">
@@ -739,6 +982,7 @@ def _build_alfred_html(forecast: dict, anchor: dict, backtest: dict) -> str:
     </thead>
     <tbody>{rows_html}</tbody>
   </table>
+  {opts_html}
   <details class="alf-analysis">
     <summary>Analysis ▸</summary>
     <ul class="alf-bullets">{bullets_html}</ul>
@@ -838,6 +1082,19 @@ def _build_alfred_html(forecast: dict, anchor: dict, backtest: dict) -> str:
     .alf-lo-hdr{{color:#f85149;}}
     .alf-rng{{color:#d29922;}}
     .alf-delta{{font-size:11px;}}
+    .alf-opts-wrap{{margin-top:12px;border-top:1px solid #21262d;padding-top:10px;}}
+    .alf-opts-hdr{{display:flex;justify-content:space-between;align-items:center;
+      margin-bottom:6px;flex-wrap:wrap;gap:6px;}}
+    .alf-opts-hdr span:first-child{{font-size:11px;font-weight:700;color:#e6edf3;
+      text-transform:uppercase;letter-spacing:0.4px;}}
+    .alf-opts-sigma{{font-size:10px;color:#8b949e;}}
+    .alf-opts-tbl{{width:100%;border-collapse:collapse;font-size:12px;}}
+    .alf-opts-tbl th{{color:#8b949e;font-weight:600;padding:3px 6px;
+      border-bottom:1px solid #21262d;text-align:left;font-size:10px;}}
+    .alf-opts-tbl td{{padding:5px 6px;border-bottom:1px solid #161b22;vertical-align:middle;}}
+    .alf-opts-tbl tbody tr:hover{{background:#1c2128;}}
+    .alf-opts-divider{{border-left:2px solid #21262d;padding-left:8px;}}
+    .alf-opts-note{{font-size:10px;color:#8b949e;margin-top:5px;padding:3px 0;}}
     .alf-analysis{{margin-top:10px;}}
     .alf-analysis summary{{cursor:pointer;color:#58a6ff;font-size:11px;user-select:none;outline:none;}}
     .alf-analysis summary:hover{{color:#79c0ff;}}
@@ -897,6 +1154,15 @@ def _build_alfred_html(forecast: dict, anchor: dict, backtest: dict) -> str:
       <li><b>Range (pts):</b> Total width of the forecast band — wider = more uncertainty.</li>
       <li><b>&Delta; from Anchor:</b> How much today's forecast has moved since the first compute of this trading day. <span style="color:#d29922;font-weight:700;">REVISED</span> badge appears when delta &gt; 5 pts.</li>
       <li><b>Acc D1 badge:</b> Backtest containment rate for Day-1 forecasts. Green &ge;70%, yellow &ge;55%, red below.</li>
+    </ul>
+    <h4>Options Strikes — Black-76 Model</h4>
+    <ul>
+      <li><b>Model:</b> Black-76 (Black-Scholes adapted for futures; risk-free rate = 0). Gives theoretical fair value and risk-neutral probability for each strike.</li>
+      <li><b>Volatility source:</b> <code>&sigma;</code> = VIX&nbsp;&divide;&nbsp;100 for /ES &amp; /MES; <code>&sigma;</code> = VXN&nbsp;&divide;&nbsp;100 (^VXN, fallback VIX&times;1.25) for /NQ &amp; /MNQ.</li>
+      <li><b>Strike selection:</b> Finds the strike where <code>P(expire worthless) &ge; 75%</code>, then rounds to the nearest CME interval (5 pts for /ES,/MES; 25 pts for /NQ,/MNQ). Actual probability is recalculated at the rounded strike.</li>
+      <li><b>Premium:</b> Black-76 theoretical value &times; contract multiplier ($50/pt /ES, $20/pt /NQ, $5/pt /MES, $2/pt /MNQ). <span style="color:#3fb950;">Green &#10003;</span> = meets $150/contract target. <span style="color:#f85149;">Red</span> = below target (number in parentheses = contracts needed).</li>
+      <li><b>Micro contracts:</b> /MES and /MNQ rarely collect $150 from a single contract at 75%+ probability. The note below the table shows how many contracts are needed.</li>
+      <li><b>Note:</b> These are theoretical model premiums based on implied vol. Actual bid/ask spreads and liquidity at these strikes may differ. Always verify live quotes on CME/ThinkorSwim before entering.</li>
     </ul>
     <h4>Limitations &amp; Risk</h4>
     <ul>

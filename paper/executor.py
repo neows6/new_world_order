@@ -238,46 +238,44 @@ class PaperExecutor:
                     daily_pnl = round(total_equity - snap.total_equity, 2)
                     daily_pnl_pct = round((daily_pnl / snap.total_equity * 100) if snap.total_equity else 0, 2)
                 else:
-                    # No snapshot yet — reconstruct start-of-day equity from trade history
+                    # No prior snapshot — only reconstruct if trades happened today.
+                    # Without today's trades the formula degenerates to (mkt_val - cost_basis)
+                    # which is identical to total_pnl, making the card misleading.
                     today_start = _dt.combine(today, _dt.min.time())
-                    last_prior = (
-                        s.query(PaperTrade)
-                        .filter(
-                            PaperTrade.timestamp < today_start,
-                            PaperTrade.cash_after.isnot(None),
-                        )
-                        .order_by(PaperTrade.timestamp.desc())
-                        .first()
+                    today_buy_total = sum(
+                        t.total for t in s.query(PaperTrade)
+                        .filter(PaperTrade.action == "BUY",
+                                PaperTrade.timestamp >= today_start)
+                        .all()
                     )
-                    if last_prior:
-                        # Cash at start of today = cash_after of last trade before today
-                        start_cash = last_prior.cash_after
-                        # Today's buys added to cost basis — remove them to get prior positions value
-                        today_buy_total = sum(
-                            t.total for t in s.query(PaperTrade)
-                            .filter(
-                                PaperTrade.action == "BUY",
-                                PaperTrade.timestamp >= today_start,
-                            )
-                            .all()
+                    if today_buy_total > 0:
+                        last_prior = (
+                            s.query(PaperTrade)
+                            .filter(PaperTrade.timestamp < today_start,
+                                    PaperTrade.cash_after.isnot(None))
+                            .order_by(PaperTrade.timestamp.desc())
+                            .first()
                         )
-                        start_pos_value = max(0.0, total_cost - today_buy_total)
-                        start_equity = start_cash + start_pos_value
-                        if start_equity > 0:
-                            daily_pnl = round(total_equity - start_equity, 2)
-                            daily_pnl_pct = round(daily_pnl / start_equity * 100, 2)
-                    # Save a snapshot for today so future calls use it
-                    try:
-                        if not s.query(PaperEquitySnapshot).filter_by(snap_date=today).first():
-                            s.add(PaperEquitySnapshot(
-                                snap_date=today,
-                                total_equity=total_equity,
-                                cash=cash,
-                                positions_value=total_mkt_val,
-                            ))
-                            s.commit()
-                    except Exception:
-                        pass
+                        if last_prior:
+                            start_cash = last_prior.cash_after
+                            start_pos_value = max(0.0, total_cost - today_buy_total)
+                            start_equity = start_cash + start_pos_value
+                            if start_equity > 0:
+                                daily_pnl = round(total_equity - start_equity, 2)
+                                daily_pnl_pct = round(daily_pnl / start_equity * 100, 2)
+
+                # Always save today's snapshot (idempotent) so tomorrow has a baseline
+                try:
+                    if not s.query(PaperEquitySnapshot).filter_by(snap_date=today).first():
+                        s.add(PaperEquitySnapshot(
+                            snap_date=today,
+                            total_equity=total_equity,
+                            cash=cash,
+                            positions_value=total_mkt_val,
+                        ))
+                        s.commit()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
