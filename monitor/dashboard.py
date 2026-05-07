@@ -1381,9 +1381,11 @@ function renderSignals(signals) {
       ? `<small style="color:${Math.abs(chg)>3?(chg>0?'#3fb950':'#f85149'):'#555'};display:block;font-size:10px">${Math.abs(chg)>3?(chg>0?'▲ bullish signal':'▼ bearish pressure'):'~ neutral move'}</small>`
       : '';
 
-    // UTC → ET
-    const utcStr   = s.generated_at.replace(' ', 'T') + 'Z';
-    const localTime = new Date(utcStr).toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    // UTC → ET (handles both "2026-05-06 14:30:22 ET" and "2026-05-06T20:04:06" formats, plus null)
+    const _ga = s.generated_at || '';
+    const _gaClean = _ga.replace(/ ET$/, '').replace(' ', 'T');
+    const utcStr   = _gaClean ? _gaClean + 'Z' : '';
+    const localTime = utcStr ? new Date(utcStr).toLocaleTimeString('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
 
     const isAiWatch = _aiWatchTickers.includes(s.ticker);
     const aiWatchBadge = isAiWatch ? ' <span style="background:#7c4dff;color:#fff;font-size:9px;padding:1px 5px;border-radius:2px;vertical-align:middle">AI</span>' : '';

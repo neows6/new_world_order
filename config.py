@@ -90,6 +90,10 @@ class AppConfig:
         "UAVS", "RIVN", "QBTS", "RCAT",
         # Stage Gate tickers — must be in watchlist for price/fundamentals ingestion
         "AEE", "AEP", "AFL", "ADI", "AJG", "ACGL",
+        # Stage 2 additions — 20 large-cap tickers added 2026-05-06
+        "NVDA", "ABBV", "ADBE", "BAC", "BLK", "CAT", "COST", "CRM",
+        "CVX", "HD", "LIN", "LLY", "MCD", "NFLX", "ORCL", "PLD",
+        "QCOM", "RTX", "UNH", "WFC", "XOM",
     ])
 
     # How often to refresh fundamentals (hours)
