@@ -95,12 +95,46 @@ class TipRanksClient:
         self._session    = None
         self._ensure_session()
 
+    def _try_cloudflare_refresh(self) -> bool:
+        """
+        Attempt to renew the short-lived __cf_bm Cloudflare cookie by hitting
+        the TipRanks homepage. curl_cffi's Chrome TLS impersonation usually
+        passes Cloudflare's fingerprint check and receives a fresh cookie
+        without needing real browser JavaScript.
+        Returns True if a new __cf_bm was received and the session is usable again.
+        """
+        try:
+            for cookie_name in ("__cf_bm", "TiPMix", "x-ms-routing-name"):
+                try:
+                    self._session.cookies.delete(cookie_name)
+                except Exception:
+                    pass
+            resp = self._session.get("https://www.tipranks.com/", timeout=15)
+            if resp.status_code == 200:
+                new_cfbm = self._session.cookies.get("__cf_bm")
+                if new_cfbm:
+                    logger.info("[TipRanks] Cloudflare cookie auto-refreshed successfully")
+                    return True
+                # Even without __cf_bm, a 200 means we're through — try proceeding
+                logger.info("[TipRanks] Cloudflare warm-up returned 200 (no new cf_bm cookie, but proceeding)")
+                return True
+            logger.debug(f"[TipRanks] Cloudflare refresh got HTTP {resp.status_code}")
+            return False
+        except Exception as e:
+            logger.debug(f"[TipRanks] Cloudflare refresh attempt failed: {e}")
+            return False
+
     # ── Fetchers ──────────────────────────────────────────────────────────────
 
     def _get(self, url: str) -> dict:
-        """GET url, raise on non-200, return parsed JSON."""
+        """GET url, raise on non-200, return parsed JSON. Auto-retries once on 403."""
         resp = self._session.get(url, timeout=20)
         if resp.status_code in (401, 403):
+            logger.debug(f"[TipRanks] HTTP {resp.status_code} — attempting Cloudflare auto-refresh")
+            if self._try_cloudflare_refresh():
+                resp = self._session.get(url, timeout=20)
+                if resp.status_code == 200:
+                    return resp.json()
             raise PermissionError(
                 f"HTTP {resp.status_code} — cookies may be expired. "
                 "Re-export from browser and call reload_cookies()."
@@ -140,6 +174,20 @@ class TipRanksClient:
             self._ensure_session()
             return self._get(_NEWS_URL.format(ticker=ticker))
 
+    def _auth_cookies_valid(self) -> bool:
+        """Return True if the long-lived auth cookies (token, tr-uid) are still unexpired."""
+        try:
+            cookies = json.loads(_COOKIE_FILE.read_text(encoding="utf-8-sig"))
+            now = time.time()
+            for c in cookies:
+                if c.get("name") in ("token", "tr-uid") and not c.get("session"):
+                    exp = c.get("expirationDate") or c.get("expires") or c.get("expiry")
+                    if exp and float(exp) > now:
+                        return True
+            return False
+        except Exception:
+            return False
+
     def get_batch(self, tickers: list, delay: float = 0.5) -> dict:
         """Fetch getData for all tickers. Returns {ticker: data}. Skips errors."""
         results = {}
@@ -148,7 +196,31 @@ class TipRanksClient:
                 results[ticker] = self.get_stock_data(ticker)
                 time.sleep(delay)
             except PermissionError as e:
-                logger.warning(f"[TipRanks] Auth error on {ticker} — stopping batch: {e}")
+                logger.warning(f"[TipRanks] 403 on {ticker} — waiting 60s then retrying once")
+                time.sleep(60)
+                try:
+                    results[ticker] = self.get_stock_data(ticker)
+                    logger.info(f"[TipRanks] Retry succeeded for {ticker} after backoff")
+                    time.sleep(delay)
+                    continue
+                except PermissionError:
+                    pass
+                except Exception:
+                    pass
+                # Still failing — check if it's a real auth expiry or just rate-limiting
+                if self._auth_cookies_valid():
+                    logger.warning("[TipRanks] Auth cookies still valid — 403 is rate-limiting, not expiry. Skipping batch.")
+                else:
+                    logger.warning("[TipRanks] Auth cookies appear expired — alerting via Telegram")
+                    try:
+                        from monitor.telegram_bot import send_alert as _tg
+                        _tg(
+                            "⚠️ <b>TipRanks cookies expired</b>\n"
+                            "Re-export cookies from tipranks.com "
+                            "and save to <code>data/tipranks_cookies.json</code>, then restart the server."
+                        )
+                    except Exception:
+                        pass
                 break
             except Exception as e:
                 logger.debug(f"[TipRanks] skip {ticker}: {e}")

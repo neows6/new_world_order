@@ -398,7 +398,12 @@ class FUDFilterEngine:
             fud_arts     = [a for a in scored_articles if a.is_fud]
             neutral_arts = [a for a in scored_articles if a.is_neutral]
 
-            avg_fud_score = statistics.mean(a.fud_score for a in scored_articles) if scored_articles else 0.50
+            # Exclude SEC filings (is_primary_source) from the quality average.
+            # Filings are a binary structural signal tracked via has_10k/10q/8k.
+            # Mixing them into the average pins every large-cap at the filing
+            # auto-score (0.70) regardless of actual news coverage quality.
+            news_only = [a for a in scored_articles if not a.is_primary_source]
+            avg_fud_score = statistics.mean(a.fud_score for a in news_only) if news_only else 0.50
             quality_ratio = len(quality_arts) / total if total > 0 else 0.50
 
             # Credibility-weighted sentiment

@@ -240,7 +240,7 @@ class FUDClassifier:
             return ArticleScore(
                 headline=headline, source=source, url=url,
                 published_at=published_at, ticker=ticker,
-                fud_score=0.95, sentiment=0.0,
+                fud_score=0.70, sentiment=0.0,
                 source_credibility=credibility,
                 has_financial_data=True, is_primary_source=True,
                 is_quality_signal=True, is_fud=False, is_neutral=False,

@@ -33,6 +33,7 @@ from signals.fibonacci import FibonacciAnalyzer
 from signals.insider_flow import InsiderFlowAnalyzer
 from signals.market_microstructure import VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
 from signals.aggregator import SignalAggregator, ClaudeMomentumAggregator
+from signals.momentum import MomentumAnalyzer
 from signals.supertrend import SuperTrendAnalyzer
 from signals.three_green_arrows import ThreeGreenArrowsAnalyzer
 from fud.filter_engine import FUDFilterEngine
@@ -41,10 +42,12 @@ from risk.manager import RiskManager
 from broker.market_data import SchwabMarketData
 
 from paper.account import init_paper_db, PaperPosition
-from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS
+from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS, DEFAULT_STAGE2_TICKERS
 
 # Base buy threshold (must match signals/aggregator.py BUY_THRESHOLD)
 _BASE_BUY_THRESHOLD = 0.08
+
+_momentum_analyzer = MomentumAnalyzer()
 
 
 def setup_logging():
@@ -163,29 +166,28 @@ def _append_daily_log(model_name: str, cycle_time: str, decisions: dict, approve
         logger.warning(f"[DAILY LOG] Failed to write: {e}")
 
 
+_SHARED_STAGEGATE = "data/stagegate.json"
+
 def _get_stage2_tickers(stagegate_file: str = "data/stagegate.json") -> list:
-    """Return Stage 2 tickers from the model's stagegate file.
-    For the russell2000 model, stage1 IS the processing universe (stage2 stays empty)."""
+    """Return Stage 2 tickers.
+    Stage 2 is shared across all models — always read from the standard stagegate.json.
+    The per-model file is only used for its own stage3 (open positions)."""
     import json
     from pathlib import Path
-    sg_file = Path(stagegate_file)
-    if sg_file.exists():
+    # Stage2 is always sourced from the shared stagegate.json regardless of model
+    shared = Path(_SHARED_STAGEGATE)
+    if shared.exists():
         try:
-            sg = json.loads(sg_file.read_text(encoding="utf-8"))
-            stage1 = sg.get("stage1", [])
+            sg = json.loads(shared.read_text(encoding="utf-8"))
             stage2 = sg.get("stage2", [])
             stage3 = sg.get("stage3", [])
             if stage2:
-                logger.info(f"Stage Gate ({stagegate_file}): running AI on {len(stage2)} Stage 2 tickers: {stage2}")
+                logger.info(f"Stage Gate: running AI on {len(stage2)} Stage 2 tickers: {stage2}")
                 return stage2
-            if stage3:
-                # Stage2 empty but positions held in Stage3 — no new candidates, don't fall back
-                logger.info(f"Stage Gate ({stagegate_file}): stage2 empty, {len(stage3)} held in stage3 — skipping cycle")
-                return []
         except Exception:
             pass
-    logger.info(f"Stage Gate ({stagegate_file}): no Stage 2 tickers — falling back to full watchlist")
-    return list(config.watchlist)
+    logger.info("Stage Gate: stage2 empty — seeding with DEFAULT_STAGE2_TICKERS")
+    return list(DEFAULT_STAGE2_TICKERS)
 
 
 def _get_ai_exit_tickers(stagegate_file: str = "data/stagegate.json") -> list:
@@ -228,6 +230,14 @@ def _seed_model_stagegates():
         standard = json.loads(src.read_text(encoding="utf-8"))
     except Exception:
         return
+    # If the standard stagegate has no stage2 tickers, initialize with defaults
+    if not standard.get("stage2"):
+        try:
+            standard["stage2"] = DEFAULT_STAGE2_TICKERS
+            src.write_text(json.dumps(standard, indent=2), encoding="utf-8")
+            logger.info(f"[PAPER] Seeded standard stagegate stage2 with {len(DEFAULT_STAGE2_TICKERS)} default tickers")
+        except Exception as e:
+            logger.warning(f"[PAPER] Could not seed standard stagegate stage2: {e}")
     for model, cfg in PAPER_MODEL_CONFIGS.items():
         if model == "standard":
             continue
@@ -448,6 +458,7 @@ def run_paper_cycle(
                 insider    = insider_analyzer.score(ticker, cik, current_price) if cik               else None
                 vwap       = vwap_calc.compute_daily(ticker, highs, lows, closes, volumes) if len(closes) >= 5  else None
                 vol_profile = vol_analyzer.analyze(ticker, highs, lows, closes, volumes)  if len(closes) >= 10 else None
+                momentum   = _momentum_analyzer.analyze(ticker, closes, volumes=volumes)  if len(closes) >= 30 else None
                 st         = st_analyzer.analyze(ticker, highs, lows, closes, volumes)    if (st_analyzer and len(closes) >= 20) else None
                 tga        = tga_analyzer.analyze(ticker, closes, highs, lows, volumes)   if (tga_analyzer and len(closes) >= 35) else None
 
@@ -471,7 +482,7 @@ def run_paper_cycle(
                     vwap=vwap, vol_profile=vol_profile,
                     vix_regime=vix_regime, current_price=current_price,
                     itool_signal=_itool_signals.get(ticker),
-                    supertrend=st, tipranks=_tr_result, tga=tga,
+                    momentum=momentum, supertrend=st, tipranks=_tr_result, tga=tga,
                     buy_threshold_override=bt,
                 )
                 l3 = fud_engine.analyze_ticker(ticker, agg)

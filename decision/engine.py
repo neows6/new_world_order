@@ -396,6 +396,44 @@ class DecisionEngine:
                 f"short-term trend is down; wait for price to reclaim EMA or use 'ema' bypass"
             )
 
+        # Gate 9: Margin of Safety hard floor (-50%)
+        # Rejects signals where price is >50% above intrinsic value.
+        # TSLA/CAT-style DCF failures show -8000%+ MOS — this eliminates them cleanly.
+        agg = layer3.incoming_signal if hasattr(layer3, "incoming_signal") else None
+        mos = getattr(agg, "margin_of_safety", None)
+        if "mos" in _bypass:
+            passed.append(f"MOS: BYPASSED ({mos:.0%} vs -50% floor) — user override")
+        elif mos is None:
+            passed.append("MOS: skipped — no intrinsic value data")
+        elif mos >= -0.50:
+            passed.append(f"MOS: {mos:.0%} ≥ -50% floor ✓")
+        else:
+            failed.append(
+                f"MOS: {mos:.0%} < -50% floor — price too far above intrinsic value "
+                f"(bypass 'mos' to override)"
+            )
+            blocker = blocker or f"Margin of safety {mos:.0%} below -50% hard floor"
+
+        # Gate 10: Three Green Arrows — require ≥1/3 for BUY confirmation
+        # Guards against news-driven buys with zero momentum/technical validation.
+        tga_count = getattr(agg, "tga_arrows_count", None)
+        if "tga" in _bypass:
+            passed.append(f"TGA: BYPASSED ({tga_count}/3 arrows) — user override")
+        elif tga_count is None:
+            passed.append("TGA: skipped — no TGA data")
+        elif tga_count >= 1:
+            arrow_parts = []
+            if getattr(agg, "tga_sma_arrow",   False): arrow_parts.append("SMA")
+            if getattr(agg, "tga_macd_arrow",  False): arrow_parts.append("MACD")
+            if getattr(agg, "tga_stoch_arrow", False): arrow_parts.append("Stoch")
+            passed.append(f"TGA: {tga_count}/3 arrows ({', '.join(arrow_parts) or 'active'}) — momentum confirmed")
+        else:
+            failed.append(
+                f"TGA: 0/3 arrows — no momentum/technical confirmation "
+                f"(bypass 'tga' to override)"
+            )
+            blocker = blocker or "Three Green Arrows: 0/3 signals — no momentum confirmation"
+
         go_no_go = len(failed) == 0 and blocker is None
         return passed, failed, blocker, go_no_go
 
@@ -639,6 +677,7 @@ class DecisionEngine:
                     signal=result.action,
                     confidence=result.decision_confidence,
                     margin_of_safety=agg.margin_of_safety,
+                    intrinsic_value_estimate=agg.intrinsic_value_conservative,
                     fud_score=layer3_result.fud_analysis.avg_fud_score,
                     current_price=result.entry_price,
                     suggested_position_pct=result.recommended_position_pct,
