@@ -5624,6 +5624,18 @@ async def api_paper_sell(request: Request, model: str = "standard"):
         sg[f"stage{target_stage}"].append(ticker)
         _sg_save(sg)
 
+        try:
+            from monitor.telegram_bot import send_alert as _tg_manual
+            _mlabel = {"standard": "Standard", "relaxed": "Relaxed -25%",
+                       "very_relaxed": "Relaxed -50%", "claude": "Claude"}.get(model, model.title())
+            _tg_manual(
+                f"\U0001f534 <b>PAPER SELL (Manual)</b> [{_mlabel}]\n"
+                f"<b>{ticker}</b>  {qty:.2f} shares @ ${price:.2f}\n"
+                f"Proceeds: ${proceeds:,.2f}  |  Moved to Stage {target_stage}"
+            )
+        except Exception:
+            pass
+
         return {"status": "ok", "ticker": ticker, "qty": qty, "price": price, "proceeds": proceeds}
 
     except Exception as exc:
@@ -5689,13 +5701,13 @@ async def _schedule_morning_brief():
                                      name="thesis-morning-recap").start()
                     _slog.info("[ThesisAnalysis] Morning recap sent at 08:00 ET")
 
-                # Market-close pattern analysis — 16:10 ET (after TipRanks at 16:05)
+                # Market-close pattern analysis — 16:45 ET (theses finish generating ~16:35)
                 key_close = (now.date(), "thesis_analysis")
-                if now.hour == 16 and now.minute == 10 and key_close not in fired_today:
+                if now.hour == 16 and now.minute == 45 and key_close not in fired_today:
                     fired_today.add(key_close)
                     threading.Thread(target=_run_thesis_analysis, daemon=True,
                                      name="thesis-analysis").start()
-                    _slog.info("[ThesisAnalysis] Auto-analysis triggered at 16:10 ET")
+                    _slog.info("[ThesisAnalysis] Auto-analysis triggered at 16:45 ET")
                 # Prune old keys daily
                 today = now.date()
                 fired_today = {k for k in fired_today if k and k[0] == today}
@@ -7477,11 +7489,14 @@ _CHARTS_HTML = """<!DOCTYPE html>
   .ind-toggle { padding:3px 8px;border-radius:4px;border:1px solid #30363d;
     background:#161b22;color:#8b949e;cursor:pointer;font-size:11px; }
   .ind-toggle.on { border-color:#3fb950;color:#3fb950; }
-  #main-chart  { width:100%;height:520px;border:1px solid #21262d;border-radius:6px;overflow:hidden; }
-  #rsi-chart   { width:100%;height:110px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
-  #vol-chart   { width:100%;height:90px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
-  #macd-chart  { width:100%;height:100px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
-  #stoch-chart { width:100%;height:100px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:4px; }
+  #main-chart  { width:100%;height:340px;border:1px solid #21262d;border-radius:6px;overflow:hidden; }
+  #rsi-chart   { width:100%;height:80px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:3px; }
+  #vol-chart   { width:100%;height:70px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:3px; }
+  #macd-chart  { width:100%;height:75px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:3px; }
+  #stoch-chart { width:100%;height:75px;border:1px solid #21262d;border-radius:6px;overflow:hidden;margin-top:3px; }
+  header .brief-btn { padding:3px 8px; }
+  header .brief-btn-title { font-size:11px; }
+  header .brief-btn-preview { font-size:9px; }
   .pane-label  { font-size:11px;color:#8b949e;padding:2px 8px;margin-top:4px;display:flex;align-items:center;gap:8px; }
   .pane-label b { color:#c9d1d9; }
   .ohlcv-bar { font-size:11px;color:#8b949e;padding:4px 8px;margin-bottom:4px;
@@ -7521,20 +7536,26 @@ _CHARTS_HTML = """<!DOCTYPE html>
 <div class="chart-wrap">
   <div class="chart-controls">
     <input id="chart-ticker" type="text" placeholder="AAPL" value="AAPL" />
-    <button class="period-btn" onclick="loadChartIntraday(_currentTicker)">1D</button>
-    <button class="period-btn" onclick="loadChart(_currentTicker,30)">1M</button>
-    <button class="period-btn active" onclick="loadChart(_currentTicker,90)">3M</button>
-    <button class="period-btn" onclick="loadChart(_currentTicker,180)">6M</button>
-    <button class="period-btn" onclick="loadChart(_currentTicker,365)">1Y</button>
-    <span id="chart-ticker-label" class="chart-title">AAPL</span>
-  </div>
-  <div class="toggle-row" style="margin-bottom:10px;">
+    <button class="period-btn" id="btn-1d">1D</button>
+    <button class="period-btn" id="btn-1w">1W</button>
+    <button class="period-btn" id="btn-1m">1M</button>
+    <button class="period-btn active" id="btn-3m">3M</button>
+    <button class="period-btn" id="btn-6m">6M</button>
+    <button class="period-btn" id="btn-1y">1Y</button>
+    <select id="intraday-freq" style="display:none;background:#161b22;border:1px solid #30363d;border-radius:4px;color:#58a6ff;padding:3px 6px;font-size:12px;cursor:pointer;">
+      <option value="1">1m</option>
+      <option value="5" selected>5m</option>
+      <option value="15">15m</option>
+      <option value="30">30m</option>
+      <option value="60">1h</option>
+    </select>
+    <span style="color:#30363d;margin:0 4px;">|</span>
     <button class="ind-toggle on" id="tog-ema20" onclick="toggleInd('ema20')">EMA 20</button>
     <button class="ind-toggle on" id="tog-ema50" onclick="toggleInd('ema50')">EMA 50</button>
     <button class="ind-toggle on" id="tog-vwap"  onclick="toggleInd('vwap')">VWAP</button>
     <button class="ind-toggle on" id="tog-fib"   onclick="toggleInd('fib')">Fibonacci</button>
     <button class="ind-toggle on" id="tog-sigs"  onclick="toggleInd('sigs')">Signals</button>
-    <span style="color:#30363d;margin:0 2px;">|</span>
+    <span style="color:#30363d;margin:0 4px;">|</span>
     <button class="ind-toggle" id="tog-sma30" onclick="toggleInd('sma30')" title="SMA(30) cross arrows — TOS Study 1">SMA 30</button>
     <button class="ind-toggle" id="tog-st"    onclick="toggleInd('st')"    title="SuperTrend (ATR×3, period 10) — green uptrend / red downtrend">SuperTrend</button>
     <button class="ind-toggle" id="tog-tga"   onclick="toggleInd('tga')"   title="3 Green Arrows panel — MACD(8,17,9) + Stochastic(14,5) panes">3GA Panel</button>
@@ -7548,6 +7569,7 @@ _CHARTS_HTML = """<!DOCTYPE html>
       <b>SuperTrend</b> — ATR×3 trailing stop. Green = uptrend, Red = downtrend.<br>
       <b>3GA Panel</b> — TOS 3 Green Arrows: MACD(8,17,9) histogram + Stochastic(14,5) sub-panes.
     </div>
+    <span id="chart-ticker-label" class="chart-title" style="margin-left:8px;">AAPL</span>
   </div>
   <div class="ohlcv-bar" id="ohlcv-bar">
     <span style="color:#58a6ff;font-weight:700;" id="ob-ticker">—</span>
@@ -7644,7 +7666,7 @@ function _createCharts() {
   var w = mainEl.getBoundingClientRect().width || mainEl.clientWidth || 900;
 
   _chart = LightweightCharts.createChart(mainEl, {
-    width: w, height: 520,
+    width: w, height: 340,
     layout: { background: {color:'#0d1117'}, textColor:'#c9d1d9' },
     grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
@@ -7653,7 +7675,7 @@ function _createCharts() {
   });
 
   _volChart = LightweightCharts.createChart(volEl, {
-    width: w, height: 90,
+    width: w, height: 70,
     layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
     grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
     rightPriceScale: { borderColor:'#30363d' },
@@ -7661,7 +7683,7 @@ function _createCharts() {
   });
 
   _rsiChart = LightweightCharts.createChart(rsiEl, {
-    width: w, height: 110,
+    width: w, height: 80,
     layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
     grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
     rightPriceScale: { borderColor:'#30363d' },
@@ -7669,7 +7691,7 @@ function _createCharts() {
   });
 
   _macdChart = LightweightCharts.createChart(macdEl, {
-    width: w, height: 100,
+    width: w, height: 75,
     layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
     grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
     rightPriceScale: { borderColor:'#30363d' },
@@ -7677,7 +7699,7 @@ function _createCharts() {
   });
 
   _stochChart = LightweightCharts.createChart(stochEl, {
-    width: w, height: 100,
+    width: w, height: 75,
     layout: { background:{color:'#0d1117'}, textColor:'#8b949e' },
     grid: { vertLines:{color:'#1a1f28'}, horzLines:{color:'#1a1f28'} },
     rightPriceScale: { borderColor:'#30363d', scaleMargins:{top:0.02, bottom:0.02}, autoScale:false },
@@ -7724,11 +7746,11 @@ function _createCharts() {
 
   window.addEventListener('resize', function() {
     var rw = mainEl.getBoundingClientRect().width || 900;
-    if (_chart)     _chart.resize(rw, 520);
-    if (_volChart)  _volChart.resize(rw, 90);
-    if (_rsiChart)  _rsiChart.resize(rw, 110);
-    if (_macdChart && _indState.tga)  _macdChart.resize(rw, 100);
-    if (_stochChart && _indState.tga) _stochChart.resize(rw, 100);
+    if (_chart)     _chart.resize(rw, 340);
+    if (_volChart)  _volChart.resize(rw, 70);
+    if (_rsiChart)  _rsiChart.resize(rw, 80);
+    if (_macdChart && _indState.tga)  _macdChart.resize(rw, 75);
+    if (_stochChart && _indState.tga) _stochChart.resize(rw, 75);
   });
 }
 
@@ -7848,9 +7870,10 @@ async function loadChart(tickerOverride, daysOverride) {
   document.getElementById('chart-ticker-label').textContent = t;
 
   // Update period buttons
+  document.getElementById('intraday-freq').style.display = 'none';
   document.querySelectorAll('.period-btn').forEach(function(b) {
     b.classList.remove('active');
-    if ((d===30&&b.textContent==='1M')||(d===90&&b.textContent==='3M')||
+    if ((d===7&&b.textContent==='1W')||(d===30&&b.textContent==='1M')||(d===90&&b.textContent==='3M')||
         (d===180&&b.textContent==='6M')||(d===365&&b.textContent==='1Y')) b.classList.add('active');
   });
   _currentIntraday = false;
@@ -7935,7 +7958,12 @@ async function loadChart(tickerOverride, daysOverride) {
   _volChart.timeScale().fitContent();
   _rsiChart.timeScale().fitContent();
 
-  // TGA panel — async, non-blocking
+  // TGA panel — async, non-blocking; restore visibility if toggle is on (may have been hidden by intraday guard)
+  if (_indState.tga) {
+    ['macd-label','macd-chart','stoch-label','stoch-chart'].forEach(function(id) {
+      var el = document.getElementById(id); if (el) el.style.display = 'block';
+    });
+  }
   _loadTgaPanel(t, d);
 
   // Load latest signal data for the AI bar
@@ -7954,10 +7982,12 @@ async function loadChartIntraday(tickerOverride) {
     b.classList.remove('active');
     if (b.textContent === '1D') b.classList.add('active');
   });
+  document.getElementById('intraday-freq').style.display = 'inline-block';
 
   _createCharts();
 
-  var ohlcv = await fetch('/api/chart-intraday?ticker=' + t + '&freq=5').then(r=>r.json()).catch(function(){return{error:'fetch failed'};});
+  var freq = parseInt(document.getElementById('intraday-freq').value || '5', 10);
+  var ohlcv = await fetch('/api/chart-intraday?ticker=' + t + '&freq=' + freq).then(r=>r.json()).catch(function(){return{error:'fetch failed'};});
   if (ohlcv.error || !ohlcv.candles || !ohlcv.candles.length) {
     document.getElementById('chart-ticker-label').textContent = t + ' (1D — unavailable, showing daily)';
     document.querySelectorAll('.period-btn').forEach(function(b) {
@@ -8005,6 +8035,11 @@ async function loadChartIntraday(tickerOverride) {
   _chart.timeScale().fitContent();
   _volChart.timeScale().fitContent();
   _rsiChart.timeScale().fitContent();
+
+  // TGA panel (MACD/Stoch) uses daily bars — hide for intraday
+  ['macd-label','macd-chart','stoch-label','stoch-chart'].forEach(function(id) {
+    var el = document.getElementById(id); if (el) el.style.display = 'none';
+  });
 
   loadAiBar(t);
 }
@@ -8141,9 +8176,15 @@ document.getElementById('chart-ticker').addEventListener('keydown', function(e) 
 // Period buttons need ticker context — re-bind them
 document.querySelectorAll('.period-btn').forEach(function(b) {
   b.onclick = function() {
-    var days = b.textContent==='1M'?30:b.textContent==='3M'?90:b.textContent==='6M'?180:365;
+    var txt = b.textContent.trim();
+    if (txt === '1D') { loadChartIntraday(_currentTicker); return; }
+    var days = txt==='1W'?7:txt==='1M'?30:txt==='3M'?90:txt==='6M'?180:365;
     loadChart(_currentTicker, days);
   };
+});
+
+document.getElementById('intraday-freq').addEventListener('change', function() {
+  if (_currentIntraday) loadChartIntraday(_currentTicker);
 });
 
 // Frame 1: create chart instances (gives LightweightCharts one full frame to init its canvas)

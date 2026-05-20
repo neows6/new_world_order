@@ -232,7 +232,7 @@ class IntrinsicValueEstimator:
 
         # Prefer 3-year average — more stable than single year
         # But use TTM if 3yr avg is wildly different (suggests structural change)
-        if oe_3yr and oe_ttm:
+        if oe_3yr is not None and oe_ttm is not None:
             pct_diff = abs(oe_ttm - oe_3yr) / abs(oe_3yr) if oe_3yr != 0 else 0
             if pct_diff > 0.40:
                 # TTM diverges significantly — use conservative (lower) of the two
@@ -283,7 +283,15 @@ class IntrinsicValueEstimator:
         notes.append(f"Historical OE CAGR: {growth_rates['historical_oe_cagr']:.1%}")
 
         # ── Run DCF scenarios ─────────────────────────────────
-        shares = shares_outstanding or 1e9  # Prevent divide-by-zero
+        if not shares_outstanding:
+            from loguru import logger as _lu
+            _lu.warning(
+                f"[IV] {ticker}: shares_outstanding missing — falling back to 1B, DCF unreliable"
+            )
+            shares = 1e9
+            warnings.append("DCF unreliable: shares_outstanding missing, used 1B fallback — per-share IV may be 2–3× overstated for mega-caps")
+        else:
+            shares = shares_outstanding
 
         bear = self._run_dcf(
             owner_earnings=oe_used,
@@ -327,7 +335,7 @@ class IntrinsicValueEstimator:
         is_undervalued = False
         price_to_intrinsic = None
 
-        if current_price and iv_conservative and iv_conservative > 0:
+        if current_price is not None and iv_conservative and iv_conservative > 0:
             margin_of_safety = (iv_conservative - current_price) / iv_conservative
             is_undervalued = margin_of_safety > 0
             price_to_intrinsic = current_price / iv_conservative

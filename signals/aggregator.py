@@ -81,7 +81,8 @@ class AggregatedSignal:
     # Raw component results (for audit trail)
     investable: bool = False
     moat_strength: str = "none"
-    margin_of_safety: Optional[float] = None
+    margin_of_safety:             Optional[float] = None
+    intrinsic_value_conservative: Optional[float] = None
     fib_confluence_score: float = 0.0
     fib_in_golden_zone: bool = False
     vwap_position: str = "unknown"
@@ -411,12 +412,12 @@ class SignalAggregator:
         m_score = 0.0
         if momentum is not None:
             momentum_map = {
-                "strong_momentum": 1.0, "momentum": 0.6,
-                "neutral": 0.0, "weak": -0.3, "bearish": -0.7,
+                "strong_buy": 1.0, "buy": 0.6,
+                "hold": 0.0, "sell": -0.3, "strong_sell": -0.7,
             }
             m_score = momentum_map.get(momentum.signal, 0.0)
             # VWAP extended-above is context-aware: only penalise if momentum is not confirming
-            if vwap and vwap.is_extended_above and momentum.signal in ("strong_momentum", "momentum"):
+            if vwap and vwap.is_extended_above and momentum.signal in ("strong_buy", "buy"):
                 # Breakout day — extended-above is a good sign, not a penalty
                 t_score = max(t_score, 0.1)
 
@@ -512,6 +513,37 @@ class SignalAggregator:
         # ── Narrative ────────────────────────────────────────────
         why_buy, why_wait, risks = self._build_narrative(analysis, fib, vwap, insider, fft, vol_profile)
 
+        # ── Conviction floor ──────────────────────────────────────
+        # Pattern: strong fundamentals (f≥0.40) but both momentum and insiders
+        # are absent/negative — market participants actively rejecting the thesis.
+        # Historically associated with value traps or model miscalibration.
+        # Downgrade to HOLD rather than surface a low-conviction buy.
+        if signal in ("buy", "strong_buy") and f_score >= 0.40 and m_score <= 0.0 and i_score <= 0.0:
+            signal = "hold"
+            why_wait.append(
+                f"Conviction void: fundamental gap (f={f_score:.2f}) not confirmed by "
+                f"insiders (i={i_score:.2f}) or momentum (m={m_score:.2f}) — "
+                f"institutional rejection pattern, possible model miscalibration"
+            )
+            logger.info(
+                f"[AGG] {analysis.ticker}: conviction floor triggered — "
+                f"f={f_score:.2f} m={m_score:.2f} i={i_score:.2f} → HOLD"
+            )
+
+        # Orphaned signal guard: composite barely above buy floor AND signal agreement too weak.
+        # Composite ≤ 0.20 with confidence < 0.20 means fewer than ~2 of 9 sub-signals align —
+        # not enough directional consensus to trust the buy classification.
+        if signal in ("buy", "strong_buy") and confidence < 0.20 and composite <= 0.20:
+            signal = "hold"
+            why_wait.append(
+                f"Orphaned signal: low sub-signal agreement (conf={confidence:.0%}, "
+                f"composite={composite:.2f}) — insufficient conviction to act"
+            )
+            logger.warning(
+                f"[AGG] {analysis.ticker}: confidence-floor block — "
+                f"conf={confidence:.0%} composite={composite:.2f} → HOLD"
+            )
+
         logger.info(
             f"[AGG] {analysis.ticker}: signal={signal}, composite={composite:.2f}, "
             f"confidence={confidence:.2f}, VIX={vix_str}, pos_size={final_pct:.1%}"
@@ -523,7 +555,7 @@ class SignalAggregator:
             f"C={c_score:.2f} V={v_score:.2f} | I-Tool={itool_signal or 'n/a'}"
         )
 
-        rvol_val = vol_profile.rvol if vol_profile else (momentum.rvol if momentum else 1.0)
+        rvol_val = vol_profile.rvol if vol_profile else (momentum.volume_ratio if momentum else 1.0)
 
         return AggregatedSignal(
             ticker=analysis.ticker,
@@ -550,10 +582,11 @@ class SignalAggregator:
             momentum_score=m_score,
             rvol=rvol_val,
             is_52w_breakout=momentum.is_52w_high_breakout if momentum else False,
-            macd_signal_direction=momentum.macd_signal if momentum else "neutral",
+            macd_signal_direction=momentum.macd_direction if momentum else "neutral",
             investable=analysis.is_investable,
             moat_strength=analysis.moat_strength,
             margin_of_safety=analysis.margin_of_safety,
+            intrinsic_value_conservative=analysis.intrinsic_value_conservative,
             fib_confluence_score=fib.confluence_score if fib else 0.0,
             fib_in_golden_zone=fib.in_golden_zone if fib else False,
             vwap_position=vwap.position if vwap else "unknown",
