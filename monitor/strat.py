@@ -839,6 +839,31 @@ async function removeSymbol(sym, evt) {
 }
 
 // ── Chart modal ────────────────────────────────────────────────────────────
+
+// Register vertical-line plugin once at load time (Chart.js 4 throws if re-registered)
+const _vertLinePlugin = {
+  id: 'vertLine',
+  beforeDraw(chart, _, opts) {
+    if (opts == null || opts.xLabel == null) return;
+    const {ctx, chartArea, scales} = chart;
+    // getPixelForValue is the correct Chart.js 4 API for category scales
+    const x = scales.x.getPixelForValue(opts.xLabel);
+    if (x == null || isNaN(x)) return;
+    ctx.save();
+    ctx.strokeStyle = opts.color || '#8b949e';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, chartArea.top);
+    ctx.lineTo(x, chartArea.bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+};
+// Guard against double-registration if page hot-reloads
+if (!Chart.registry.plugins.get('vertLine')) Chart.register(_vertLinePlugin);
+
 function openChart(sym, dir, idx) {
   const occ = (_data[sym]?.[dir === 'dn' ? 'downside' : 'upside']?.occurrences || [])[idx];
   if (!occ) return;
@@ -860,38 +885,15 @@ function openChart(sym, dir, idx) {
     : `✅ Upside Threshold Breach — +${occ.pct_change.toFixed(1)}% on ${occ.breach_date}`;
 
   const pts = occ.window_prices || [];
-  const labels  = pts.map(p => p.d);
-  const values  = pts.map(p => p.p);
-  const thrLine = pts.map(() => thr);
+  const labels    = pts.map(p => p.d);
+  const values    = pts.map(p => p.p);
+  const thrLine   = pts.map(() => thr);
   const breachIdx = pts.findIndex(p => p.d === occ.breach_date);
-
-  // Breach point dataset (single point)
   const breachPoints = pts.map((p, i) => i === breachIdx ? p.p : null);
 
   document.getElementById('chartModal').classList.add('open');
 
   if (_chart) { _chart.destroy(); _chart = null; }
-
-  // Vertical line plugin
-  const verticalLinePlugin = {
-    id: 'vertLine',
-    beforeDraw(chart, _, opts) {
-      if (opts.xIdx == null || opts.xIdx < 0) return;
-      const {ctx, chartArea, scales} = chart;
-      const x = scales.x.getPixelForIndex(opts.xIdx);
-      ctx.save();
-      ctx.strokeStyle = opts.color || '#8b949e';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(x, chartArea.top);
-      ctx.lineTo(x, chartArea.bottom);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.restore();
-    }
-  };
-  Chart.register(verticalLinePlugin);
 
   const ctx = document.getElementById('chartCanvas').getContext('2d');
   _chart = new Chart(ctx, {
@@ -942,7 +944,7 @@ function openChart(sym, dir, idx) {
             label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) + '%' : ''}`
           }
         },
-        vertLine: {xIdx: breachIdx, color: thrClr},
+        vertLine: {xLabel: breachIdx >= 0 ? labels[breachIdx] : null, color: thrClr},
       },
       scales: {
         x: {
