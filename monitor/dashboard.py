@@ -39,6 +39,9 @@ app.include_router(wheel_router)
 from monitor.alfred import alfred_router
 app.include_router(alfred_router)
 
+from monitor.strat import strat_router
+app.include_router(strat_router)
+
 # ── Mount signals dashboard under /signals ────────────────────────────────────
 from monitor.signals_dashboard import app as _signals_app, _latest_signals as _get_live_signals
 app.mount("/signals", _signals_app)
@@ -1284,6 +1287,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <a href="/charts"        class="brief-btn" id="charts-btn">&#128200; Charts</a>
     <a href="/signals"       class="brief-btn" id="signals-btn">&#128200; Signal Monitor</a>
     <a href="/alfred"        class="brief-btn" id="alfred-btn">&#128270; Alfred</a>
+    <a href="/strat"         class="brief-btn" id="strat-btn">&#128202; STRAT</a>
   </div>
 </header>
 <div class="tape-wrap"><div class="tape-track" id="main-tape"><span class="mt-neu">Loading signals...</span></div></div>
