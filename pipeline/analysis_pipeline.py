@@ -340,7 +340,7 @@ class AnalysisPipeline:
                 vix_regime=vix_regime,
                 current_price=current_price,
                 momentum=momentum,
-                tv_signal=tv_signal,
+                itool_signal=tv_signal,
                 floor_fundamentals=floor_fundamentals,
             )
             logger.info(

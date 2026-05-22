@@ -82,6 +82,10 @@ class AnalysisReport:
     analysis_notes: list
     analysis_warnings: list
 
+    # DCF reliability — False for REITs (SIC 65xx) and financial sector (SIC 60-64xx)
+    # where discounted cash flow systematically overstates intrinsic value.
+    dcf_reliable: bool = True
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, default=str)
 
@@ -249,12 +253,16 @@ class FirstPrinciplesEngine:
             reasons.append(f"{moat_result.strength.value.capitalize()} moat detected ✓")
 
         # Gate 6: Positive owner earnings
-        if iv_result.owner_earnings_used and iv_result.owner_earnings_used > 0:
-            reasons.append("Positive owner earnings ✓")
-            passes.append(True)
+        # Skip for financial sector companies (banks, insurers) where D&A-based OE is not applicable
+        if iv_result.owner_earnings_used is not None:
+            if iv_result.owner_earnings_used > 0:
+                reasons.append("Positive owner earnings ✓")
+                passes.append(True)
+            else:
+                reasons.append("Negative or zero owner earnings — cash burn")
+                passes.append(False)
         else:
-            reasons.append("Negative or zero owner earnings — cash burn")
-            passes.append(False)
+            reasons.append("Owner earnings N/A (financial sector or missing D&A) — gate skipped")
 
         # All hard gates must pass
         is_investable = all(passes)
@@ -292,6 +300,10 @@ class FirstPrinciplesEngine:
                 current_price = last_price_rec.adjusted_close or last_price_rec.close
                 shares_outstanding = last_price_rec.shares_outstanding
                 market_cap = last_price_rec.market_cap
+                # market_cap is often NULL in intraday records — derive it so WACC
+                # doesn't collapse to debt-only cost and produce a 60x terminal multiplier
+                if market_cap is None and current_price and shares_outstanding:
+                    market_cap = current_price * shares_outstanding
 
             # ── WACC ───────────────────────────────────────────
             price_returns = self._compute_price_returns(price_records)
@@ -324,6 +336,17 @@ class FirstPrinciplesEngine:
                 revenue_cagr=None,  # Populated by moat detector internally
             )
 
+            # ── DCF reliability check ──────────────────────────
+            # REITs (SIC 65xx) and financials (SIC 60-64xx) are structurally
+            # mispriced by DCF — they should use FFO/cap-rate models instead.
+            # Cap displayed MOS at 200% so phantom 400%+ gaps don't dominate
+            # the fundamental score and mislead the human reviewer.
+            _sic = (company.sic_code or "")
+            dcf_reliable = not _sic.startswith(("60", "62", "63", "64", "65"))
+            _mos = iv_result.margin_of_safety
+            _iv_con = iv_result.intrinsic_value_conservative
+            _iv_base = iv_result.intrinsic_value_base
+
             # ── Investability assessment ───────────────────────
             is_investable, investable_reasons = self._assess_investability(
                 fundamentals_by_year, wacc_result, moat_result, iv_result
@@ -336,6 +359,14 @@ class FirstPrinciplesEngine:
                 moat_result.signals
             )
             all_warnings = iv_result.warnings + moat_result.warnings
+            if not dcf_reliable:
+                dcf_warning = (
+                    f"DCF unreliable for SIC {_sic} sector — "
+                    f"intrinsic value overstated; use FFO/cap-rate for REITs, P/Book for banks"
+                )
+                all_warnings.append(dcf_warning)
+                if _mos is not None and _mos > 2.0:
+                    _mos = 2.0   # cap at 200% so f_score isn't inflated by phantom gaps
 
             report = AnalysisReport(
                 ticker=ticker,
@@ -362,9 +393,9 @@ class FirstPrinciplesEngine:
                 net_debt_to_ebitda=latest.net_debt_to_ebitda,
 
                 current_price=current_price,
-                intrinsic_value_conservative=iv_result.intrinsic_value_conservative,
-                intrinsic_value_base=iv_result.intrinsic_value_base,
-                margin_of_safety=iv_result.margin_of_safety,
+                intrinsic_value_conservative=_iv_con,
+                intrinsic_value_base=_iv_base,
+                margin_of_safety=_mos,
                 price_to_intrinsic=iv_result.price_to_intrinsic,
                 is_undervalued=iv_result.is_undervalued,
 
@@ -376,6 +407,7 @@ class FirstPrinciplesEngine:
                 investable_reasons=investable_reasons,
                 analysis_notes=all_notes,
                 analysis_warnings=all_warnings,
+                dcf_reliable=dcf_reliable,
             )
 
             logger.info(
