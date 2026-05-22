@@ -1,5 +1,5 @@
 """
-monitor/strat.py — STRAT: Historical Threshold Breach Analysis
+monitor/strat.py - STRAT: Historical Threshold Breach Analysis
 
 For each symbol and each closing date from Feb 2020 to Feb 2026:
   Downside: Did price fall ≥15% at any point within 90 calendar days?
@@ -8,12 +8,12 @@ For each symbol and each closing date from Feb 2020 to Feb 2026:
             (stocks: first breach day; indices: last trading day only)
 
 Routes:
-  GET  /strat                       — Dashboard page
-  GET  /api/strat/data              — Full cached analysis (optionally ?symbol=X)
-  GET  /api/strat/status            — Compute progress
-  POST /api/strat/refresh           — Trigger background recompute
-  POST /api/strat/add_symbol        — Add custom symbol  {"symbol": "AMD"}
-  DELETE /api/strat/remove_symbol/{symbol} — Remove custom symbol
+  GET  /strat                       - Dashboard page
+  GET  /api/strat/data              - Full cached analysis (optionally ?symbol=X)
+  GET  /api/strat/status            - Compute progress
+  POST /api/strat/refresh           - Trigger background recompute
+  POST /api/strat/add_symbol        - Add custom symbol  {"symbol": "AMD"}
+  DELETE /api/strat/remove_symbol/{symbol} - Remove custom symbol
 """
 
 import json
@@ -130,7 +130,7 @@ def _compute_symbol(sym: str, yf_ticker: str) -> dict:
     prices_idx  = prices.index.date   # numpy array of date objects
     is_index    = sym in INDEX_SYMBOLS
 
-    # Earliest available date — used to determine which period labels are valid
+    # Earliest available date - used to determine which period labels are valid
     earliest = prices_idx[0] if len(prices_idx) > 0 else ANALYSIS_START
 
     downside_occ = []
@@ -271,7 +271,7 @@ def _run_compute(symbols_override: Optional[dict] = None) -> None:
             _computed_at = ts
             _compute_pct = 100
 
-        logger.info(f"[STRAT] Compute complete — {total} symbols")
+        logger.info(f"[STRAT] Compute complete - {total} symbols")
 
     except Exception as exc:
         logger.error(f"[STRAT] Compute error: {exc}")
@@ -299,11 +299,11 @@ def _load_cache() -> bool:
 
 def _ensure_computed() -> None:
     if not _load_cache():
-        logger.info("[STRAT] Cache stale/missing — computing in background")
+        logger.info("[STRAT] Cache stale/missing - computing in background")
         threading.Thread(target=_run_compute, daemon=True, name="strat-compute").start()
 
 
-# ── Startup — runs when module is imported by dashboard.py ───────────────────
+# ── Startup - runs when module is imported by dashboard.py ───────────────────
 # APIRouter doesn't support on_event; the main app's startup fires after import,
 # so we kick off cache loading/computation here at import time instead.
 threading.Thread(target=_ensure_computed, daemon=True, name="strat-init").start()
@@ -353,7 +353,7 @@ def api_strat_add_symbol(body: dict):
     if sym in existing:
         return JSONResponse({"status": "already_exists"})
 
-    # Validate with yfinance — quick 5d fetch
+    # Validate with yfinance - quick 5d fetch
     try:
         t = yf.Ticker(sym)
         hist = t.history(period="5d")
@@ -403,7 +403,7 @@ _PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>STRAT — NWO</title>
+<title>STRAT - NWO</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;font-size:13px;min-height:100vh}
@@ -575,7 +575,7 @@ h1{font-size:17px;font-weight:700;color:#e6edf3;margin-bottom:4px}
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script>
-// ── State ──────────────────────────────────────────────────────────────────
+// -- State --
 const BUILTIN_GROUPS = BUILTIN_GROUPS_PLACEHOLDER;
 const INDEX_SYMS     = new Set(INDEX_SYMS_PLACEHOLDER);
 
@@ -586,7 +586,7 @@ let _selPer   = {dn: '6yr', up: '6yr'};
 let _chart    = null;
 let _polling  = null;
 
-// ── Init ───────────────────────────────────────────────────────────────────
+// -- Init --
 async function init() {
   await pollStatus();
 }
@@ -601,14 +601,14 @@ async function pollStatus() {
 
     if (s.computing) {
       dot.className = 'status-dot computing';
-      txt.textContent = `Computing… ${s.progress}%`;
+      txt.textContent = `Computing... ${s.progress}%`;
       prog.style.display = 'block';
       fill.style.width   = s.progress + '%';
       if (!_polling) _polling = setInterval(pollStatus, 2000);
     } else {
       dot.className = 'status-dot';
-      const ts = s.computed_at ? new Date(s.computed_at + 'Z').toLocaleString() : '—';
-      txt.textContent = `Ready — computed ${ts}`;
+      const ts = s.computed_at ? new Date(s.computed_at + 'Z').toLocaleString() : '--';
+      txt.textContent = `Ready - computed ${ts}`;
       prog.style.display = 'none';
       if (_polling) { clearInterval(_polling); _polling = null; }
       renderPicker(s.symbols);
@@ -621,11 +621,11 @@ async function pollStatus() {
 
 async function triggerRefresh() {
   await fetch('/api/strat/refresh', {method:'POST'});
-  document.getElementById('statusText').textContent = 'Refreshing…';
+  document.getElementById('statusText').textContent = 'Refreshing...';
   setTimeout(pollStatus, 500);
 }
 
-// ── Symbol picker ─────────────────────────────────────────────────────────
+// -- Symbol picker --
 function renderPicker(availableSyms) {
   const avail = new Set(availableSyms || []);
   const gc = document.getElementById('groupsContainer');
@@ -672,7 +672,7 @@ async function selectSymbol(sym) {
   const chip = document.getElementById('chip-' + sym);
   if (chip) chip.classList.add('active');
 
-  document.getElementById('mainContent').innerHTML = '<div class="select-msg">Loading…</div>';
+  document.getElementById('mainContent').innerHTML = '<div class="select-msg">Loading...</div>';
 
   if (!_data[sym]) {
     try {
@@ -687,7 +687,7 @@ async function selectSymbol(sym) {
   renderSymbol(sym);
 }
 
-// ── Render analysis ───────────────────────────────────────────────────────
+// -- Render analysis --
 function renderSymbol(sym) {
   const d = _data[sym];
   if (!d || d.error) {
@@ -700,7 +700,7 @@ function renderSymbol(sym) {
   const html = `
     <div class="sym-header">
       <span class="sym-title">${sym}</span>
-      <span class="sym-meta">${INDEX_SYMS.has(sym) ? 'Index &mdash; last-day breach rule' : 'Equity &mdash; first-breach rule'} &bull; Earliest data: ${d.earliest_date || '—'}</span>
+      <span class="sym-meta">${INDEX_SYMS.has(sym) ? 'Index &mdash; last-day breach rule' : 'Equity &mdash; first-breach rule'} &bull; Earliest data: ${d.earliest_date || '--'}</span>
       <button class="csv-btn" onclick="downloadCSV('${sym}')" title="Download all occurrences as CSV">&#11015; CSV</button>
     </div>
     <div class="panels">
@@ -738,7 +738,7 @@ function renderPanel(sym, dir, analysis, earliest) {
     return `<tr>
       <td>${p === '1yr' ? '1 Year' : p === '3yr' ? '3 Years' : '6 Years'}</td>
       <td><span class="${valid ? 'count-num' : 'count-na'}">${valid ? cnt : 'N/A'}</span></td>
-      <td style="color:#8b949e;font-size:10px">${valid ? (p==='1yr'?'Feb 25–Feb 26':p==='3yr'?'Feb 23–Feb 26':'Feb 20–Feb 26') : 'insufficient history'}</td>
+      <td style="color:#8b949e;font-size:10px">${valid ? (p==='1yr'?'Feb 25-Feb 26':p==='3yr'?'Feb 23-Feb 26':'Feb 20-Feb 26') : 'insufficient history'}</td>
     </tr>`;
   }).join('');
 
@@ -791,14 +791,14 @@ function setPeriod(dir, period, sym) {
   renderSymbol(sym);
 }
 
-// ── Custom symbols ─────────────────────────────────────────────────────────
+// -- Custom symbols --
 async function addSymbol() {
   const inp = document.getElementById('addSymInput');
   const st  = document.getElementById('addSymStatus');
   const sym = inp.value.trim().toUpperCase();
   if (!sym) return;
   inp.value = '';
-  st.textContent = 'Validating…';
+  st.textContent = 'Validating...';
   st.style.color = '#8b949e';
   try {
     const r = await fetch('/api/strat/add_symbol', {
@@ -814,7 +814,7 @@ async function addSymbol() {
       st.textContent = sym + ' already tracked';
       st.style.color = '#d29922';
     } else {
-      st.textContent = sym + ' added — computing…';
+      st.textContent = sym + ' added - computing...';
       st.style.color = '#3fb950';
       _custom.push(sym);
       renderCustomChips();
@@ -841,7 +841,7 @@ async function removeSymbol(sym, evt) {
   }
 }
 
-// ── CSV export ────────────────────────────────────────────────────────────
+// -- CSV export --
 function downloadCSV(sym) {
   const d = _data[sym];
   if (!d) return;
@@ -864,7 +864,7 @@ function downloadCSV(sym) {
       '+' + o.pct_change.toFixed(2)]);
   });
 
-  const csv = rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+  const csv = rows.map(r => r.map(v => `"${v}"`).join(',')).join('\\n');
   const blob = new Blob([csv], {type: 'text/csv'});
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
@@ -874,7 +874,7 @@ function downloadCSV(sym) {
   URL.revokeObjectURL(url);
 }
 
-// ── Chart modal ────────────────────────────────────────────────────────────
+// -- Chart modal --
 
 // Register vertical-line plugin once at load time (Chart.js 4 throws if re-registered)
 const _vertLinePlugin = {
@@ -910,15 +910,15 @@ function openChart(sym, dir, idx) {
   const window_days = isDown ? 90 : 30;
 
   document.getElementById('modalTitle').textContent =
-    `${sym} — ${isDown ? 'Downside' : 'Upside'} Threshold Breach`;
+    `${sym} - ${isDown ? 'Downside' : 'Upside'} Threshold Breach`;
   document.getElementById('modalSub').textContent =
-    `Start: ${occ.start_date} ($${occ.start_price.toFixed(2)}) → ${window_days}-day window • Breach: ${occ.breach_date} ($${occ.breach_price.toFixed(2)}, ${occ.pct_change > 0 ? '+' : ''}${occ.pct_change.toFixed(1)}%)`;
+    `Start: ${occ.start_date} ($${occ.start_price.toFixed(2)}) -> ${window_days}-day window | Breach: ${occ.breach_date} ($${occ.breach_price.toFixed(2)}, ${occ.pct_change > 0 ? '+' : ''}${occ.pct_change.toFixed(1)}%)`;
 
   const lbl = document.getElementById('breachLabel');
   lbl.className = 'breach-label ' + (isDown ? 'breach-label-dn' : 'breach-label-up');
   lbl.textContent = isDown
-    ? `⚠️ Downside Threshold Breach — ${occ.pct_change.toFixed(1)}% on ${occ.breach_date}`
-    : `✅ Upside Threshold Breach — +${occ.pct_change.toFixed(1)}% on ${occ.breach_date}`;
+    ? `[!] Downside Threshold Breach - ${occ.pct_change.toFixed(1)}% on ${occ.breach_date}`
+    : `[+] Upside Threshold Breach - +${occ.pct_change.toFixed(1)}% on ${occ.breach_date}`;
 
   const pts = occ.window_prices || [];
   const labels    = pts.map(p => p.d);
@@ -1006,7 +1006,7 @@ function closeModal(e) {
   if (_chart) { _chart.destroy(); _chart = null; }
 }
 
-// ── Boot ───────────────────────────────────────────────────────────────────
+// -- Boot --
 init();
 </script>
 </body>
@@ -1025,4 +1025,4 @@ _PAGE = _PAGE.replace("INDEX_SYMS_PLACEHOLDER",     _INDEX_SYMS_JS)
 
 @strat_router.get("/strat", response_class=HTMLResponse)
 def strat_page():
-    return HTMLResponse(_PAGE)
+    return HTMLResponse(_PAGE, media_type="text/html; charset=utf-8")
