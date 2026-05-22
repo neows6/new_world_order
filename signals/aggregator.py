@@ -157,11 +157,16 @@ class SignalAggregator:
         score += moat_scores.get(analysis.moat_strength, 0)
 
         # Margin of safety
+        # IV > 3x current price (MoS > 200%) almost always means bad DCF inputs
+        # (missing shares_outstanding, stale earnings, wrong capex) — treat as unreliable
+        # and give zero MoS contribution rather than rewarding a model error with +0.3.
         if analysis.margin_of_safety is not None:
-            if analysis.margin_of_safety > 0.30:   score += 0.3
-            elif analysis.margin_of_safety > 0.15: score += 0.2
-            elif analysis.margin_of_safety > 0:    score += 0.1
-            else:                                   score -= 0.2
+            if analysis.margin_of_safety > 2.0:
+                pass   # extreme discount = suspect data; no score contribution
+            elif analysis.margin_of_safety > 0.30:   score += 0.3
+            elif analysis.margin_of_safety > 0.15:   score += 0.2
+            elif analysis.margin_of_safety > 0:      score += 0.1
+            else:                                     score -= 0.2
 
         return max(-1.0, min(1.0, score))
 
@@ -514,26 +519,29 @@ class SignalAggregator:
         why_buy, why_wait, risks = self._build_narrative(analysis, fib, vwap, insider, fft, vol_profile)
 
         # ── Conviction floor ──────────────────────────────────────
-        # Pattern: strong fundamentals (f≥0.40) but both momentum and insiders
-        # are absent/negative — market participants actively rejecting the thesis.
-        # Historically associated with value traps or model miscalibration.
-        # Downgrade to HOLD rather than surface a low-conviction buy.
-        if signal in ("buy", "strong_buy") and f_score >= 0.40 and m_score <= 0.0 and i_score <= 0.0:
+        # A BUY signal below composite 0.50 must be confirmed by at least one of:
+        # positive momentum (price action / institutional follow-through) or positive
+        # insider activity (management skin-in-the-game). Without either, the signal
+        # is a lone fundamental thesis that the market has not yet validated — the
+        # exact pattern behind value traps and DCF model errors.
+        if signal in ("buy", "strong_buy") and composite < 0.50 and m_score <= 0.0 and i_score <= 0.0:
             signal = "hold"
             why_wait.append(
-                f"Conviction void: fundamental gap (f={f_score:.2f}) not confirmed by "
-                f"insiders (i={i_score:.2f}) or momentum (m={m_score:.2f}) — "
-                f"institutional rejection pattern, possible model miscalibration"
+                f"Conviction void: composite={composite:.2f} below 0.50 with no momentum "
+                f"(m={m_score:.2f}) or insider (i={i_score:.2f}) confirmation — "
+                f"unvalidated thesis, possible value trap or model miscalibration"
             )
             logger.info(
                 f"[AGG] {analysis.ticker}: conviction floor triggered — "
-                f"f={f_score:.2f} m={m_score:.2f} i={i_score:.2f} → HOLD"
+                f"composite={composite:.2f} m={m_score:.2f} i={i_score:.2f} → HOLD"
             )
 
-        # Orphaned signal guard: composite barely above buy floor AND signal agreement too weak.
-        # Composite ≤ 0.20 with confidence < 0.20 means fewer than ~2 of 9 sub-signals align —
-        # not enough directional consensus to trust the buy classification.
-        if signal in ("buy", "strong_buy") and confidence < 0.20 and composite <= 0.20:
+        # Orphaned signal guard: weak composite AND low signal agreement.
+        # Composite < 0.40 with confidence < 0.20 means fewer than ~2 of 9 sub-signals
+        # align — not enough directional consensus to trust the buy classification.
+        # Raised from 0.20 to 0.40 to catch mid-band false positives (e.g. composite=0.29,
+        # conf=32%) that previously slipped through.
+        if signal in ("buy", "strong_buy") and confidence < 0.20 and composite < 0.40:
             signal = "hold"
             why_wait.append(
                 f"Orphaned signal: low sub-signal agreement (conf={confidence:.0%}, "

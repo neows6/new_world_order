@@ -340,7 +340,19 @@ class IntrinsicValueEstimator:
             is_undervalued = margin_of_safety > 0
             price_to_intrinsic = current_price / iv_conservative
 
-            if margin_of_safety >= 0.25:
+            if margin_of_safety > 2.0:
+                # IV > 3x current price — almost always bad inputs (missing shares, stale earnings)
+                warnings.append(
+                    f"EXTREME DCF: IV ${iv_conservative:.2f} is {margin_of_safety:.0%} above price "
+                    f"(>{iv_conservative/current_price:.1f}x) — verify shares_outstanding and owner earnings "
+                    f"before acting on this estimate"
+                )
+                logger.warning(
+                    f"[IV] {ticker}: extreme valuation gap — IV=${iv_conservative:.2f} "
+                    f"vs price=${current_price:.2f} ({iv_conservative/current_price:.1f}x). "
+                    f"Likely shares_outstanding data error. MoS contribution suppressed in aggregator."
+                )
+            elif margin_of_safety >= 0.25:
                 notes.append(f"Significant discount to intrinsic value: {margin_of_safety:.1%} margin of safety")
             elif margin_of_safety >= 0.15:
                 notes.append(f"Adequate margin of safety: {margin_of_safety:.1%}")
