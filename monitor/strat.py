@@ -448,9 +448,11 @@ h1{font-size:17px;font-weight:700;color:#e6edf3;margin-bottom:4px}
 .refresh-btn:hover{border-color:#58a6ff;color:#58a6ff}
 
 /* Symbol header */
-.sym-header{display:flex;align-items:baseline;gap:10px;margin-bottom:14px}
+.sym-header{display:flex;align-items:center;gap:10px;margin-bottom:14px}
 .sym-title{font-size:20px;font-weight:700;color:#e6edf3}
-.sym-meta{font-size:11px;color:#8b949e}
+.sym-meta{font-size:11px;color:#8b949e;flex:1}
+.csv-btn{padding:4px 11px;border-radius:6px;border:1px solid #30363d;background:transparent;color:#8b949e;cursor:pointer;font-size:11px;font-weight:600;white-space:nowrap;flex-shrink:0}
+.csv-btn:hover{border-color:#58a6ff;color:#58a6ff}
 
 /* Analysis panels */
 .panels{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -699,6 +701,7 @@ function renderSymbol(sym) {
     <div class="sym-header">
       <span class="sym-title">${sym}</span>
       <span class="sym-meta">${INDEX_SYMS.has(sym) ? 'Index &mdash; last-day breach rule' : 'Equity &mdash; first-breach rule'} &bull; Earliest data: ${d.earliest_date || '—'}</span>
+      <button class="csv-btn" onclick="downloadCSV('${sym}')" title="Download all occurrences as CSV">&#11015; CSV</button>
     </div>
     <div class="panels">
       ${renderPanel(sym, 'dn', d.downside, earliest)}
@@ -836,6 +839,39 @@ async function removeSymbol(sym, evt) {
       document.getElementById('mainContent').innerHTML = '<div class="select-msg">Select a symbol above to view threshold breach analysis.</div>';
     }
   }
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────
+function downloadCSV(sym) {
+  const d = _data[sym];
+  if (!d) return;
+
+  const rows = [
+    ['Symbol','Direction','Threshold','Window (cal days)','Start Date','Start Price ($)','Breach Date','Breach Price ($)','% Change']
+  ];
+
+  (d.downside?.occurrences || []).forEach(o => {
+    rows.push([sym, 'Downside', '15%', 90,
+      o.start_date, o.start_price.toFixed(2),
+      o.breach_date, o.breach_price.toFixed(2),
+      o.pct_change.toFixed(2)]);
+  });
+
+  (d.upside?.occurrences || []).forEach(o => {
+    rows.push([sym, 'Upside', '10%', 30,
+      o.start_date, o.start_price.toFixed(2),
+      o.breach_date, o.breach_price.toFixed(2),
+      '+' + o.pct_change.toFixed(2)]);
+  });
+
+  const csv = rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+  const blob = new Blob([csv], {type: 'text/csv'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `STRAT_${sym}_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ── Chart modal ────────────────────────────────────────────────────────────
