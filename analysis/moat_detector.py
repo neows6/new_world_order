@@ -79,7 +79,9 @@ class MoatDetector:
         if not margins:
             return {"avg": None, "stable": False, "trend": "unknown", "signal": "Insufficient data"}
 
-        valid = [m for m in margins if m is not None]
+        # Discard impossible values (>100% or <0%) — caused by EDGAR fiscal-year
+        # parsing mismatches where quarterly revenue is divided into annual gross_profit
+        valid = [m for m in margins if m is not None and 0.0 < m <= 1.0]
         if len(valid) < 2:
             return {"avg": valid[0] if valid else None, "stable": False, "trend": "unknown", "signal": "Insufficient data"}
 
@@ -224,17 +226,17 @@ class MoatDetector:
         types = []
 
         # High gross margin = pricing power = intangible asset or switching cost
-        if gross_margin_avg and gross_margin_avg > 0.60:
+        if gross_margin_avg is not None and gross_margin_avg > 0.60:
             types.append(MoatType.INTANGIBLE_ASSET)
-        if gross_margin_avg and 0.40 <= gross_margin_avg <= 0.70:
+        if gross_margin_avg is not None and 0.40 <= gross_margin_avg <= 0.70:
             types.append(MoatType.SWITCHING_COST)
 
         # Very high ROIC spread = efficient scale or network effect
-        if roic_avg_spread and roic_avg_spread > 0.10:
+        if roic_avg_spread is not None and roic_avg_spread > 0.10:
             types.append(MoatType.NETWORK_EFFECT)
 
         # High FCF conversion + modest margins = cost advantage
-        if fcf_conversion and fcf_conversion > 0.85 and gross_margin_avg and gross_margin_avg < 0.40:
+        if fcf_conversion is not None and fcf_conversion > 0.85 and gross_margin_avg is not None and gross_margin_avg < 0.40:
             types.append(MoatType.COST_ADVANTAGE)
 
         return list(set(types)) if types else [MoatType.NONE]
