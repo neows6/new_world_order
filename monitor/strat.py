@@ -613,6 +613,7 @@ async function pollStatus() {
       if (_polling) { clearInterval(_polling); _polling = null; }
       renderPicker(s.symbols);
       document.getElementById('pickerSection').style.display = 'block';
+      if (_selSym) selectSymbol(_selSym);   // reload fresh data for current symbol
     }
   } catch(e) {
     document.getElementById('statusText').textContent = 'Error connecting to server';
@@ -621,8 +622,9 @@ async function pollStatus() {
 
 async function triggerRefresh() {
   await fetch('/api/strat/refresh', {method:'POST'});
+  _data = {};   // clear client-side cache so reloaded data is shown after compute
   document.getElementById('statusText').textContent = 'Refreshing...';
-  setTimeout(pollStatus, 500);
+  if (!_polling) _polling = setInterval(pollStatus, 2000);
 }
 
 // -- Symbol picker --
