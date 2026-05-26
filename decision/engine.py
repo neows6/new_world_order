@@ -186,8 +186,8 @@ class DecisionEngine:
     """
 
     # Decision gates — all must pass for GO
-    MIN_ENSEMBLE_PROB   = 0.45   # P(bull) must exceed this
-    MIN_QUANTUM_CERTAIN = 0.45   # Wave function must be partially collapsed
+    MIN_ENSEMBLE_PROB   = 0.52   # P(bull) must exceed this (was 0.45 — 52% = meaningful edge over coin flip)
+    MIN_QUANTUM_CERTAIN = 0.60   # Wave function must be substantially collapsed (was 0.45 — near coin flip)
     MAX_REYNOLDS        = 10.0   # Reject in extreme turbulence (raised from 5.0 — Re 5-10 is turbulent but tradeable)
     MIN_RR_RATIO        = 1.5    # Minimum risk/reward ratio
     MAX_KALMAN_SURPRISE = 2.5    # Reject if Kalman innovation > 2.5σ (unusual move)
@@ -427,6 +427,12 @@ class DecisionEngine:
             if getattr(agg, "tga_macd_arrow",  False): arrow_parts.append("MACD")
             if getattr(agg, "tga_stoch_arrow", False): arrow_parts.append("Stoch")
             passed.append(f"TGA: {tga_count}/3 arrows ({', '.join(arrow_parts) or 'active'}) — momentum confirmed")
+        elif mos is not None and mos >= 0.0:
+            # Positive MOS means price is at/below intrinsic value — fundamental buffer
+            # overrides the timing requirement; don't hard-block, pass with caution note
+            passed.append(
+                f"TGA: 0/3 arrows — MOS {mos:.0%} provides fundamental buffer ⚠"
+            )
         else:
             failed.append(
                 f"TGA: 0/3 arrows — no momentum/technical confirmation "

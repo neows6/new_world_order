@@ -179,14 +179,52 @@ class FirstPrinciplesEngine:
 
     def _get_sp500_returns(self, n_days: int) -> list:
         """
-        Placeholder for S&P 500 daily returns.
-        In production: store SPY/^GSPC price history via the same pipeline.
-        Returns approximate long-run daily return for now.
+        Real S&P 500 daily returns via yfinance, cached in data/spy_returns_cache.json.
+        Falls back to synthetic returns if yfinance is unavailable.
+        Cache is refreshed if > 7 days old.
         """
-        # TODO: Replace with actual SPY returns from DB once SPY is in watchlist
-        # For now, return synthetic returns centered on long-run daily mean
-        daily_mean = 0.10 / 252   # ~10% annual return
-        return [daily_mean] * n_days
+        import json as _json
+        from pathlib import Path as _Path
+        from datetime import datetime as _dt, timedelta as _td
+
+        cache_path = _Path(__file__).resolve().parent.parent / "data" / "spy_returns_cache.json"
+
+        def _load_cache():
+            try:
+                if cache_path.exists():
+                    raw = _json.loads(cache_path.read_text())
+                    age_days = (_dt.utcnow() - _dt.fromisoformat(raw["ts"])).days
+                    if age_days <= 7:
+                        return raw["returns"]
+            except Exception:
+                pass
+            return None
+
+        def _fetch_and_cache():
+            try:
+                import yfinance as yf
+                end = _dt.utcnow().strftime("%Y-%m-%d")
+                start = (_dt.utcnow() - _td(days=1260)).strftime("%Y-%m-%d")  # ~5 years
+                spy = yf.download("SPY", start=start, end=end, interval="1d",
+                                  auto_adjust=True, progress=False)["Close"]
+                if spy.empty or len(spy) < 60:
+                    return None
+                spy_vals = spy.values.tolist()
+                returns = [(spy_vals[i] - spy_vals[i-1]) / spy_vals[i-1]
+                           for i in range(1, len(spy_vals))]
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(_json.dumps({"ts": _dt.utcnow().isoformat(), "returns": returns}))
+                logger.info(f"[ENGINE] SPY beta returns fetched: {len(returns)} days")
+                return returns
+            except Exception as exc:
+                logger.warning(f"[ENGINE] SPY fetch failed, using synthetic returns: {exc}")
+                return None
+
+        returns = _load_cache() or _fetch_and_cache()
+        if returns:
+            return returns[-n_days:] if len(returns) >= n_days else returns
+        # Fallback: synthetic
+        return [0.10 / 252] * n_days
 
     def _assess_investability(
         self,

@@ -216,11 +216,12 @@ class EnsembleKellyEngine:
         # Spread creates the probability distribution width
         sigma = max(0.02, spread * 0.10)   # Spread → price uncertainty
 
-        # P10 (pessimistic), P50 (base), P90 (optimistic)
-        # Using normal approximation: z(10%) ≈ -1.28, z(90%) ≈ +1.28
-        p10 = current_price * (1.0 + expected_return - 1.28 * sigma)
+        # P10/P90 use Student's t(df=5) quantiles (±1.476) instead of normal (±1.28)
+        # Fat tails: market returns have excess kurtosis ~4-6; t(5) captures this
+        T5_Q = 1.476
+        p10 = current_price * (1.0 + expected_return - T5_Q * sigma)
         p50 = current_price * (1.0 + expected_return)
-        p90 = current_price * (1.0 + expected_return + 1.28 * sigma)
+        p90 = current_price * (1.0 + expected_return + T5_Q * sigma)
 
         return p10, p50, p90
 
@@ -254,8 +255,10 @@ class EnsembleKellyEngine:
         warnings = []
 
         # ── Assemble ensemble members ──────────────────────────────
-        # Convert Reynolds multiplier to a score (0.5=full=0, 0=no=−1)
-        reynolds_score = (reynolds_position_mult - 0.5) * 2.0   # maps [0,1] → [-1,1]
+        # Semantic mapping: turbulent (0.40) ≠ bearish; it's cautious-neutral.
+        # The old arithmetic rescaling (mult-0.5)*2 made Re=0.40 read as -0.20 (bearish) — wrong.
+        _REYNOLDS_SCORE_MAP = {1.0: 0.30, 0.40: 0.00, 0.15: -0.20, 0.10: -0.30}
+        reynolds_score = _REYNOLDS_SCORE_MAP.get(round(reynolds_position_mult, 2), 0.0)
 
         raw_scores = {
             "fundamental": fundamental_score,
@@ -308,18 +311,27 @@ class EnsembleKellyEngine:
         calibrated_confidence = ensemble_prob_bull * confidence_multiplier
 
         # ── Kelly Criterion ────────────────────────────────────────
-        # Use the ensemble win probability as our best Kelly estimate
-        kelly_p = max(self.MIN_WIN_PROB - 0.01, min(0.85, ensemble_prob_bull))
+        kelly_p = min(0.85, ensemble_prob_bull)
         rr = max(0.5, risk_reward_ratio)
 
         kelly_full = self._compute_kelly_fraction(kelly_p, rr)
-        kelly_recommended = kelly_full * KELLY_FRACTION   # 25% Kelly
+
+        # Adaptive Kelly fraction — scale down when models disagree
+        kelly_fraction = KELLY_FRACTION   # base 25%
+        if spread > self.MODERATE_SPREAD:
+            kelly_fraction *= 0.50        # wide disagreement → half Kelly
+        elif spread > self.TIGHT_SPREAD:
+            kelly_fraction *= 0.75        # moderate disagreement → 3/4 Kelly
+        if calibrated_confidence < 0.40:
+            kelly_fraction *= 0.70        # low calibrated confidence → further reduce
+
+        kelly_recommended = kelly_full * kelly_fraction
 
         # Kelly reasoning
         q = 1.0 - kelly_p
         kelly_reasoning = (
             f"Kelly: f* = (b×p - q)/b = ({rr:.1f}×{kelly_p:.2f} - {q:.2f})/{rr:.1f} "
-            f"= {kelly_full:.3f} → 25% Kelly = {kelly_recommended:.3f} "
+            f"= {kelly_full:.3f} → {kelly_fraction:.0%} Kelly = {kelly_recommended:.3f} "
             f"({kelly_recommended:.1%} of portfolio)"
         )
         notes.append(kelly_reasoning)
@@ -342,12 +354,16 @@ class EnsembleKellyEngine:
         else:
             effective_pct = min(adjusted_pct, max_position_pct)
 
-        # Win probability gate
-        if ensemble_prob_bull < self.MIN_WIN_PROB:
+        # Win probability gate — require 5% edge above break-even for the R/R ratio
+        # Break-even: 1/(1+b). At R/R=2: need >33% win rate. At R/R=1: need >50%.
+        # This replaces the fixed 55% floor which wrongly blocked high-R/R setups.
+        breakeven_p = 1.0 / (1.0 + rr)
+        min_win_p = max(breakeven_p + 0.05, 0.45)   # always require at least 5% edge
+        if ensemble_prob_bull < min_win_p:
             effective_pct = 0.0
             warnings.append(
-                f"Win probability ({ensemble_prob_bull:.0%}) below minimum ({self.MIN_WIN_PROB:.0%}) "
-                f"— Kelly recommends no position"
+                f"Win probability ({ensemble_prob_bull:.0%}) below break-even+5% "
+                f"({min_win_p:.0%} at R/R={rr:.1f}) — Kelly recommends no position"
             )
 
         # ── Outcome distribution ───────────────────────────────────

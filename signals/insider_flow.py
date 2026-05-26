@@ -383,18 +383,29 @@ class InsiderFlowAnalyzer:
         # ── Composite scoring ─────────────────────────────────────
         score = 0.0
 
-        # Cluster buy = strongest signal
-        if cluster_buy_detected:
-            score += 3.0
-        elif unique_buyers >= 2:
-            score += 1.5
+        def _recency_weight(txn: "InsiderTransaction") -> float:
+            """Form 4 signal edge decays after ~30 days."""
+            days_ago = (datetime.now() - txn.transaction_date).days
+            if days_ago <= 30:  return 1.00
+            if days_ago <= 60:  return 0.65
+            if days_ago <= 90:  return 0.35
+            return 0.10
 
-        # Large buy dollar value (weighted by role)
+        # Cluster buy = strongest signal (apply recency to most recent transaction in cluster)
+        if cluster_buy_detected:
+            most_recent_cluster = max(buys, key=lambda t: t.transaction_date)
+            score += 3.0 * _recency_weight(most_recent_cluster)
+        elif unique_buyers >= 2:
+            most_recent_multi = max(buys, key=lambda t: t.transaction_date)
+            score += 1.5 * _recency_weight(most_recent_multi)
+
+        # Large buy dollar value (weighted by role and recency)
         for buy in buys:
+            rw = buy.role_weight * _recency_weight(buy)
             if buy.total_value >= self.STRONG_BUY_VALUE:
-                score += 1.0 * buy.role_weight
+                score += 1.0 * rw
             elif buy.total_value >= self.MIN_BUY_VALUE:
-                score += 0.3 * buy.role_weight
+                score += 0.3 * rw
 
         # Penalize heavy selling
         if total_sell_value > total_buy_value * 2:

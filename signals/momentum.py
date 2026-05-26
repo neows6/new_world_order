@@ -30,6 +30,7 @@ class MomentumResult:
     momentum_score: float   # –1.0 to +1.0
     signal: str             # "strong_buy" | "buy" | "hold" | "sell" | "strong_sell"
     reason: str             # human-readable summary
+    is_52w_high_breakout: bool = False  # price within 2% of 52-week high
 
 
 def _ema(closes: list, period: int) -> float:
@@ -71,6 +72,30 @@ def _rsi(closes: list, period: int = 14) -> float:
         return 100.0
     rs = avg_g / avg_l
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+
+def _detect_divergence(closes: list, macd_hist: list) -> float:
+    """
+    Bearish divergence: price makes higher high while MACD histogram makes lower high.
+    Bullish divergence: price makes lower low while MACD makes higher low.
+    Both are well-documented reversal warnings in technical analysis.
+    Returns a score adjustment: negative for bearish, positive for bullish, 0 for none.
+    """
+    if len(closes) < 20 or len(macd_hist) < 20:
+        return 0.0
+    recent_price_high = max(closes[-10:])
+    prior_price_high  = max(closes[-20:-10])
+    recent_macd_high  = max(macd_hist[-10:])
+    prior_macd_high   = max(macd_hist[-20:-10])
+    if recent_price_high > prior_price_high * 1.005 and recent_macd_high < prior_macd_high * 0.995:
+        return -0.25  # bearish divergence
+    recent_price_low = min(closes[-10:])
+    prior_price_low  = min(closes[-20:-10])
+    recent_macd_low  = min(macd_hist[-10:])
+    prior_macd_low   = min(macd_hist[-20:-10])
+    if recent_price_low < prior_price_low * 0.995 and recent_macd_low > prior_macd_low * 1.005:
+        return +0.20  # bullish divergence
+    return 0.0
 
 
 class MomentumAnalyzer:
@@ -130,6 +155,11 @@ class MomentumAnalyzer:
             price_above_ema50 = price > ema50
             ema_aligned = ema20 > ema50      # Uptrend structure
 
+            # ── 52-week high breakout ──────────────────────────────
+            lookback = closes[-252:] if len(closes) >= 252 else closes
+            w52_high = max(lookback)
+            is_52w_high_breakout = w52_high > 0 and (price >= w52_high * 0.98)
+
             # ── Volume surge ───────────────────────────────────────
             volume_ratio = 1.0
             if volumes and len(volumes) >= 21:
@@ -181,7 +211,10 @@ class MomentumAnalyzer:
               + 0.15 * ema_c
               + 0.05 * vol_c
             )
-            score = round(max(-1.0, min(1.0, score)), 4)
+
+            # MACD/price divergence adjustment
+            div_adj = _detect_divergence(closes, hist_series)
+            score = round(max(-1.0, min(1.0, score + div_adj)), 4)
 
             # ── Signal classification ──────────────────────────────
             if score >= 0.40:      sig = "strong_buy"
@@ -203,6 +236,10 @@ class MomentumAnalyzer:
                 parts.append("below EMA20")
             if volume_ratio > 1.5:
                 parts.append(f"vol\xd7{volume_ratio:.1f}")
+            if div_adj < 0:
+                parts.append("bearish MACD divergence")
+            elif div_adj > 0:
+                parts.append("bullish MACD divergence")
             reason = " | ".join(parts)
 
             logger.debug(f"[MOM] {ticker}: score={score:+.3f} ({sig}) — {reason}")
@@ -221,6 +258,7 @@ class MomentumAnalyzer:
                 momentum_score=score,
                 signal=sig,
                 reason=reason,
+                is_52w_high_breakout=is_52w_high_breakout,
             )
 
         except Exception as e:
