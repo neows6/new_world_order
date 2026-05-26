@@ -5071,16 +5071,17 @@ def api_paper_benchmarks(since: str = ""):
             since = db_since
         # If since is today (or a future date), back up to the last weekday before today
         # so yfinance can return at least 2 data points (open and close from prior day)
-        from datetime import date as _date
+        from datetime import date as _date, timedelta as _td
         today = datetime.now(timezone.utc).date()
         since_date = _date.fromisoformat(since)
         if since_date >= today:
-            since_date = today - timedelta(days=1)
+            since_date = today - _td(days=1)
             while since_date.weekday() >= 5:   # skip Saturday(5) and Sunday(6)
-                since_date -= timedelta(days=1)
+                since_date -= _td(days=1)
             since = since_date.isoformat()
     except Exception:
-        since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        from datetime import timedelta as _td
+        since = (datetime.now(timezone.utc) - _td(days=30)).strftime("%Y-%m-%d")
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_key = f"{since}_{today_str}"
