@@ -42,6 +42,18 @@ app.include_router(alfred_router)
 from monitor.strat import strat_router
 app.include_router(strat_router)
 
+from monitor.sentinel import sentinel_router, start_background_runner as _start_sentinel_runner
+app.include_router(sentinel_router)
+
+# Spawn entanglement engine + sentinel runner threads at import time
+try:
+    from signals.entanglement import start_background_runner as _start_entanglement_runner
+    _start_entanglement_runner(interval_seconds=60)
+    _start_sentinel_runner(interval_seconds=30)
+except Exception as _exc:
+    from loguru import logger as _lg
+    _lg.warning(f"[DASHBOARD] Sentinel/entanglement runners failed to start: {_exc}")
+
 # ── Mount signals dashboard under /signals ────────────────────────────────────
 from monitor.signals_dashboard import app as _signals_app, _latest_signals as _get_live_signals
 app.mount("/signals", _signals_app)
@@ -1288,6 +1300,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <a href="/signals"       class="brief-btn" id="signals-btn">&#128200; Signal Monitor</a>
     <a href="/alfred"        class="brief-btn" id="alfred-btn">&#128270; Alfred</a>
     <a href="/strat"         class="brief-btn" id="strat-btn">&#128202; STRAT</a>
+    <a href="/sentinel"      class="brief-btn" id="sentinel-btn">&#128737; Sentinel</a>
   </div>
 </header>
 <div class="tape-wrap"><div class="tape-track" id="main-tape"><span class="mt-neu">Loading signals...</span></div></div>

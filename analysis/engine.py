@@ -343,6 +343,28 @@ class FirstPrinciplesEngine:
                 if market_cap is None and current_price and shares_outstanding:
                     market_cap = current_price * shares_outstanding
 
+            # ── Pre-pipeline data validation (catches CRM/MSFT-style data bugs) ─
+            try:
+                from analysis.data_validator import validate_fundamentals
+                _val = validate_fundamentals(
+                    ticker=ticker,
+                    fundamentals_by_year=fundamentals_by_year,
+                    current_price=current_price,
+                    shares_outstanding=shares_outstanding,
+                    market_cap=market_cap,
+                    use_claude=True,
+                )
+                if _val.anomalies:
+                    logger.warning(
+                        f"[L2] {ticker}: data validator flagged "
+                        f"{len(_val.anomalies)} anomalies — {_val.anomalies[0]}"
+                    )
+                # Use sanitized market_cap if validator filled in a NULL
+                if market_cap is None and _val.sanitized_data.get("market_cap"):
+                    market_cap = _val.sanitized_data["market_cap"]
+            except Exception as _vexc:
+                logger.debug(f"[L2] {ticker}: validator skipped: {_vexc}")
+
             # ── WACC ───────────────────────────────────────────
             price_returns = self._compute_price_returns(price_records)
             market_returns = self._get_sp500_returns(len(price_returns))
