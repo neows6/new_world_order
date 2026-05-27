@@ -1,0 +1,276 @@
+
+// Debug: confirm script is executing
+document.getElementById('js-check').textContent = 'JS loaded, fetching...';
+document.getElementById('js-check').style.color = '#d29922';
+
+let _scanData   = null;
+let _filter     = 'all';
+let _charts     = {};
+let _pollTimer  = null;
+
+// ── Data loading ─────────────────────────────────────────────────────────────
+
+async function loadScan() {
+  try {
+    const d = await fetch('/api/itool').then(r => r.json());
+    if (d.error) { showError(d.error); return; }
+
+    if (d._scanning || !d.generated_at) {
+      showScanning();
+      if (!_pollTimer) _pollTimer = setInterval(loadScan, 5000);
+      return;
+    }
+
+    clearInterval(_pollTimer); _pollTimer = null;
+    _scanData = d;
+
+    const gt = new Date(d.generated_at + 'Z');
+    document.getElementById('scan-info').textContent =
+      'Scanned ' + gt.toLocaleDateString() + ' ' + gt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+
+    const c = d.counts || {};
+    document.getElementById('status-bar').innerHTML =
+      '<span>' + (d.total_scanned||0) + ' stocks scanned</span>' +
+      '<span class="cnt-bull">&#9650; ' + (c.bullish||0) + ' Bullish</span>' +
+      '<span class="cnt-bear">&#9660; ' + (c.bearish||0) + ' Bearish</span>' +
+      '<span class="neu">' + ((c.total||0) - (c.bullish||0) - (c.bearish||0)) + ' Neutral shown</span>';
+
+    buildTape(d.results || []);
+    applyFilter();
+    document.getElementById('rescan-btn').disabled = false;
+  } catch(e) {
+    showError('Could not reach server.');
+  }
+}
+
+function showScanning() {
+  document.getElementById('status-bar').innerHTML =
+    '<span class="scanning-pulse">&#8635; Scanning ~500 stocks... this takes ~2 minutes. Page auto-refreshes.</span>';
+  document.getElementById('rescan-btn').disabled = true;
+}
+
+function showError(msg) {
+  document.getElementById('status-bar').innerHTML = '<span style="color:#f85149">' + msg + '</span>';
+}
+
+async function triggerScan() {
+  document.getElementById('rescan-btn').disabled = true;
+  showScanning();
+  await fetch('/api/itool/refresh', {method: 'POST'});
+  if (!_pollTimer) _pollTimer = setInterval(loadScan, 5000);
+}
+
+// ── Ticker tape ───────────────────────────────────────────────────────────────
+
+function buildTape(results) {
+  const signals = results.filter(r => r.signal !== 'neutral');
+  if (!signals.length) {
+    document.getElementById('tape-track').innerHTML = '<span class="neu">No signals detected</span>';
+    return;
+  }
+  // Duplicate for seamless loop
+  const all = [...signals, ...signals];
+  const track = document.getElementById('tape-track');
+  track.innerHTML = all.map((r, i) =>
+    '<span class="tape-' + r.signal.replace('bullish','bull').replace('bearish','bear') + '">' +
+    (r.signal === 'bullish' ? '&#9650;' : '&#9660;') + ' ' +
+    r.ticker + ' $' + r.price.toFixed(2) + '</span>' +
+    '<span class="tape-sep">|</span>'
+  ).join('');
+  const dur = Math.max(40, signals.length * 0.5);
+  track.style.animationDuration = dur + 's';
+}
+
+// ── Filter & table ────────────────────────────────────────────────────────────
+
+function setFilter(f) {
+  _filter = f;
+  ['all','bullish','bearish'].forEach(id => {
+    document.getElementById('tab-' + id).classList.toggle('active', id === f);
+  });
+  if (_scanData) applyFilter();
+}
+
+function applyFilter() {
+  const results = _scanData.results || [];
+  const filtered = _filter === 'all' ? results : results.filter(r => r.signal === _filter);
+  document.getElementById('count-label').textContent =
+    filtered.length + ' of ' + results.length + ' stocks';
+  renderTable(filtered);
+}
+
+function renderTable(results) {
+  const wrap = document.getElementById('results-wrap');
+  if (!results.length) {
+    wrap.innerHTML = '<p class="empty">No stocks match the current filter.</p>';
+    return;
+  }
+  let html = '<table><tr>' +
+    '<th>Ticker</th><th>Price</th><th>SMA30</th><th>SMA50</th>' +
+    '<th>MACD Hist</th><th>Stoch %K</th><th>Signal</th><th>Chart</th>' +
+    '</tr>';
+  for (const r of results) {
+    const sigCls  = r.signal === 'bullish' ? 'sig-bull' : 'sig-bear';
+    const sigIcon = r.signal === 'bullish' ? '&#9650;' : '&#9660;';
+    const mCls = r.macd_hist > 0 ? 'pos' : r.macd_hist < 0 ? 'neg' : 'neu';
+    const kCls = r.stoch_k < 25 ? 'pos' : r.stoch_k > 75 ? 'neg' : 'neu';
+    html += '<tr onclick="openChart('' + r.ticker + '')">' +
+      '<td><strong>' + r.ticker + '</strong></td>' +
+      '<td>$' + r.price.toFixed(2) + '</td>' +
+      '<td>' + (r.sma30 ? '$' + r.sma30.toFixed(2) : '&#8212;') + '</td>' +
+      '<td>' + (r.sma50 ? '$' + r.sma50.toFixed(2) : '&#8212;') + '</td>' +
+      '<td class="' + mCls + '">' + r.macd_hist.toFixed(4) + '</td>' +
+      '<td class="' + kCls + '">' + r.stoch_k.toFixed(1) + '</td>' +
+      '<td class="' + sigCls + '">' + sigIcon + ' ' + r.signal.toUpperCase() + '</td>' +
+      '<td><button class="chart-btn" onclick="event.stopPropagation();openChart('' +
+        r.ticker + '')">Chart</button></td>' +
+      '</tr>';
+  }
+  wrap.innerHTML = html + '</table>';
+}
+
+// ── Chart modal ───────────────────────────────────────────────────────────────
+
+function openChart(ticker) {
+  if (typeof Chart === 'undefined') {
+    document.getElementById('status-bar').innerHTML +=
+      ' &nbsp;<span style="color:#d29922">Chart library loading, try again in a moment...</span>';
+    return;
+  }
+  const r = (_scanData?.results || []).find(x => x.ticker === ticker);
+  if (!r) return;
+
+  document.getElementById('modal-title').textContent = ticker + ' — Technical Analysis';
+  document.getElementById('modal-meta').innerHTML =
+    '<span class="' + (r.signal==='bullish'?'sig-bull':'sig-bear') + '">' +
+    (r.signal==='bullish'?'&#9650;':'&#9660;') + ' ' + r.signal.toUpperCase() + '</span>' +
+    ' &nbsp;|&nbsp; Price: $' + r.price.toFixed(2) +
+    ' &nbsp;|&nbsp; MACD: <span class="' + (r.macd_hist>0?'pos':'neg') + '">' +
+      r.macd_hist.toFixed(4) + '</span>' +
+    ' &nbsp;|&nbsp; Stoch %K: ' + r.stoch_k.toFixed(1);
+
+  document.getElementById('chart-modal').classList.add('open');
+
+  // Destroy previous instances
+  ['chart-price','chart-macd','chart-stoch'].forEach(id => {
+    if (_charts[id]) { _charts[id].destroy(); delete _charts[id]; }
+  });
+
+  const labels = r.dates;
+  const dark   = { grid: { color: '#21262d' }, ticks: { color: '#8b949e', font: {size:10} } };
+
+  // ── Panel 1: Price + SMA30 + SMA50 + crossover markers ──
+  const bullPts = (r.bull_price_idx || []).map(i => ({x: labels[i], y: r.closes[i]}));
+  const bearPts = (r.bear_price_idx || []).map(i => ({x: labels[i], y: r.closes[i]}));
+
+  _charts['chart-price'] = new Chart(
+    document.getElementById('chart-price').getContext('2d'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Price', data: r.closes, borderColor: '#e6edf3', borderWidth: 1.5,
+          pointRadius: 0, tension: 0.1, fill: false, order: 3 },
+        { label: 'SMA30', data: r.sma30_series, borderColor: '#58a6ff',
+          borderWidth: 1.2, pointRadius: 0, tension: 0, fill: false, order: 2 },
+        { label: 'SMA50', data: r.sma50_series, borderColor: '#d29922',
+          borderWidth: 1.2, pointRadius: 0, tension: 0, fill: false, order: 2 },
+        { type: 'scatter', label: 'Bullish', data: bullPts,
+          pointStyle: 'triangle', pointRadius: 9, rotation: 0,
+          backgroundColor: '#3fb950', borderColor: '#3fb950', order: 1 },
+        { type: 'scatter', label: 'Bearish', data: bearPts,
+          pointStyle: 'triangle', pointRadius: 9, rotation: 180,
+          backgroundColor: '#f85149', borderColor: '#f85149', order: 1 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8b949e', font: {size:11},
+        filter: i => i.text !== 'Bullish' && i.text !== 'Bearish' } } },
+      scales: {
+        x: { ...dark, x: {}, ticks: { ...dark.ticks, maxTicksLimit: 8 } },
+        y: { ...dark }
+      }
+    }
+  });
+
+  // ── Panel 2: MACD Histogram ──────────────────────────────
+  const histColors = (r.macd_hist_series || []).map(v =>
+    v === null ? 'transparent' : v >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)');
+  const histBorders = (r.macd_hist_series || []).map(v =>
+    v === null ? 'transparent' : v >= 0 ? '#3fb950' : '#f85149');
+
+  // Mark MACD crossover bars with bright borders
+  (r.bull_macd_idx || []).forEach(i => { histBorders[i] = '#58a6ff'; });
+  (r.bear_macd_idx || []).forEach(i => { histBorders[i] = '#ff9900'; });
+
+  _charts['chart-macd'] = new Chart(
+    document.getElementById('chart-macd').getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'MACD Hist',
+        data: r.macd_hist_series,
+        backgroundColor: histColors,
+        borderColor: histBorders,
+        borderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8b949e', font: {size:11} } } },
+      scales: {
+        x: { ...dark, ticks: { ...dark.ticks, maxTicksLimit: 8 } },
+        y: { ...dark }
+      }
+    }
+  });
+
+  // ── Panel 3: Stochastic ──────────────────────────────────
+  _charts['chart-stoch'] = new Chart(
+    document.getElementById('chart-stoch').getContext('2d'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: '%K', data: r.stoch_k_series, borderColor: '#58a6ff',
+          borderWidth: 1.5, pointRadius: 0, tension: 0.1, fill: false },
+        { label: '%D', data: r.stoch_d_series, borderColor: '#d29922',
+          borderWidth: 1, pointRadius: 0, tension: 0.1, fill: false,
+          borderDash: [4, 3] },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8b949e', font: {size:11} } } },
+      scales: {
+        x: { ...dark, ticks: { ...dark.ticks, maxTicksLimit: 8 } },
+        y: {
+          ...dark, min: 0, max: 100,
+          ticks: { ...dark.ticks,
+            callback: v => [0, 25, 50, 75, 100].includes(v) ? v : '' },
+          grid: {
+            color: ctx => {
+              if (ctx.tick.value === 25 || ctx.tick.value === 75)
+                return 'rgba(248,81,73,0.25)';
+              return '#21262d';
+            }
+          }
+        }
+      }
+    }
+  });
+}
+
+function closeModal() {
+  document.getElementById('chart-modal').classList.remove('open');
+}
+
+function modalBgClick(e) {
+  if (e.target.id === 'chart-modal') closeModal();
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadScan();
+setInterval(loadScan, 30000);

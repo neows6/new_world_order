@@ -24,3 +24,8 @@ monitor/files.zip
 .vscode/
 *.DS_Store
 Thumbs.db
+
+# Claude Code working directory + local backups
+.claude/
+backups/
+test_page.html
