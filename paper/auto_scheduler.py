@@ -80,10 +80,11 @@ class PaperScheduler:
         if self._started:
             return
         self._started = True
-        threading.Thread(target=self._cycle_loop,     daemon=True, name="paper-cycle").start()
-        threading.Thread(target=self._monitor_loop,   daemon=True, name="paper-stops").start()
-        threading.Thread(target=self._r2000_loop,     daemon=True, name="paper-r2000").start()
-        threading.Thread(target=self._tipranks_loop,  daemon=True, name="paper-tipranks").start()
+        threading.Thread(target=self._cycle_loop,      daemon=True, name="paper-cycle").start()
+        threading.Thread(target=self._monitor_loop,    daemon=True, name="paper-stops").start()
+        threading.Thread(target=self._r2000_loop,      daemon=True, name="paper-r2000").start()
+        threading.Thread(target=self._tipranks_loop,   daemon=True, name="paper-tipranks").start()
+        threading.Thread(target=self._prewarm_engines, daemon=True, name="paper-prewarm").start()
         logger.info("[AUTO] Paper scheduler started — cycle every 5 min, stops every 60s, R2000 scan 3x/day, TipRanks scan 2x/day")
 
     def pause(self):
@@ -94,9 +95,16 @@ class PaperScheduler:
         self._paused = False
         logger.info("[AUTO] Paper scheduler resumed")
 
-    def trigger_cycle(self):
-        """Fire a manual cycle immediately (Run Now). Non-blocking."""
+    def trigger_cycle(self, force: bool = False) -> str:
+        """
+        Fire a manual cycle (Run Now). Returns status string.
+        Blocked outside market hours unless force=True.
+        """
+        if not force and not _is_market_hours():
+            logger.info("[AUTO] Run Now blocked — outside market hours (9:30am–4:00pm ET Mon-Fri)")
+            return "outside_market_hours"
         threading.Thread(target=self._run_cycle, daemon=True, name="paper-manual").start()
+        return "started"
 
     def status(self) -> dict:
         now_et = datetime.now(ET)
@@ -332,6 +340,15 @@ class PaperScheduler:
 
     # ── Engine initialization ──────────────────────────────────────────────────
 
+    def _prewarm_engines(self):
+        """Initialize engine pool shortly after server start so dashboard shows Ready immediately."""
+        import time
+        time.sleep(15)
+        try:
+            self._ensure_engines()
+        except Exception:
+            pass  # Will retry on next market-hours cycle
+
     def _ensure_engines(self):
         if self._engines_ready:
             return
@@ -347,6 +364,8 @@ class PaperScheduler:
             )
             from signals.aggregator import SignalAggregator
             from signals.supertrend import SuperTrendAnalyzer
+            from signals.three_green_arrows import ThreeGreenArrowsAnalyzer
+            from signals.momentum import MomentumAnalyzer
             from fud.filter_engine import FUDFilterEngine
             from risk.manager import RiskManager
             from broker.market_data import SchwabMarketData
@@ -364,6 +383,8 @@ class PaperScheduler:
             self._vix             = VIXRegimeDetector()
             self._aggregator      = SignalAggregator()
             self._st_analyzer     = SuperTrendAnalyzer()
+            self._tga_analyzer    = ThreeGreenArrowsAnalyzer()
+            self._momentum_analyzer = MomentumAnalyzer()
             self._fud             = FUDFilterEngine(db_session_factory=self._Session)
             self._risk            = RiskManager(db_session_factory=self._Session)
             self._market_data     = SchwabMarketData()

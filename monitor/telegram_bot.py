@@ -22,30 +22,35 @@ from loguru import logger
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+# Supports comma-separated list: "-1003975931056,8322227501"
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+_CHAT_IDS = [c.strip() for c in CHAT_ID.split(",") if c.strip()]
 
 _BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 def send_alert(message: str) -> bool:
     """
-    Send a Telegram message. Returns True on success.
+    Send a Telegram message to all configured chat IDs.
+    Returns True if at least one succeeds.
     Silent no-op if credentials are not configured.
     """
-    if not BOT_TOKEN or not CHAT_ID:
+    if not BOT_TOKEN or not _CHAT_IDS:
         return False
 
-    try:
-        resp = httpx.post(
-            f"{_BASE}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning(f"Telegram alert failed: {e}")
-        return False
+    ok = False
+    for chat_id in _CHAT_IDS:
+        try:
+            resp = httpx.post(
+                f"{_BASE}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            ok = True
+        except Exception as e:
+            logger.warning(f"Telegram alert failed for {chat_id}: {e}")
+    return ok
 
 
 def get_chat_id() -> None:

@@ -430,7 +430,7 @@ class RiskManager:
 
         # ── Risk metrics ───────────────────────────────────────────
         dollar_risk = (entry_price - adjusted_stop) * final_shares if adjusted_stop else None
-        pct_risk = dollar_risk / portfolio_value if dollar_risk and portfolio_value else None
+        pct_risk = dollar_risk / portfolio_value if dollar_risk is not None and portfolio_value else None
         rr = (tp1 - entry_price) / (entry_price - adjusted_stop) if (tp1 and adjusted_stop and entry_price > adjusted_stop) else None
 
         # R/R check

@@ -28,9 +28,9 @@ CONCEPT_MAP = {
     "revenue":               ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
     "gross_profit":          ["GrossProfit", "GrossProfitLoss"],
     "operating_income":      ["OperatingIncomeLoss"],
-    "net_income":            ["NetIncomeLoss"],
+    "net_income":            ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
     "eps_diluted":           ["EarningsPerShareDiluted"],
-    "depreciation":          ["DepreciationDepletionAndAmortization", "Depreciation"],
+    "depreciation":          ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization", "Depreciation", "DepreciationAmortizationAndAccretionNet", "AmortizationOfIntangibleAssets"],
 
     # Balance sheet
     "total_assets":          ["Assets"],
@@ -41,7 +41,7 @@ CONCEPT_MAP = {
 
     # Cash flow
     "operating_cash_flow":   ["NetCashProvidedByUsedInOperatingActivities"],
-    "capex":                 ["PaymentsToAcquirePropertyPlantAndEquipment", "PropertyPlantAndEquipmentAdditions", "PurchasesOfPropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
+    "capex":                 ["PaymentsToAcquirePropertyPlantAndEquipment", "PropertyPlantAndEquipmentAdditions", "PurchasesOfPropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets", "PaymentsForCapitalImprovements", "PaymentsToAcquireRealEstateHeldForInvestment"],
     "shares_outstanding":    ["CommonStockSharesOutstanding"],
 }
 
@@ -246,7 +246,7 @@ class EdgarClient:
 
         # Extract all concepts as annual series
         # Use merged extraction for multi-fallback fields (capex, gross_profit)
-        MERGED_FIELDS = {"capex", "gross_profit"}
+        MERGED_FIELDS = {"capex", "gross_profit", "depreciation", "revenue", "total_equity", "total_debt", "cash", "net_income", "operating_income"}
         extracted = {}
         for field_name, concept_names in CONCEPT_MAP.items():
             if field_name in MERGED_FIELDS and len(concept_names) > 1:
@@ -274,23 +274,27 @@ class EdgarClient:
             assets = g("total_assets")
 
             # Derived / first principles metrics
-            gross_margin = (gross_profit / revenue) if revenue and gross_profit else None
-            free_cash_flow = (ocf - capex) if ocf and capex else None
-            owner_earnings = (net_income + dep - capex) if (net_income and dep and capex) else None
+            gross_margin = (gross_profit / revenue) if (revenue is not None and gross_profit is not None and revenue != 0) else None
+            # capex falls back to 0 for capital-light sectors (banks, insurers) where
+            # EDGAR doesn't carry a PaymentsToAcquirePPE tag, or when the filing year
+            # predates the concept being used.  OCF-only FCF is labelled approximate.
+            _capex = capex if capex is not None else 0
+            free_cash_flow = (ocf - _capex) if ocf is not None else None
+            owner_earnings = (net_income + dep - _capex) if (net_income is not None and dep is not None) else None
             net_debt = (debt - cash) if (debt is not None and cash is not None) else None
 
             # NOPAT = Operating Income * (1 - effective tax rate)
             # We estimate using net income / revenue as a simplification
             # A more precise version requires tax rate from the filing
             op_income = g("operating_income")
-            nopat = (op_income * 0.79) if op_income else None  # Assumes ~21% corporate tax
+            nopat = (op_income * 0.79) if op_income is not None else None  # Assumes ~21% corporate tax
 
             # Invested capital = total equity + net debt
-            invested_capital = (equity + net_debt) if (equity and net_debt is not None) else None
-            roic = (nopat / invested_capital) if (nopat and invested_capital and invested_capital != 0) else None
+            invested_capital = (equity + net_debt) if (equity is not None and net_debt is not None) else None
+            roic = (nopat / invested_capital) if (nopat is not None and invested_capital is not None and invested_capital != 0) else None
 
-            ebitda = (op_income + dep) if (op_income and dep) else None
-            net_debt_to_ebitda = (net_debt / ebitda) if (net_debt is not None and ebitda and ebitda != 0) else None
+            ebitda = (op_income + dep) if (op_income is not None and dep is not None) else None
+            net_debt_to_ebitda = (net_debt / ebitda) if (net_debt is not None and ebitda is not None and ebitda != 0) else None
 
             annual_records.append({
                 "ticker": ticker,

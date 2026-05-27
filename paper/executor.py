@@ -15,7 +15,7 @@ from loguru import logger
 from sqlalchemy.orm import Session as SASession
 
 from risk.manager import RiskAssessment
-from paper.account import init_paper_db, PaperAccount, PaperPosition, PaperTrade
+from paper.account import init_paper_db, PaperAccount, PaperPosition, PaperTrade, PaperEquitySnapshot
 
 try:
     from monitor.telegram_bot import send_alert as _tg
@@ -31,6 +31,13 @@ PAPER_MODEL_CONFIGS = {
     "very_relaxed": {"multiplier": 0.50, "db": "data/paper_very_relaxed.db",      "stagegate": "data/stagegate_very_relaxed.json"},
     "claude":       {"multiplier": 0.85, "db": "data/paper_claude.db",            "stagegate": "data/stagegate_claude.json"},
 }
+
+# Default S&P 100 large-cap tickers for stage2 on fresh start or reset
+DEFAULT_STAGE2_TICKERS = [
+    "ABBV", "ADBE", "AMZN", "BAC",  "BLK",  "CAT",  "COST", "CRM",
+    "CVX",  "GOOGL","HD",   "LIN",  "LLY",  "MCD",  "MSFT", "NFLX",
+    "NVDA", "ORCL", "PLD",  "QCOM", "RTX",  "UNH",  "V",    "WFC",  "XOM",
+]
 
 
 class PaperExecutor:
@@ -236,33 +243,12 @@ class PaperExecutor:
                 )
                 if snap:
                     daily_pnl = round(total_equity - snap.total_equity, 2)
-                    daily_pnl_pct = round((daily_pnl / snap.total_equity * 100) if snap.total_equity else 0, 2)
+                    daily_pnl_pct = round((daily_pnl / start_bal * 100) if start_bal else 0, 2)
                 else:
-                    # No prior snapshot — only reconstruct if trades happened today.
-                    # Without today's trades the formula degenerates to (mkt_val - cost_basis)
-                    # which is identical to total_pnl, making the card misleading.
-                    today_start = _dt.combine(today, _dt.min.time())
-                    today_buy_total = sum(
-                        t.total for t in s.query(PaperTrade)
-                        .filter(PaperTrade.action == "BUY",
-                                PaperTrade.timestamp >= today_start)
-                        .all()
-                    )
-                    if today_buy_total > 0:
-                        last_prior = (
-                            s.query(PaperTrade)
-                            .filter(PaperTrade.timestamp < today_start,
-                                    PaperTrade.cash_after.isnot(None))
-                            .order_by(PaperTrade.timestamp.desc())
-                            .first()
-                        )
-                        if last_prior:
-                            start_cash = last_prior.cash_after
-                            start_pos_value = max(0.0, total_cost - today_buy_total)
-                            start_equity = start_cash + start_pos_value
-                            if start_equity > 0:
-                                daily_pnl = round(total_equity - start_equity, 2)
-                                daily_pnl_pct = round(daily_pnl / start_equity * 100, 2)
+                    # No prior snapshot (reset day or fresh account).
+                    # All P&L since starting balance happened today — daily = lifetime.
+                    daily_pnl = round(total_equity - start_bal, 2)
+                    daily_pnl_pct = round((daily_pnl / start_bal * 100) if start_bal else 0, 2)
 
                 # Always save today's snapshot (idempotent) so tomorrow has a baseline
                 try:
@@ -293,6 +279,7 @@ class PaperExecutor:
                 "daily_pnl_pct":    daily_pnl_pct,
                 "positions":        pos_list,
                 "created_at":       account.created_at.isoformat() if account.created_at else None,
+                "reset_at":         account.reset_at.isoformat()   if account.reset_at   else None,
             }
 
     def get_recent_trades(self, limit: int = 50) -> list:
@@ -318,52 +305,88 @@ class PaperExecutor:
             ]
 
     def reset_account(self):
-        """Wipe all trades and positions, restore starting balance."""
+        """Wipe all trades, positions, and equity snapshots, restore starting balance and default stagegate."""
         with self.Session() as s:
             s.query(PaperTrade).delete()
             s.query(PaperPosition).delete()
+            s.query(PaperEquitySnapshot).delete()
             account = s.query(PaperAccount).first()
             account.cash     = account.starting_balance
             account.reset_at = datetime.now(timezone.utc)
             s.commit()
+        self._reset_stagegate_to_defaults()
         logger.info("[PAPER] Account reset to starting balance.")
+
+    def _reset_stagegate_to_defaults(self):
+        """On reset: restore shared stage2 to defaults and clear this model's stage3.
+        Stage2 lives in data/stagegate.json (shared); stage3 is per-model."""
+        import json as _json
+        _SHARED = "data/stagegate.json"
+        try:
+            # Restore shared stage2
+            shared = {}
+            try:
+                with open(_SHARED, encoding="utf-8") as f:
+                    shared = _json.load(f)
+            except Exception:
+                pass
+            shared["stage1"] = shared.get("stage1", [])
+            shared["stage2"] = sorted(DEFAULT_STAGE2_TICKERS)
+            shared["stage3"] = shared.get("stage3", [])
+            with open(_SHARED, "w", encoding="utf-8") as f:
+                _json.dump(shared, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[PAPER] Could not reset shared stagegate: {e}")
+        try:
+            # Clear only this model's stage3
+            if self._stagegate_file != _SHARED:
+                model_sg = {}
+                try:
+                    with open(self._stagegate_file, encoding="utf-8") as f:
+                        model_sg = _json.load(f)
+                except Exception:
+                    pass
+                model_sg["stage3"] = []
+                with open(self._stagegate_file, "w", encoding="utf-8") as f:
+                    _json.dump(model_sg, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[PAPER] Could not reset stagegate file {self._stagegate_file}: {e}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _update_stagegate(self, ticker: str, action: str):
-        """Sync stagegate file after a trade: BUY → stage3, SELL → stage2."""
+        """Sync stagegate files after a trade.
+        Stage2 is shared (data/stagegate.json) and is the permanent candidate pool —
+        it is NEVER modified by individual trade events. Stage3 is per-model and
+        tracks each model's open positions in self._stagegate_file.
+        BUY  → add ticker to this model's stage3.
+        SELL → remove ticker from this model's stage3.
+        """
         import json, os
         try:
-            sg_file = self._stagegate_file
-            if not os.path.exists(sg_file):
-                return
-            with open(sg_file, encoding="utf-8") as f:
-                sg = json.load(f)
+            model_file = self._stagegate_file
+            model_sg = {}
+            if os.path.exists(model_file):
+                with open(model_file, encoding="utf-8") as f:
+                    model_sg = json.load(f)
             for k in ("stage1", "stage2", "stage3"):
-                sg.setdefault(k, [])
+                model_sg.setdefault(k, [])
+
             if action == "BUY":
-                # Always remove from stage1
-                if ticker in sg["stage1"]:
-                    sg["stage1"].remove(ticker)
-                # First buy: move from stage2 → stage3
-                # Pyramid buy (already in stage3 from a split): keep stage2 presence as-is
-                if ticker not in sg["stage3"]:
-                    if ticker in sg["stage2"]:
-                        sg["stage2"].remove(ticker)
-                    sg["stage3"].append(ticker)
-                # else: pyramid — stage2 presence unchanged
+                if ticker not in model_sg["stage3"]:
+                    model_sg["stage3"].append(ticker)
             elif action == "SELL":
-                if ticker in sg["stage3"]:
-                    sg["stage3"].remove(ticker)
-                # Return to stage2 (still AI-watched) if not already placed
-                if ticker not in sg["stage1"] and ticker not in sg["stage2"]:
-                    sg["stage2"].append(ticker)
-            with open(sg_file, "w", encoding="utf-8") as f:
-                json.dump(sg, f, indent=2)
+                if ticker in model_sg["stage3"]:
+                    model_sg["stage3"].remove(ticker)
+            else:
+                return
+
+            with open(model_file, "w", encoding="utf-8") as f:
+                json.dump(model_sg, f, indent=2)
 
             # Auto-enable AI exit toggle on AI BUY so the AI monitors for exits
             if action == "BUY":
-                sg_path = str(sg_file)
+                sg_path = str(model_file)
                 if "very_relaxed" in sg_path:
                     ai_exits_path = "data/ai_exits_very_relaxed.json"
                 elif "relaxed" in sg_path:

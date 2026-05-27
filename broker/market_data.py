@@ -37,6 +37,14 @@ class SchwabMarketData:
             return self._client
 
         try:
+            import certifi
+            from authlib.integrations.httpx_client import OAuth2Client as _OA2C
+            _orig_init = _OA2C.__init__
+            def _patched_init(self, *a, **kw):
+                kw.setdefault("verify", certifi.where())
+                _orig_init(self, *a, **kw)
+            _OA2C.__init__ = _patched_init
+
             import schwab
             token_path = Path(config.schwab.token_path)
 
@@ -181,59 +189,60 @@ class SchwabMarketData:
             logger.error(f"Failed to fetch quote for {ticker}: {e}")
             return None
 
-    def get_quotes_batch(self, tickers: list) -> dict:
+    def get_quotes_batch(self, tickers: list, chunk_size: int = 200) -> dict:
         """
-        Fetch quotes for multiple tickers in one API call.
-        Returns {ticker: quote_dict}
+        Fetch quotes for multiple tickers, chunked to stay within Schwab's
+        per-request symbol limit. Returns {ticker: quote_dict}.
         """
         client = self._get_client()
+        result = {}
 
-        try:
-            resp = client.get_quotes(tickers)
-            resp.raise_for_status()
-            data = resp.json()
+        chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+        for chunk in chunks:
+            try:
+                resp = client.get_quotes(chunk)
+                resp.raise_for_status()
+                data = resp.json()
 
-            result = {}
-            for ticker, info in data.items():
-                quote = info.get("quote", {})
-                fundamental = info.get("fundamental", {})
-                last        = quote.get("lastPrice") or quote.get("mark")
-                close_price = quote.get("closePrice") or quote.get("regularMarketLastPrice")
-                net_change  = quote.get("netChange") or quote.get("regularMarketNetChange")
-                net_pct     = quote.get("netPercentChange") or quote.get("regularMarketPercentChange")
-                high_price  = quote.get("highPrice") or quote.get("regularMarketHighPrice")
-                low_price   = quote.get("lowPrice")  or quote.get("regularMarketLowPrice")
-                open_price  = quote.get("openPrice") or quote.get("regularMarketOpenPrice")
-                volume      = quote.get("totalVolume") or quote.get("regularMarketVolume")
-                if net_pct is None and net_change is not None and close_price:
-                    try:
-                        net_pct = round(net_change / close_price * 100, 2)
-                    except Exception:
-                        pass
-                result[ticker] = {
-                    "ticker":        ticker,
-                    "last_price":    last,
-                    "open_price":    round(float(open_price), 4)  if open_price  else None,
-                    "high_price":    round(float(high_price), 4)  if high_price  else None,
-                    "low_price":     round(float(low_price), 4)   if low_price   else None,
-                    "volume":        int(volume)                   if volume      else None,
-                    "bid":           quote.get("bidPrice"),
-                    "ask":           quote.get("askPrice"),
-                    "net_change":    round(float(net_change), 4)  if net_change  is not None else None,
-                    "net_pct_change":round(float(net_pct), 2)     if net_pct     is not None else None,
-                    "prev_close":    round(float(close_price), 2) if close_price else None,
-                    "market_cap":    fundamental.get("marketCap"),
-                    "shares_outstanding": fundamental.get("sharesOutstanding"),
-                    "pe_ratio":      fundamental.get("peRatio"),
-                    "timestamp":     datetime.now(),
-                }
+                for ticker, info in data.items():
+                    quote = info.get("quote", {})
+                    fundamental = info.get("fundamental", {})
+                    last        = quote.get("lastPrice") or quote.get("mark")
+                    close_price = quote.get("closePrice") or quote.get("regularMarketLastPrice")
+                    net_change  = quote.get("netChange") or quote.get("regularMarketNetChange")
+                    net_pct     = quote.get("netPercentChange") or quote.get("regularMarketPercentChange")
+                    high_price  = quote.get("highPrice") or quote.get("regularMarketHighPrice")
+                    low_price   = quote.get("lowPrice")  or quote.get("regularMarketLowPrice")
+                    open_price  = quote.get("openPrice") or quote.get("regularMarketOpenPrice")
+                    volume      = quote.get("totalVolume") or quote.get("regularMarketVolume")
+                    if net_pct is None and net_change is not None and close_price:
+                        try:
+                            net_pct = round(net_change / close_price * 100, 2)
+                        except Exception:
+                            pass
+                    result[ticker] = {
+                        "ticker":        ticker,
+                        "last_price":    last,
+                        "open_price":    round(float(open_price), 4)  if open_price  else None,
+                        "high_price":    round(float(high_price), 4)  if high_price  else None,
+                        "low_price":     round(float(low_price), 4)   if low_price   else None,
+                        "volume":        int(volume)                   if volume      else None,
+                        "bid":           quote.get("bidPrice"),
+                        "ask":           quote.get("askPrice"),
+                        "net_change":    round(float(net_change), 4)  if net_change  is not None else None,
+                        "net_pct_change":round(float(net_pct), 2)     if net_pct     is not None else None,
+                        "prev_close":    round(float(close_price), 2) if close_price else None,
+                        "market_cap":    fundamental.get("marketCap"),
+                        "shares_outstanding": fundamental.get("sharesOutstanding"),
+                        "pe_ratio":      fundamental.get("peRatio"),
+                        "timestamp":     datetime.now(),
+                    }
 
-            logger.info(f"Fetched batch quotes for {len(result)} tickers")
-            return result
+            except Exception as e:
+                logger.error(f"Batch quote fetch failed for chunk of {len(chunk)}: {e}")
 
-        except Exception as e:
-            logger.error(f"Batch quote fetch failed: {e}")
-            return {}
+        logger.info(f"Fetched batch quotes for {len(result)} tickers in {len(chunks)} chunk(s)")
+        return result
 
     def get_account_value(self) -> Optional[float]:
         """

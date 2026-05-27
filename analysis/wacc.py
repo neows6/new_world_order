@@ -117,7 +117,7 @@ class WACCEstimator:
         Cost of debt = interest expense / total debt.
         Falls back to sector-based estimate if data unavailable.
         """
-        if interest_expense and total_debt and total_debt > 0:
+        if interest_expense is not None and total_debt is not None and total_debt > 0:
             rd = abs(interest_expense) / total_debt
             # Sanity check — Rd should be 2-15% for investment grade companies
             if 0.02 <= rd <= 0.15:
