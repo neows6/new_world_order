@@ -187,9 +187,8 @@ def _claude_validate(ticker: str, fundamentals_summary: dict,
 
     try:
         import anthropic
-        import httpx
-        import certifi
-        http_client = httpx.Client(verify=certifi.where(), timeout=15.0)
+        from utils.ssl_context import make_httpx_client
+        http_client = make_httpx_client(timeout=15.0)
         client = anthropic.Anthropic(api_key=api_key, http_client=http_client)
 
         prompt = (

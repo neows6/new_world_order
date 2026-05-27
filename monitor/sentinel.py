@@ -169,11 +169,9 @@ def _claude_judge(events: list[dict], live_prices: dict,
 
     try:
         import anthropic
-        import httpx
-        import certifi
-        # Custom httpx client with explicit cert bundle — Windows CA store
-        # often lacks the intermediate cert needed for api.anthropic.com
-        http_client = httpx.Client(verify=certifi.where(), timeout=30.0)
+        from utils.ssl_context import make_httpx_client
+        # Custom httpx client handles Norton-AV SSL inspection on this machine
+        http_client = make_httpx_client(timeout=30.0)
         client = anthropic.Anthropic(api_key=api_key, http_client=http_client)
 
         prompt = (

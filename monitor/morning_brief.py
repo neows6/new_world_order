@@ -220,6 +220,35 @@ def _fetch_congress_trades(limit: int = 10) -> list[dict]:
         return []
 
 
+# ── HTML helpers ─────────────────────────────────────────────
+
+def _strip_code_fences(html: str) -> str:
+    """Remove markdown code fences (```html ... ```) that AI models sometimes add."""
+    lines = html.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _strip_html_wrapper(html: str) -> str:
+    """Strip full HTML document boilerplate so only body content remains.
+    Gemini/Claude sometimes wraps output in <!DOCTYPE><html><head><style><body>
+    which injects light-themed CSS that overrides the dark dashboard theme."""
+    import re
+    if "<html" not in html.lower():
+        return html
+    body_match = re.search(r"<body[^>]*>(.*?)</body>", html, re.DOTALL | re.IGNORECASE)
+    if body_match:
+        return body_match.group(1).strip()
+    # Fallback: surgically remove the wrapper tags and <head> block
+    html = re.sub(r"<!DOCTYPE[^>]*>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<head[^>]*>.*?</head>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"</?html[^>]*>|</?body[^>]*>", "", html, flags=re.IGNORECASE)
+    return html.strip()
+
+
 # ── Main generator ────────────────────────────────────────────
 
 class MorningBriefGenerator:
@@ -245,13 +274,16 @@ class MorningBriefGenerator:
     def load_cached(self) -> Optional[dict]:
         try:
             if self.cache_path.exists():
-                return json.loads(self.cache_path.read_text())
+                return json.loads(self.cache_path.read_text(encoding="utf-8"))
         except Exception:
             pass
         return None
 
     def _save(self, brief: dict):
-        self.cache_path.write_text(json.dumps(brief, indent=2, default=str))
+        self.cache_path.write_text(
+            json.dumps(brief, indent=2, default=str, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def _build_context(self, raw: dict) -> str:
         """Build a text context block from raw market data for AI prompts."""
@@ -331,7 +363,11 @@ Recent congressional trades — note any interesting patterns or sector concentr
 <h3>Key Risks Today</h3>
 Bullet list of 3 things that could move markets today (earnings, data, geopolitical).
 
-Be direct. No filler. Institutional tone. Use <span class="up"> for positive numbers and <span class="down"> for negative numbers."""
+Be direct. No filler. Institutional tone. Use <span class="up"> for positive numbers and <span class="down"> for negative numbers.
+
+IMPORTANT: Output ONLY the inner HTML body content (h3, p, table, ul, span elements).
+Do NOT include <!DOCTYPE>, <html>, <head>, <style>, or <body> tags.
+Do NOT add any CSS or inline background-color styles. The page already has a dark theme."""
 
     def _synthesize(self, raw: dict) -> str:
         """
@@ -357,11 +393,8 @@ Be direct. No filler. Institutional tone. Use <span class="up"> for positive num
                     contents=prompt,
                 )
                 html = response.text
-                # Strip markdown code fences if Gemini wraps in ```html
-                if html.startswith("```"):
-                    html = "\n".join(html.split("\n")[1:])
-                if html.endswith("```"):
-                    html = html.rsplit("```", 1)[0]
+                html = _strip_code_fences(html)
+                html = _strip_html_wrapper(html)
                 logger.info("[BRIEF] Narrative generated via Google Gemini Flash")
                 return html.strip()
             except Exception as e:
@@ -371,14 +404,18 @@ Be direct. No filler. Institutional tone. Use <span class="up"> for positive num
         if anthropic_key:
             try:
                 import anthropic
-                client  = anthropic.Anthropic(api_key=anthropic_key)
+                from utils.ssl_context import make_httpx_client
+                client  = anthropic.Anthropic(
+                    api_key=anthropic_key,
+                    http_client=make_httpx_client(timeout=60.0),
+                )
                 message = client.messages.create(
                     model="claude-haiku-4-5-20251001",
                     max_tokens=2000,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 logger.info("[BRIEF] Narrative generated via Anthropic Claude Haiku")
-                return message.content[0].text
+                return _strip_html_wrapper(_strip_code_fences(message.content[0].text))
             except Exception as e:
                 logger.warning(f"[BRIEF] Anthropic synthesis failed: {e}")
 
