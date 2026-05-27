@@ -475,6 +475,30 @@ h1{font-size:17px;font-weight:700;color:#e6edf3;margin-bottom:4px;display:flex;a
 .alert-conf-bar{flex:0 0 100px;height:4px;background:#21262d;border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle;margin:0 6px}
 .alert-conf-fill{height:100%;background:#3fb950}
 .empty{padding:36px;text-align:center;color:#8b949e}
+
+/* Info icon + modal */
+.info-btn{background:none;border:1px solid #30363d;border-radius:4px;color:#8b949e;cursor:pointer;font-size:14px;padding:2px 8px;line-height:1;transition:all .15s}
+.info-btn:hover{border-color:#58a6ff;color:#58a6ff}
+.info-overlay{display:none;position:fixed;inset:0;background:#000000cc;z-index:1000;align-items:center;justify-content:center;padding:20px}
+.info-overlay.open{display:flex}
+.info-modal{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;width:min(720px,95vw);max-height:88vh;overflow-y:auto}
+.info-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #30363d}
+.info-title{font-size:16px;font-weight:700;color:#e6edf3;display:flex;align-items:center;gap:8px}
+.info-close{background:none;border:none;color:#8b949e;cursor:pointer;font-size:20px;line-height:1;padding:0 4px}
+.info-close:hover{color:#e6edf3}
+.info-modal h3{font-size:13px;color:#58a6ff;margin:18px 0 8px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.info-modal h3:first-of-type{margin-top:0}
+.info-modal p{color:#c9d1d9;font-size:13px;line-height:1.7;margin-bottom:10px}
+.info-modal code{background:#0d1117;border:1px solid #30363d;border-radius:3px;padding:1px 6px;font-size:12px;color:#79c0ff}
+.info-modal .info-table{width:100%;font-size:12px;margin:8px 0 14px;border-collapse:collapse}
+.info-modal .info-table td{padding:6px 10px;border-bottom:1px solid #21262d;vertical-align:top;color:#c9d1d9}
+.info-modal .info-table td:first-child{font-weight:600;color:#e6edf3;width:130px;white-space:nowrap}
+.info-modal .info-pill{display:inline-block;padding:1px 8px;border-radius:8px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;margin-right:4px}
+.info-modal .info-pill.info{background:#58a6ff22;color:#58a6ff}
+.info-modal .info-pill.warn{background:#d2992222;color:#d29922}
+.info-modal .info-pill.high{background:#f8514922;color:#f85149}
+.info-callout{background:#0d1117;border-left:3px solid #58a6ff;padding:10px 14px;margin:10px 0;font-size:12px;color:#c9d1d9;border-radius:0 4px 4px 0}
+.info-callout.warn{border-left-color:#d29922}
 </style>
 </head>
 <body>
@@ -494,7 +518,10 @@ h1{font-size:17px;font-weight:700;color:#e6edf3;margin-bottom:4px;display:flex;a
 </header>
 
 <div class="container">
-  <h1>&#128737; Live Sentinel</h1>
+  <h1>
+    &#128737; Live Sentinel
+    <button class="info-btn" onclick="document.getElementById('infoOverlay').classList.add('open')" title="How the Sentinel works">&#9432;</button>
+  </h1>
   <p class="subtitle">Claude-judged real-time alerts on cross-ticker correlation breaks (entanglement decoherence) &mdash; predictive lead-lag signals from the watchlist universe.</p>
 
   <div class="status-strip" id="statusStrip">
@@ -514,6 +541,63 @@ h1{font-size:17px;font-weight:700;color:#e6edf3;margin-bottom:4px;display:flex;a
 
   <div class="alerts" id="alerts">
     <div class="empty">Loading alerts&hellip;</div>
+  </div>
+</div>
+
+<!-- Info modal -->
+<div class="info-overlay" id="infoOverlay" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="info-modal">
+    <div class="info-hdr">
+      <div class="info-title">&#128737; About the Live Sentinel</div>
+      <button class="info-close" onclick="document.getElementById('infoOverlay').classList.remove('open')">&times;</button>
+    </div>
+
+    <h3>What is the Sentinel?</h3>
+    <p>The Sentinel is a real-time monitoring system that watches the market for unusual patterns and asks Claude (Anthropic&rsquo;s AI) to interpret them. Unlike the rest of the NWO pipeline &mdash; which analyzes each ticker independently &mdash; the Sentinel looks at how watchlist tickers move <em>together</em>, and flags moments when their normal relationships break down.</p>
+
+    <h3>The Physics Analog: Entanglement &amp; Decoherence</h3>
+    <p>In quantum mechanics, &ldquo;entangled&rdquo; particles maintain correlations &mdash; observing one tells you about the other. In markets, certain ticker pairs are similarly entangled via shared exposures: <code>NVDA</code> and <code>AMD</code> both ride AI/GPU demand, <code>AAPL</code> and <code>MSFT</code> share mega-cap tech beta, <code>JPM</code> and <code>BAC</code> move together on large-bank sentiment.</p>
+    <p>When a pair&rsquo;s correlation suddenly breaks (&ldquo;decoherence&rdquo;), one ticker has received new information the other hasn&rsquo;t propagated yet. The lagging ticker is statistically likely to <strong>catch up</strong> &mdash; this is a predictive lead-lag signal.</p>
+
+    <h3>How Detection Works</h3>
+    <table class="info-table">
+      <tr><td>Sampling</td><td>30-day rolling Pearson correlation across all watchlist pairs</td></tr>
+      <tr><td>Cadence</td><td>Every 60 seconds during market hours (9:30&ndash;16:00 ET)</td></tr>
+      <tr><td>Threshold</td><td><code>|&Delta;&rho;|</code> &gt; 2.5&sigma; across all pairs AND historical <code>|&rho;|</code> &gt; 0.50</td></tr>
+      <tr><td>Lead/Lag</td><td>The ticker with the larger recent move is the lead; the other is the catch-up candidate</td></tr>
+      <tr><td>Confidence</td><td>Scaled by historical correlation strength &times; z-score magnitude</td></tr>
+    </table>
+
+    <h3>Reading an Alert</h3>
+    <p>When events accumulate, Claude is sent the structured event + live prices + current pipeline signals and returns a single actionable alert:</p>
+    <table class="info-table">
+      <tr><td>Level</td><td>
+        <span class="info-pill info">INFO</span>noteworthy but routine &middot;
+        <span class="info-pill warn">WARN</span>setup forming, monitor &middot;
+        <span class="info-pill high">HIGH</span>high-conviction divergence
+      </td></tr>
+      <tr><td>Action</td><td><code>watch_for_entry</code>, <code>watch_for_exit</code>, <code>wait</code>, <code>investigate</code></td></tr>
+      <tr><td>Reasoning</td><td>One sentence explaining the setup in plain English</td></tr>
+      <tr><td>Horizon</td><td>How long the signal is expected to remain valid (minutes)</td></tr>
+      <tr><td>Confidence</td><td>0&ndash;100% &mdash; Claude&rsquo;s own assessment of how strong the setup is</td></tr>
+    </table>
+
+    <div class="info-callout">
+      <strong>This is an attention-getter, not a trade trigger.</strong> Alerts highlight unusual patterns worth a human review. They are not auto-executed; the regular L1&ndash;L5 pipeline still has to approve any actual trade.
+    </div>
+
+    <h3>Why the Engine Stays Quiet Most Days</h3>
+    <p>The Sentinel is intentionally <em>selective</em>. Normal market behavior produces zero events. The engine only fires when something genuinely abnormal happens &mdash; sudden divergences, sector-specific news propagating unevenly, single-stock catalysts. If you see no alerts for a few hours, that&rsquo;s the system working correctly, not silence from a failure.</p>
+
+    <h3>Daily API Budget</h3>
+    <p>Each Claude judgment costs about <code>$0.001&ndash;0.005</code> (Haiku model). Typical days produce 10&ndash;30 events &rarr; <code>~$0.05&ndash;$0.30/day</code>. Today&rsquo;s usage is shown in the status strip above. The <strong>Pause</strong> button halts new Claude calls without affecting the underlying entanglement detection.</p>
+
+    <h3>Manual Trigger</h3>
+    <p>The <strong>Trigger Judgment Now</strong> button forces a fresh scan + Claude judgment immediately, even if no new events have accumulated. Useful for verifying the system is reachable and for testing during quiet markets.</p>
+
+    <div class="info-callout warn">
+      <strong>Privacy &amp; security note:</strong> Claude sees only ticker symbols, current prices, and signal scores &mdash; never account balances, positions, or P&amp;L. The API call is HTTPS-encrypted; we route through a Norton-aware SSL context because this machine has SSL inspection enabled.
+    </div>
   </div>
 </div>
 
