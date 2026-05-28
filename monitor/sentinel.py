@@ -52,14 +52,6 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
 
-# Fix Windows SSL cert chain — Anthropic SDK uses httpx which can't find local CA
-try:
-    import certifi
-    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
-except Exception:
-    pass
-
 ROOT = Path(__file__).resolve().parent.parent
 _ALERTS_FILE = ROOT / "data" / "sentinel_alerts.json"
 _PAUSE_FILE  = ROOT / "data" / "sentinel_paused.flag"
