@@ -1112,6 +1112,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .signal-buy  { color: #3fb950; font-weight: 700; }
   .signal-sell { color: #f85149; font-weight: 700; }
   .signal-hold { color: #d29922; font-weight: 700; }
+  .signal-watch{ color: #f0b429; font-weight: 700; }   /* amber — fundamentals strong, awaiting confirmation */
   .conf-bar  { height: 8px; border-radius: 4px; background: #21262d; width: 80px;
                display: block; margin-bottom: 2px; }
   .conf-fill { height: 8px; border-radius: 4px; background: #3fb950;
@@ -1579,7 +1580,10 @@ function renderSignals(signals) {
   for (const _tk of _tkOrd) { for (const [_si, s] of _grp[_tk].entries()) {
   const _isPrimary = _si === 0; const _hasHistory = _grp[_tk].length > 1;
 
-    const origCls = s.signal === 'BUY' ? 'signal-buy' : s.signal === 'SELL' ? 'signal-sell' : 'signal-hold';
+    const origCls = s.signal === 'BUY' ? 'signal-buy'
+                    : s.signal === 'SELL' ? 'signal-sell'
+                    : s.signal === 'WATCH' ? 'signal-watch'
+                    : 'signal-hold';
     const conf   = s.confidence || 0;
     const mosVal = s.margin_of_safety;
     const fudVal = s.fud_score || 0;
@@ -6003,11 +6007,22 @@ def _apply_thresh_override():
         lv = _j.loads(f.read_text()).get("level", "high") if f.exists() else "high"
         m = MULT.get(lv, 1.0)
         from decision.engine import DecisionEngine as _DE
-        _DE.MIN_ENSEMBLE_PROB   = round(0.55 * m, 4)
-        _DE.MIN_QUANTUM_CERTAIN = round(0.45 * m, 4)
-        _DE.MAX_REYNOLDS        = round(5.0  / m, 4) if m > 0 else 5.0
-        _DE.MIN_RR_RATIO        = round(1.5  * m, 4)
-        _DE.MAX_KALMAN_SURPRISE = round(2.5  / m, 4) if m > 0 else 2.5
+        # Snapshot the production defaults on first call so subsequent calls
+        # always scale from the current code baseline, not the last override.
+        if not hasattr(_DE, "_BASE_THRESHOLDS"):
+            _DE._BASE_THRESHOLDS = {
+                "MIN_ENSEMBLE_PROB":   _DE.MIN_ENSEMBLE_PROB,
+                "MIN_QUANTUM_CERTAIN": _DE.MIN_QUANTUM_CERTAIN,
+                "MAX_REYNOLDS":        _DE.MAX_REYNOLDS,
+                "MIN_RR_RATIO":        _DE.MIN_RR_RATIO,
+                "MAX_KALMAN_SURPRISE": _DE.MAX_KALMAN_SURPRISE,
+            }
+        b = _DE._BASE_THRESHOLDS
+        _DE.MIN_ENSEMBLE_PROB   = round(b["MIN_ENSEMBLE_PROB"]   * m, 4)
+        _DE.MIN_QUANTUM_CERTAIN = round(b["MIN_QUANTUM_CERTAIN"] * m, 4)
+        _DE.MAX_REYNOLDS        = round(b["MAX_REYNOLDS"]        / m, 4) if m > 0 else b["MAX_REYNOLDS"]
+        _DE.MIN_RR_RATIO        = round(b["MIN_RR_RATIO"]        * m, 4)
+        _DE.MAX_KALMAN_SURPRISE = round(b["MAX_KALMAN_SURPRISE"] / m, 4) if m > 0 else b["MAX_KALMAN_SURPRISE"]
     except Exception:
         pass
 

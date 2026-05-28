@@ -20,6 +20,11 @@ from typing import Optional
 
 PAUSE_FLAG = Path("data/paused.flag")
 
+# Install Norton-aware CA bundle into env BEFORE any HTTP clients are imported.
+# Modules that use schwab-py / curl_cffi / requests pick this up automatically.
+from utils.ssl_context import install_env_ca_bundle as _install_ca
+_install_ca()
+
 from loguru import logger
 
 from config import config
@@ -202,7 +207,7 @@ def run_trading_cycle(
             floor_fundamentals = (
                 is_ai_watch
                 and momentum is not None
-                and momentum.signal in ("strong_momentum", "momentum")
+                and momentum.signal in ("strong_buy", "buy")
                 and momentum.rvol >= 1.5
             )
 

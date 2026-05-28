@@ -16,6 +16,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Install Norton-aware CA bundle into env BEFORE any HTTP clients are imported.
+from utils.ssl_context import install_env_ca_bundle as _install_ca
+_install_ca()
+
 import uvicorn
 
 

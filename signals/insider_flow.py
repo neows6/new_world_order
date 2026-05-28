@@ -28,10 +28,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-import requests
 from loguru import logger
 
 from config import config
+from utils.ssl_context import make_requests_session
 
 
 # Insider role weights — CEO/CFO/Director carry more conviction
@@ -132,7 +132,7 @@ class InsiderFlowAnalyzer:
     CLUSTER_MIN_BUYERS  = 2     # 2+ insiders = cluster
 
     def __init__(self):
-        self.session = requests.Session()
+        self.session = make_requests_session()
         self.session.headers.update({
             "User-Agent": config.edgar.user_agent,
             "Accept-Encoding": "gzip, deflate",

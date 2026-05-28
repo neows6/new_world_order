@@ -493,6 +493,13 @@ class FUDFilterEngine:
             elif adj_composite >= -0.40:   adj_signal = "sell"
             else:                          adj_signal = "strong_sell"
 
+            # Respect the aggregator's WATCH downgrade — the conviction floor or
+            # orphaned-signal guard already decided this setup is missing
+            # confirmation. L3 must not silently undo that with a pure-composite
+            # reclassification.
+            if incoming_signal.signal == "watch":
+                adj_signal = "watch"
+
             # If filter blocked, force to hold
             if not passes_filter:
                 adj_signal   = "hold"

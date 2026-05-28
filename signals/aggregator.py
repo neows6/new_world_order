@@ -19,7 +19,7 @@ Signal weighting (research-backed priorities):
 VIX regime is a GATE not a weight — it scales the final position size.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Optional
 import json
@@ -112,6 +112,14 @@ class AggregatedSignal:
     tga_stoch_arrow: bool = False
     tga_volume_spike: bool = False
     tga_reason: str = ""
+
+    # ── WATCH state ────────────────────────────────────────────────
+    # When the conviction floor or orphaned-signal guard would normally
+    # downgrade a BUY composite to HOLD, we emit "watch" instead so the
+    # operator can see *why* the trade is parked and what would unblock it.
+    # watch_reasons lists the specific missing confirmations; e.g.
+    #   ["MACD momentum (currently falling)", "Insider cluster buy (0 in 90d)"]
+    watch_reasons: list = field(default_factory=list)
 
 
 # Signal weights (must sum to 1.0)
@@ -518,38 +526,57 @@ class SignalAggregator:
         # ── Narrative ────────────────────────────────────────────
         why_buy, why_wait, risks = self._build_narrative(analysis, fib, vwap, insider, fft, vol_profile)
 
-        # ── Conviction floor ──────────────────────────────────────
+        # ── Conviction floor → WATCH ──────────────────────────────
         # A BUY signal below composite 0.50 must be confirmed by at least one of:
         # positive momentum (price action / institutional follow-through) or positive
         # insider activity (management skin-in-the-game). Without either, the signal
         # is a lone fundamental thesis that the market has not yet validated — the
         # exact pattern behind value traps and DCF model errors.
+        #
+        # Rather than downgrading silently to HOLD, we surface the setup as WATCH
+        # with the specific blockers attached so operators can see what's missing.
+        watch_reasons: list = []
         if signal in ("buy", "strong_buy") and composite < 0.50 and m_score <= 0.0 and i_score <= 0.0:
-            signal = "hold"
+            if momentum is None:
+                watch_reasons.append("Momentum confirmation (no momentum data)")
+            else:
+                _mdir = getattr(momentum, "macd_direction", "flat")
+                watch_reasons.append(
+                    f"Momentum confirmation (m={m_score:.2f}, MACD {_mdir}, "
+                    f"signal={momentum.signal})"
+                )
+            _ins_buys = getattr(insider, "total_buys_90d", 0) if insider else 0
+            watch_reasons.append(
+                f"Insider accumulation (i={i_score:.2f}, "
+                f"{_ins_buys} open-market buys in 90d)"
+            )
+            signal = "watch"
             why_wait.append(
                 f"Conviction void: composite={composite:.2f} below 0.50 with no momentum "
                 f"(m={m_score:.2f}) or insider (i={i_score:.2f}) confirmation — "
-                f"unvalidated thesis, possible value trap or model miscalibration"
+                f"WATCH until at least one confirmation arrives"
             )
             logger.info(
-                f"[AGG] {analysis.ticker}: conviction floor triggered — "
-                f"composite={composite:.2f} m={m_score:.2f} i={i_score:.2f} → HOLD"
+                f"[AGG] {analysis.ticker}: conviction floor → WATCH "
+                f"composite={composite:.2f} m={m_score:.2f} i={i_score:.2f} "
+                f"reasons={watch_reasons}"
             )
 
         # Orphaned signal guard: weak composite AND low signal agreement.
         # Composite < 0.40 with confidence < 0.20 means fewer than ~2 of 9 sub-signals
         # align — not enough directional consensus to trust the buy classification.
-        # Raised from 0.20 to 0.40 to catch mid-band false positives (e.g. composite=0.29,
-        # conf=32%) that previously slipped through.
         if signal in ("buy", "strong_buy") and confidence < 0.20 and composite < 0.40:
-            signal = "hold"
+            watch_reasons.append(
+                f"Sub-signal agreement (only {confidence:.0%} of components align)"
+            )
+            signal = "watch"
             why_wait.append(
                 f"Orphaned signal: low sub-signal agreement (conf={confidence:.0%}, "
-                f"composite={composite:.2f}) — insufficient conviction to act"
+                f"composite={composite:.2f}) — WATCH for additional confirmations"
             )
             logger.warning(
-                f"[AGG] {analysis.ticker}: confidence-floor block — "
-                f"conf={confidence:.0%} composite={composite:.2f} → HOLD"
+                f"[AGG] {analysis.ticker}: confidence-floor → WATCH "
+                f"conf={confidence:.0%} composite={composite:.2f}"
             )
 
         logger.info(
@@ -618,6 +645,7 @@ class SignalAggregator:
             tga_stoch_arrow=tga.stoch_arrow if tga else False,
             tga_volume_spike=tga.volume_spike if tga else False,
             tga_reason=tga.reason if tga else "",
+            watch_reasons=watch_reasons,
         )
 
 class ClaudeMomentumAggregator(SignalAggregator):

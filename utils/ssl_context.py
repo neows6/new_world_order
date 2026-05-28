@@ -85,3 +85,47 @@ def make_httpx_client(timeout: float = 30.0):
     """Convenience: returns an httpx.Client with the right SSL context."""
     import httpx
     return httpx.Client(verify=get_ssl_context(), timeout=timeout)
+
+
+def install_env_ca_bundle() -> None:
+    """
+    Set the well-known SSL env vars (REQUESTS_CA_BUNDLE, SSL_CERT_FILE,
+    CURL_CA_BUNDLE) to our combined Norton+certifi bundle.
+
+    Use this for HTTP clients we can't easily configure programmatically:
+    schwab-py (authlib+requests), curl_cffi (TipRanks), feedparser, etc.
+    Already-set env vars are preserved (setdefault).
+    """
+    import os
+    if not _CUSTOM_BUNDLE.exists():
+        return
+    bundle = str(_CUSTOM_BUNDLE)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", bundle)
+    os.environ.setdefault("SSL_CERT_FILE",      bundle)
+    os.environ.setdefault("CURL_CA_BUNDLE",     bundle)
+
+
+def make_requests_session():
+    """
+    Returns a requests.Session configured for Norton/AV SSL inspection.
+    Uses a custom HTTPAdapter that injects our ssl.SSLContext so that
+    urllib3 (which requests uses internally) respects our CA bundle and
+    tolerates the non-spec-compliant BasicConstraints on Norton's root cert.
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    ctx = get_ssl_context()
+
+    class _NortonAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            kwargs["ssl_context"] = ctx
+            super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, proxy, **proxy_kwargs):
+            proxy_kwargs["ssl_context"] = ctx
+            return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    session = requests.Session()
+    session.mount("https://", _NortonAdapter())
+    return session

@@ -10,6 +10,7 @@ Assumes you already have OAuth tokens set up from your previous work.
 Token path configured in config.py via SCHWAB_TOKEN_PATH env var.
 """
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,17 @@ from typing import Optional
 from loguru import logger
 
 from config import config
+
+# Norton AV SSL inspection: schwab-py uses authlib + requests internally, so we
+# can't inject our custom SSLContext directly. Pointing REQUESTS_CA_BUNDLE at
+# our combined bundle (certifi + Norton root) is the standard way to extend
+# requests' trust store without modifying the schwab-py library.
+# CURL_CA_BUNDLE covers libcurl-based clients (curl_cffi used by TipRanks).
+_BUNDLE = Path(__file__).resolve().parent.parent / "data" / "ca_bundle_with_norton.pem"
+if _BUNDLE.exists():
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", str(_BUNDLE))
+    os.environ.setdefault("SSL_CERT_FILE",      str(_BUNDLE))
+    os.environ.setdefault("CURL_CA_BUNDLE",     str(_BUNDLE))
 
 
 class SchwabMarketData:

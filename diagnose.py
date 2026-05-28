@@ -114,7 +114,10 @@ def run_gate_breakdown(ticker: str, Session) -> None:
     from signals.insider_flow import InsiderFlowAnalyzer
     from signals.market_microstructure import VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
     from signals.momentum import MomentumAnalyzer
-    from signals.aggregator import SignalAggregator, SIGNAL_WEIGHTS
+    from signals.supertrend import SuperTrendAnalyzer
+    from signals.three_green_arrows import ThreeGreenArrowsAnalyzer
+    from signals.tipranks_signal import TipRanksAnalyzer
+    from signals.aggregator import SignalAggregator, SIGNAL_WEIGHTS, BUY_THRESHOLD
     from fud.filter_engine import FUDFilterEngine
     from decision.engine import DecisionEngine
     from decision.reynolds_turbulence import ReynoldsMarketAnalyzer
@@ -208,9 +211,27 @@ def run_gate_breakdown(ticker: str, Session) -> None:
         insider = InsiderFlowAnalyzer().score(ticker, cik, price)
     except Exception: pass
 
+    supertrend = None
+    try:
+        supertrend = SuperTrendAnalyzer().analyze(ticker, highs, lows, closes, volumes)
+    except Exception: pass
+
+    tga = None
+    try:
+        tga = ThreeGreenArrowsAnalyzer().analyze(ticker, closes, highs, lows, volumes)
+    except Exception: pass
+
+    tipranks = None
+    try:
+        from data_sources.tipranks_client import get_client as _tr_client
+        raw_tr = _tr_client().get_stock_data(ticker)
+        if raw_tr:
+            tipranks = TipRanksAnalyzer().analyze(ticker, raw_tr, current_price=price)
+    except Exception: pass
+
     vix_level = 20.0
     try:
-        from schwab_api.market_data import SchwabMarketData
+        from broker.market_data import SchwabMarketData
         q = SchwabMarketData().get_quote("$VIX.X")
         if q and q.get("last"):
             vix_level = float(q["last"])
@@ -220,7 +241,7 @@ def run_gate_breakdown(ticker: str, Session) -> None:
     # ── Aggregate ─────────────────────────────────────────────────
     agg = SignalAggregator()
     is_ai_watch  = ticker in config.ai_watch_tickers
-    is_breakout  = (momentum and momentum.signal in ("strong_momentum", "momentum")
+    is_breakout  = (momentum and momentum.signal in ("strong_buy", "buy")
                     and momentum.rvol >= 1.5)
     floor_funds  = is_ai_watch and is_breakout
 
@@ -228,6 +249,7 @@ def run_gate_breakdown(ticker: str, Session) -> None:
         analysis=analysis, fft=fft, fib=fib, insider=insider,
         vwap=vwap, vol_profile=vol_prof, vix_regime=vix_regime,
         current_price=price, momentum=momentum,
+        supertrend=supertrend, tipranks=tipranks, tga=tga,
         floor_fundamentals=floor_funds,
     )
 
@@ -236,42 +258,45 @@ def run_gate_breakdown(ticker: str, Session) -> None:
     brk_note = " [BREAKOUT OVERRIDE active]" if floor_funds else ""
     print(f"\n  Composite: {agg_signal.composite_score:+.3f} → {agg_signal.signal.upper()}{ai_note}{brk_note}")
     print(f"  Confidence: {agg_signal.confidence:.0%} | VIX: {vix_level:.1f} ({agg_signal.vix_regime})")
+    if agg_signal.signal == "watch" and agg_signal.watch_reasons:
+        print(f"\n  {'WATCH — missing confirmations:':<45}")
+        for r in agg_signal.watch_reasons:
+            print(f"    [ ] {r}")
     print()
     print(f"  {'SIGNAL BREAKDOWN':─<45}")
 
-    # Replicate active_weights logic (same as aggregator)
-    from signals.aggregator import SIGNAL_WEIGHTS as SW
-    aw = dict(SW)
-    if not hasattr(agg_signal, 'tv_score') or agg_signal.tv_score == 0.0:
-        tv_w = aw.pop("tv_consensus", 0.0)
-        total_r = sum(aw.values())
-        for k in aw:
-            aw[k] += tv_w * (aw[k] / total_r)
-        aw["tv_consensus"] = 0.0
+    # Compute per-signal scores using the same normalizers as the aggregator,
+    # so the breakdown reflects what actually feeds the composite.
+    _st_score  = agg._normalize_supertrend_score(supertrend)
+    _tr_score  = agg._normalize_tipranks_score(tipranks)
+    _tga_score = agg._normalize_tga_score(tga)
 
     components = [
-        ("Fundamentals",  agg_signal.fundamentals_score, aw.get("fundamentals", 0),
+        ("Fundamentals",  agg_signal.fundamentals_score, SIGNAL_WEIGHTS.get("fundamentals", 0),
          f"moat={analysis.moat_strength} MoS={analysis.margin_of_safety:.0%}" if analysis.margin_of_safety is not None else "no data"),
-        ("Momentum",      agg_signal.momentum_score,     aw.get("momentum", 0),
+        ("Momentum",      agg_signal.momentum_score,     SIGNAL_WEIGHTS.get("momentum", 0),
          f"RVOL={momentum.rvol:.1f}x {momentum.macd_direction} {momentum.ma_stack} [{momentum.signal}]" if momentum else "no data"),
-        ("Insider",       agg_signal.insider_score,       aw.get("insider", 0),
+        ("Insider",       agg_signal.insider_score,       SIGNAL_WEIGHTS.get("insider", 0),
          f"cluster_buy={agg_signal.insider_cluster_buy}" if insider else "no Form4 data"),
-        ("Technical",     agg_signal.technical_score,     aw.get("technical", 0),
+        ("Technical",     agg_signal.technical_score,     SIGNAL_WEIGHTS.get("technical", 0),
          f"fib={agg_signal.fib_confluence_score:.2f} vwap={agg_signal.vwap_position}" if fib or vwap else "no data"),
-        ("FFT Cycle",     agg_signal.cycle_score,         aw.get("cycle", 0),
+        ("SuperTrend",    _st_score,                      SIGNAL_WEIGHTS.get("supertrend", 0),
+         f"dir={agg_signal.supertrend_direction} fav={agg_signal.supertrend_favourability:.2f}" if supertrend else "no data"),
+        ("TipRanks",      _tr_score,                      SIGNAL_WEIGHTS.get("tipranks", 0),
+         f"smart={agg_signal.tipranks_smart_score} buy_pct={agg_signal.tipranks_buy_pct}" if tipranks else "no data (cookies?)"),
+        ("3 Green Arrows",_tga_score,                     SIGNAL_WEIGHTS.get("tga", 0),
+         f"arrows={agg_signal.tga_arrows_count}/3 [{agg_signal.tga_signal}]" if tga else "no data"),
+        ("FFT Cycle",     agg_signal.cycle_score,         SIGNAL_WEIGHTS.get("cycle", 0),
          f"phase={agg_signal.fft_phase} strength={agg_signal.fft_signal_strength:.2f}" if fft else "insufficient data"),
-        ("Volume",        agg_signal.volume_score,        aw.get("volume", 0),
+        ("Volume",        agg_signal.volume_score,        SIGNAL_WEIGHTS.get("volume", 0),
          f"poc={agg_signal.poc_level:.2f}" if agg_signal.poc_level else "no profile"),
-        ("TV Consensus",  getattr(agg_signal, "tv_score", 0.0), aw.get("tv_consensus", 0),
-         getattr(agg_signal, "tv_recommendation", "") or "unavailable"),
     ]
 
-    buy_threshold = 0.15
     for name, score, weight, detail in components:
         contrib = score * weight
         print(f"  {name:14s} {score:+.3f}  ×{weight:.0%}  = {contrib:+.3f}   {detail}")
     print(f"  {'─'*45}")
-    print(f"  {'Composite':14s} {agg_signal.composite_score:+.3f}              (buy threshold: {buy_threshold:+.2f})")
+    print(f"  {'Composite':14s} {agg_signal.composite_score:+.3f}              (buy threshold: {BUY_THRESHOLD:+.2f})")
 
     # ── L3 FUD gate ───────────────────────────────────────────────
     print(f"\n  {'FUD FILTER (L3)':─<45}")
@@ -335,9 +360,9 @@ def run_gate_breakdown(ticker: str, Session) -> None:
             news_quality_score=layer3.fud_analysis.avg_fud_score,
             cycle_score=agg_signal.cycle_score,
         )
-        q_ok = quantum.state_certainty >= 0.45
+        q_ok = quantum.state_certainty >= DecisionEngine.MIN_QUANTUM_CERTAIN
         print(f"  {'✓' if q_ok else '✗'} Quantum: certainty={quantum.state_certainty:.0%} "
-              f"(need ≥45%) | {quantum.dominant_state.upper()}")
+              f"(need ≥{DecisionEngine.MIN_QUANTUM_CERTAIN:.0%}) | {quantum.dominant_state.upper()}")
     except Exception as e:
         print(f"  ? Quantum: ERROR {e}")
         quantum = None
@@ -367,26 +392,26 @@ def run_gate_breakdown(ticker: str, Session) -> None:
             current_price=price,
             portfolio_value=None,
         )
-        e_ok = ensemble.ensemble_probability_bull >= 0.50
+        e_ok = ensemble.ensemble_probability_bull >= DecisionEngine.MIN_ENSEMBLE_PROB
         print(f"  {'✓' if e_ok else '✗'} Ensemble: P(bull)={ensemble.ensemble_probability_bull:.0%} "
-              f"(need ≥50%) | spread={ensemble.spread_category}")
+              f"(need ≥{DecisionEngine.MIN_ENSEMBLE_PROB:.0%}) | spread={ensemble.spread_category}")
     except Exception as e:
         print(f"  ? Ensemble: ERROR {e}")
         ensemble = None
 
-    rr_ok = (agg_signal.risk_reward_ratio or 0) >= 1.5
-    print(f"  {'✓' if rr_ok else '✗'} R/R: {agg_signal.risk_reward_ratio or 0:.1f}:1 (need ≥1.5)")
+    rr_ok = (agg_signal.risk_reward_ratio or 0) >= DecisionEngine.MIN_RR_RATIO
+    print(f"  {'✓' if rr_ok else '✗'} R/R: {agg_signal.risk_reward_ratio or 0:.1f}:1 (need ≥{DecisionEngine.MIN_RR_RATIO:.1f})")
 
     # Gate 6: Kalman innovation — AI Watch breakout relaxes limit from 2.5σ to 5.0σ
     kalman_ok = True
     if kalman:
         is_ai_watch_breakout = is_ai_watch and layer3 and layer3.adjusted_signal in ("buy", "strong_buy")
-        kalman_limit = 5.0 if is_ai_watch_breakout else 2.5
+        kalman_limit = 5.0 if is_ai_watch_breakout else DecisionEngine.MAX_KALMAN_SURPRISE
         innovation = abs(kalman.innovation_normalized)
         kalman_ok = innovation <= kalman_limit
         ai_note = f" (AI Watch limit {kalman_limit:.0f}σ)" if is_ai_watch_breakout else ""
         print(f"  {'✓' if kalman_ok else '✗'} Kalman: innovation={innovation:.1f}σ "
-              f"(need ≤{kalman_limit:.0f}σ){ai_note} trend={kalman.trend_direction}")
+              f"(need ≤{kalman_limit:.1f}σ){ai_note} trend={kalman.trend_direction}")
 
     gate7_ok = layer3.adjusted_signal in ("buy", "strong_buy")
     print(f"  {'✓' if gate7_ok else '✗'} Gate 7 (signal): adjusted_signal={layer3.adjusted_signal} "
@@ -394,8 +419,8 @@ def run_gate_breakdown(ticker: str, Session) -> None:
 
     fud_ok = layer3.proceed_to_execution
     re_pass  = reynolds.allow_entry if reynolds else True
-    q_pass   = (quantum.state_certainty >= 0.45) if quantum else False
-    e_pass   = (ensemble.ensemble_probability_bull >= 0.50) if ensemble else False
+    q_pass   = (quantum.state_certainty >= DecisionEngine.MIN_QUANTUM_CERTAIN) if quantum else False
+    e_pass   = (ensemble.ensemble_probability_bull >= DecisionEngine.MIN_ENSEMBLE_PROB) if ensemble else False
 
     all_pass = fud_ok and re_pass and q_pass and e_pass and rr_ok and kalman_ok and gate7_ok
     print(f"\n  L4 final: {'✅ GO' if all_pass else '❌ NO-GO'}")

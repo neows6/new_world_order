@@ -205,11 +205,19 @@ class FirstPrinciplesEngine:
                 import yfinance as yf
                 end = _dt.utcnow().strftime("%Y-%m-%d")
                 start = (_dt.utcnow() - _td(days=1260)).strftime("%Y-%m-%d")  # ~5 years
-                spy = yf.download("SPY", start=start, end=end, interval="1d",
-                                  auto_adjust=True, progress=False)["Close"]
-                if spy.empty or len(spy) < 60:
+                raw = yf.download("SPY", start=start, end=end, interval="1d",
+                                  auto_adjust=True, progress=False)
+                if raw is None or raw.empty:
                     return None
-                spy_vals = spy.values.tolist()
+                # Handle yfinance MultiIndex columns (newer versions)
+                if hasattr(raw.columns, "levels"):
+                    key = ("Close", "SPY")
+                    spy = raw[key] if key in raw.columns else raw["Close"].iloc[:, 0]
+                else:
+                    spy = raw["Close"]
+                if spy is None or spy.empty or len(spy) < 60:
+                    return None
+                spy_vals = [float(v) for v in spy.values]
                 returns = [(spy_vals[i] - spy_vals[i-1]) / spy_vals[i-1]
                            for i in range(1, len(spy_vals))]
                 cache_path.parent.mkdir(parents=True, exist_ok=True)

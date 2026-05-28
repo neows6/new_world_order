@@ -411,12 +411,22 @@ class PaperScheduler:
             o = json.loads(f.read_text())
             lv = o.get("level", "high")
             m = MULT.get(lv, 1.0)
-            # Only update class-level attrs (affects standard model which has no instance overrides)
-            DE.MIN_ENSEMBLE_PROB   = round(0.45 * m, 4)
-            DE.MIN_QUANTUM_CERTAIN = round(0.45 * m, 4)
-            DE.MAX_REYNOLDS        = round(5.0  / m, 4) if m > 0 else 5.0
-            DE.MIN_RR_RATIO        = round(1.5  * m, 4)
-            DE.MAX_KALMAN_SURPRISE = round(2.5  / m, 4) if m > 0 else 2.5
+            # Snapshot the production defaults on first call so subsequent calls
+            # always scale from the current code baseline, not the last override.
+            if not hasattr(DE, "_BASE_THRESHOLDS"):
+                DE._BASE_THRESHOLDS = {
+                    "MIN_ENSEMBLE_PROB":   DE.MIN_ENSEMBLE_PROB,
+                    "MIN_QUANTUM_CERTAIN": DE.MIN_QUANTUM_CERTAIN,
+                    "MAX_REYNOLDS":        DE.MAX_REYNOLDS,
+                    "MIN_RR_RATIO":        DE.MIN_RR_RATIO,
+                    "MAX_KALMAN_SURPRISE": DE.MAX_KALMAN_SURPRISE,
+                }
+            b = DE._BASE_THRESHOLDS
+            DE.MIN_ENSEMBLE_PROB   = round(b["MIN_ENSEMBLE_PROB"]   * m, 4)
+            DE.MIN_QUANTUM_CERTAIN = round(b["MIN_QUANTUM_CERTAIN"] * m, 4)
+            DE.MAX_REYNOLDS        = round(b["MAX_REYNOLDS"]        / m, 4) if m > 0 else b["MAX_REYNOLDS"]
+            DE.MIN_RR_RATIO        = round(b["MIN_RR_RATIO"]        * m, 4)
+            DE.MAX_KALMAN_SURPRISE = round(b["MAX_KALMAN_SURPRISE"] / m, 4) if m > 0 else b["MAX_KALMAN_SURPRISE"]
         except Exception:
             pass
 

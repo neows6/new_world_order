@@ -357,14 +357,13 @@ def print_report(results: list, as_of: date, show_gates: bool):
             print(f"  MOMENTUM DETAIL  (composite: {mom.composite_momentum_score:+.3f}  →  {mom.signal.upper()})")
             rvol_flag = "  ⚡ SURGE" if mom.rvol >= 2.0 else ("  ⬇ low" if mom.rvol < 0.8 else "")
             print(f"    RVOL:        {mom.rvol:.2f}×{rvol_flag}")
-            print(f"    MACD:        {mom.macd_direction}  (histogram: {mom.macd_histogram:+.3f})")
+            print(f"    MACD:        {mom.macd_direction}  (histogram: {mom.macd_hist:+.3f})")
             print(f"    MA Stack:    {mom.ma_stack}")
-            print(f"    ATR ratio:   {mom.atr_ratio:.2f}×{'  📈 EXPANDING' if mom.atr_ratio >= 1.5 else ''}")
-            pct_str = f"{mom.pct_from_52w_high:+.1%} from 52w high"
-            bk_str  = "  🚀 BREAKOUT!" if mom.is_52w_breakout else ""
-            print(f"    52w High:    {pct_str}{bk_str}")
-            for note in mom.notes:
-                print(f"    → {note}")
+            print(f"    ROC:         5d={mom.roc_5d:+.1f}%  20d={mom.roc_20d:+.1f}%")
+            bk_str = "  🚀 BREAKOUT!" if mom.is_52w_high_breakout else ""
+            print(f"    52w High:    breakout={mom.is_52w_high_breakout}{bk_str}")
+            if mom.reason:
+                print(f"    → {mom.reason}")
 
         # Technical detail (if show_gates)
         if show_gates:

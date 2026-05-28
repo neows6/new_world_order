@@ -32,6 +32,23 @@ class MomentumResult:
     reason: str             # human-readable summary
     is_52w_high_breakout: bool = False  # price within 2% of 52-week high
 
+    # Compatibility aliases used by pipeline / diagnose
+    @property
+    def rvol(self) -> float:
+        return self.volume_ratio
+
+    @property
+    def composite_momentum_score(self) -> float:
+        return self.momentum_score
+
+    @property
+    def ma_stack(self) -> str:
+        if self.ema_aligned and self.price_above_ema20:
+            return "bullish"
+        if not self.ema_aligned and not self.price_above_ema20:
+            return "bearish"
+        return "mixed"
+
 
 def _ema(closes: list, period: int) -> float:
     """Exponential moving average of the last `period` values (or all if shorter)."""
@@ -111,11 +128,14 @@ class MomentumAnalyzer:
         self,
         ticker: str,
         closes: list,
+        highs: Optional[list] = None,
+        lows: Optional[list] = None,
         volumes: Optional[list] = None,
     ) -> Optional[MomentumResult]:
         """
         Returns MomentumResult or None if insufficient data.
         closes: list of closing prices, oldest first.
+        highs/lows: daily OHLC high/low arrays (optional, not used currently).
         volumes: list of daily volumes, same length as closes (optional).
         """
         if not closes or len(closes) < self.MIN_BARS:

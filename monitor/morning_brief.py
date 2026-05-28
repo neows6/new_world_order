@@ -26,7 +26,12 @@ import requests
 import yfinance as yf
 from loguru import logger
 
+from utils.ssl_context import make_requests_session as _mrs
+
 ROOT = Path(__file__).resolve().parent.parent
+
+# Module-level session for direct HTTPS calls (Norton AV SSL inspection)
+_HTTP = _mrs()
 
 
 # ── Ticker symbols ────────────────────────────────────────────
@@ -166,7 +171,7 @@ def _fetch_news(max_per_feed: int = 3) -> list[dict]:
 def _fetch_wsb_sentiment(limit: int = 10) -> list[dict]:
     """ApeWisdom WSB trending tickers — free, no auth needed."""
     try:
-        resp = requests.get(
+        resp = _HTTP.get(
             "https://apewisdom.io/api/v1.0/filter/wallstreetbets",
             timeout=10,
             headers={"User-Agent": "NWO-Trading-Bot/1.0"},
@@ -193,7 +198,7 @@ def _fetch_wsb_sentiment(limit: int = 10) -> list[dict]:
 def _fetch_congress_trades(limit: int = 10) -> list[dict]:
     """QuiverQuant congressional trades — free tier, no key needed for basic endpoint."""
     try:
-        resp = requests.get(
+        resp = _HTTP.get(
             "https://api.quiverquant.com/beta/live/congresstrading",
             timeout=10,
             headers={

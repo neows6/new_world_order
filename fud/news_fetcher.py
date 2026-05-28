@@ -50,7 +50,8 @@ class NewsFetcher:
     """
 
     def __init__(self):
-        self.session = requests.Session()
+        from utils.ssl_context import make_requests_session
+        self.session = make_requests_session()
         self.session.headers.update({
             "User-Agent": config.edgar.user_agent,
             "Accept": "application/json, text/html, application/rss+xml",

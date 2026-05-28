@@ -30,6 +30,9 @@ from signals.fibonacci import FibonacciAnalyzer
 from signals.insider_flow import InsiderFlowAnalyzer
 from signals.market_microstructure import VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
 from signals.momentum import MomentumAnalyzer
+from signals.supertrend import SuperTrendAnalyzer
+from signals.three_green_arrows import ThreeGreenArrowsAnalyzer
+from signals.tipranks_signal import TipRanksAnalyzer
 from signals.aggregator import SignalAggregator
 from fud.filter_engine import FUDFilterEngine
 from decision.engine import DecisionEngine
@@ -57,7 +60,19 @@ class AnalysisPipeline:
         self.vol_profile      = VolumeProfileAnalyzer()
         self.vix_detector     = VIXRegimeDetector()
         self.momentum_calc    = MomentumAnalyzer()
+        self.supertrend_calc  = SuperTrendAnalyzer()
+        self.tga_calc         = ThreeGreenArrowsAnalyzer()
+        self.tipranks_calc    = TipRanksAnalyzer()
         self.aggregator       = SignalAggregator()
+
+        # TipRanks client (optional — requires cookies in data/tipranks_cookies.json)
+        try:
+            from data_sources.tipranks_client import get_client as _tr_client
+            self.tipranks_client = _tr_client()
+            logger.info("[TIPRANKS] Client initialised")
+        except Exception as exc:
+            self.tipranks_client = None
+            logger.debug(f"[TIPRANKS] Client unavailable: {exc}")
 
         # Layer 3
         self.fud_filter       = FUDFilterEngine(db_session_factory)
@@ -120,13 +135,13 @@ class AnalysisPipeline:
         """
         # Try Schwab first
         try:
-            from schwab_api.market_data import SchwabMarketData
+            from broker.market_data import SchwabMarketData
             md = SchwabMarketData()
             quote = md.get_quote("$VIX.X")   # Schwab symbol for CBOE VIX
             if quote and quote.get("last"):
                 return float(quote["last"])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[VIX] Schwab fetch failed: {exc}")
 
         # Try TradingView data feed
         try:
@@ -297,6 +312,7 @@ class AnalysisPipeline:
 
         # TradingView technical consensus (optional)
         tv_signal = None
+        tv_signal_str: Optional[str] = None
         if self.tv_fetcher:
             try:
                 tv_signal = self.tv_fetcher.get_signal(ticker)
@@ -306,8 +322,38 @@ class AnalysisPipeline:
                         f"(buy={tv_signal.buy_count} sell={tv_signal.sell_count} "
                         f"neutral={tv_signal.neutral_count})"
                     )
+                    # Aggregator's itool_signal expects a string, not the result object
+                    rec = (tv_signal.recommendation or "").upper()
+                    if rec in ("STRONG_BUY", "BUY"):
+                        tv_signal_str = "bullish"
+                    elif rec in ("STRONG_SELL", "SELL"):
+                        tv_signal_str = "bearish"
             except Exception as e:
                 logger.debug(f"[TV] {ticker}: {e}")
+
+        # SuperTrend
+        supertrend = None
+        try:
+            supertrend = self.supertrend_calc.analyze(ticker, highs, lows, closes, volumes)
+        except Exception as e:
+            logger.debug(f"[SUPERTREND] {ticker}: {e}")
+
+        # 3 Green Arrows (ThinkorSwim emulation)
+        tga = None
+        try:
+            tga = self.tga_calc.analyze(ticker, closes, highs, lows, volumes)
+        except Exception as e:
+            logger.debug(f"[TGA] {ticker}: {e}")
+
+        # TipRanks Smart Score + analyst consensus (optional — requires cookies)
+        tipranks = None
+        if self.tipranks_client:
+            try:
+                raw_tr = self.tipranks_client.get_stock_data(ticker)
+                if raw_tr:
+                    tipranks = self.tipranks_calc.analyze(ticker, raw_tr, current_price=current_price)
+            except Exception as e:
+                logger.debug(f"[TIPRANKS] {ticker}: {e}")
 
         # ── AI Watch breakout override ────────────────────────────
         # For AI watch tickers on confirmed momentum breakout days,
@@ -316,7 +362,7 @@ class AnalysisPipeline:
         is_ai_watch = ticker in config.ai_watch_tickers
         is_breakout  = (
             momentum is not None
-            and momentum.signal in ("strong_momentum", "momentum")
+            and momentum.signal in ("strong_buy", "buy")
             and momentum.rvol >= 1.5
         )
         floor_fundamentals = is_ai_watch and is_breakout
@@ -340,7 +386,10 @@ class AnalysisPipeline:
                 vix_regime=vix_regime,
                 current_price=current_price,
                 momentum=momentum,
-                itool_signal=tv_signal,
+                supertrend=supertrend,
+                tipranks=tipranks,
+                tga=tga,
+                itool_signal=tv_signal_str,
                 floor_fundamentals=floor_fundamentals,
             )
             logger.info(

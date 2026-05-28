@@ -53,8 +53,9 @@ class EdgarClient:
     """
 
     def __init__(self):
+        from utils.ssl_context import make_requests_session
         self.base_url = config.edgar.base_url
-        self.session = requests.Session()
+        self.session = make_requests_session()
         self.session.headers.update({
             "User-Agent": config.edgar.user_agent,
             "Accept-Encoding": "gzip, deflate",

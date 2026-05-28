@@ -19,6 +19,8 @@ import httpx
 from dotenv import load_dotenv
 from loguru import logger
 
+from utils.ssl_context import make_httpx_client as _mhc
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -39,17 +41,17 @@ def send_alert(message: str) -> bool:
         return False
 
     ok = False
-    for chat_id in _CHAT_IDS:
-        try:
-            resp = httpx.post(
-                f"{_BASE}/sendMessage",
-                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            ok = True
-        except Exception as e:
-            logger.warning(f"Telegram alert failed for {chat_id}: {e}")
+    with _mhc(timeout=10.0) as client:
+        for chat_id in _CHAT_IDS:
+            try:
+                resp = client.post(
+                    f"{_BASE}/sendMessage",
+                    json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                )
+                resp.raise_for_status()
+                ok = True
+            except Exception as e:
+                logger.warning(f"Telegram alert failed for {chat_id}: {e}")
     return ok
 
 
@@ -64,9 +66,10 @@ def get_chat_id() -> None:
 
     print("Fetching recent messages sent to your bot...")
     try:
-        resp = httpx.get(f"{_BASE}/getUpdates", timeout=15)
-        resp.raise_for_status()
-        updates = resp.json().get("result", [])
+        with _mhc(timeout=15.0) as client:
+            resp = client.get(f"{_BASE}/getUpdates")
+            resp.raise_for_status()
+            updates = resp.json().get("result", [])
     except Exception as e:
         print(f"Failed to fetch updates: {e}")
         sys.exit(1)

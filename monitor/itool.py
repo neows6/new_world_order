@@ -23,6 +23,11 @@ import requests
 import yfinance as yf
 from loguru import logger
 
+from utils.ssl_context import make_requests_session as _mrs
+
+# Module-level session for direct HTTPS calls (Norton AV SSL inspection)
+_HTTP = _mrs()
+
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_PATH = ROOT / "data" / "itool_scan.json"
 SP500_CACHE = ROOT / "data" / "sp500_tickers.json"
@@ -130,7 +135,7 @@ _FALLBACK_TICKERS = [
 def _fetch_sp500_tickers() -> list:
     """Fetch current S&P 500 constituents from Wikipedia. Caches to disk."""
     try:
-        resp = requests.get(
+        resp = _HTTP.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
             headers={"User-Agent": "NWO-Trading-Bot/1.0"},
             timeout=15,
