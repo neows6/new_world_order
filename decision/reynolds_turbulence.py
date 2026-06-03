@@ -174,9 +174,13 @@ class ReynoldsMarketAnalyzer:
         if len(closes) < 10:
             return 0.01
 
-        returns = [abs(closes[i] - closes[i-1]) / closes[i-1]
-                   for i in range(1, len(closes[-self.ATR_PERIOD:]))
-                   if closes[i-1] > 0]
+        # Use the most-recent ATR_PERIOD bars. NOTE: slice first, then index the
+        # slice — the prior code iterated range(len(closes[-ATR_PERIOD:])) but
+        # indexed closes[i], which read the OLDEST bars instead of the recent window.
+        window = closes[-self.ATR_PERIOD:]
+        returns = [abs(window[i] - window[i-1]) / window[i-1]
+                   for i in range(1, len(window))
+                   if window[i-1] > 0]
 
         if not returns:
             return 0.01
