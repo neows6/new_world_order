@@ -51,11 +51,17 @@ class SchwabMarketData:
         try:
             import certifi
             from authlib.integrations.httpx_client import OAuth2Client as _OA2C
-            _orig_init = _OA2C.__init__
-            def _patched_init(self, *a, **kw):
-                kw.setdefault("verify", certifi.where())
-                _orig_init(self, *a, **kw)
-            _OA2C.__init__ = _patched_init
+            # Patch __init__ ONCE per process. Guard with a class flag — without it,
+            # every call here (each fresh MarketData instance, every retry) re-wraps
+            # the previous wrapper on the class, stacking nested calls until
+            # OAuth2Client() hits "maximum recursion depth exceeded".
+            if not getattr(_OA2C, "_nwo_verify_patched", False):
+                _orig_init = _OA2C.__init__
+                def _patched_init(self, *a, **kw):
+                    kw.setdefault("verify", certifi.where())
+                    _orig_init(self, *a, **kw)
+                _OA2C.__init__ = _patched_init
+                _OA2C._nwo_verify_patched = True
 
             import schwab
             token_path = Path(config.schwab.token_path)
