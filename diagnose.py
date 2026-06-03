@@ -377,6 +377,7 @@ def run_gate_breakdown(ticker: str, Session) -> None:
         quantum_score  = DecisionEngine._compute_quantum_score(None, quantum) if quantum else 0.0
         kalman_score   = DecisionEngine._compute_kalman_score(None, kalman)   if kalman  else 0.0
         reynolds_mult  = reynolds.position_multiplier if reynolds else 0.75
+        reynolds_regime = reynolds.regime if reynolds else "transient"
 
         ensemble = ensemble_engine.run(
             ticker=ticker,
@@ -384,6 +385,7 @@ def run_gate_breakdown(ticker: str, Session) -> None:
             quantum_score=quantum_score,
             kalman_score=kalman_score,
             reynolds_position_mult=reynolds_mult,
+            reynolds_regime=reynolds_regime,
             technical_score=agg_signal.technical_score,
             insider_score=agg_signal.insider_score,
             momentum_score=momentum_score,

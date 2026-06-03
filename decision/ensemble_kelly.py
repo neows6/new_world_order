@@ -234,6 +234,7 @@ class EnsembleKellyEngine:
         quantum_score: float,
         kalman_score: float,
         reynolds_position_mult: float,
+        reynolds_regime: str,
         technical_score: float,
         insider_score: float,
         momentum_score: float = 0.0,      # From signals/momentum.py
@@ -255,10 +256,17 @@ class EnsembleKellyEngine:
         warnings = []
 
         # ── Assemble ensemble members ──────────────────────────────
-        # Semantic mapping: turbulent (0.40) ≠ bearish; it's cautious-neutral.
-        # The old arithmetic rescaling (mult-0.5)*2 made Re=0.40 read as -0.20 (bearish) — wrong.
-        _REYNOLDS_SCORE_MAP = {1.0: 0.30, 0.40: 0.00, 0.15: -0.20, 0.10: -0.30}
-        reynolds_score = _REYNOLDS_SCORE_MAP.get(round(reynolds_position_mult, 2), 0.0)
+        # Semantic mapping: turbulent ≠ bearish; it's cautious-neutral.
+        # Keyed by regime string (robust) — the prior float-keyed map silently
+        # missed the "transient" (0.75) multiplier and defaulted it to 0.0,
+        # understating the ensemble score for transient-regime names.
+        _REYNOLDS_SCORE_MAP = {
+            "laminar":   0.30,   # calm, trending — favorable for entry
+            "transient": 0.15,   # mild caution
+            "turbulent": 0.00,   # cautious-neutral (turbulent ≠ bearish)
+            "extreme":  -0.30,   # crisis-like — bearish (also blocked upstream)
+        }
+        reynolds_score = _REYNOLDS_SCORE_MAP.get(reynolds_regime, 0.0)
 
         raw_scores = {
             "fundamental": fundamental_score,

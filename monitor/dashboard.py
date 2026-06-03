@@ -3007,19 +3007,34 @@ def _run_thesis_analysis() -> None:
             for e in todays
         )
 
-        prompt = (
-            f"Today's AI-generated trade theses for {ticker_count} tickers "
-            f"({len(todays)} BUY/STRONG_BUY signals):\n\n"
-            f"{entries_text}\n\n"
-            f"Write a concise end-of-day pattern analysis covering four points:\n"
-            f"1. Recurring sector or ticker themes (what narratives dominated today's signals).\n"
-            f"2. Common risk factors mentioned across multiple theses.\n"
-            f"3. A market-wide observation implied by the collective signal set.\n"
-            f"4. One or two actionable recommendations for the trading system operator.\n\n"
-            f"Plain prose only. No markdown, no bullets, no disclaimers. "
-            f"4 sentences max — one per point. Reference actual tickers and scores. "
-            f"Start directly with point 1."
-        )
+        if len(todays) == 1:
+            # Single-signal day — cross-ticker "patterns" don't apply; analyse the lone thesis.
+            only = todays[0]
+            prompt = (
+                f"Today produced a single BUY/STRONG_BUY thesis:\n\n"
+                f"{entries_text}\n\n"
+                f"Write a concise end-of-day note on this lone signal covering three points:\n"
+                f"1. The core narrative driving the {only['ticker']} thesis.\n"
+                f"2. The main risk factor to watch.\n"
+                f"3. One actionable recommendation for the trading system operator.\n\n"
+                f"Plain prose only. No markdown, no bullets, no disclaimers. "
+                f"3 sentences max — one per point. Reference {only['ticker']} and its scores. "
+                f"Start directly with point 1."
+            )
+        else:
+            prompt = (
+                f"Today's AI-generated trade theses for {ticker_count} tickers "
+                f"({len(todays)} BUY/STRONG_BUY signals):\n\n"
+                f"{entries_text}\n\n"
+                f"Write a concise end-of-day pattern analysis covering four points:\n"
+                f"1. Recurring sector or ticker themes (what narratives dominated today's signals).\n"
+                f"2. Common risk factors mentioned across multiple theses.\n"
+                f"3. A market-wide observation implied by the collective signal set.\n"
+                f"4. One or two actionable recommendations for the trading system operator.\n\n"
+                f"Plain prose only. No markdown, no bullets, no disclaimers. "
+                f"4 sentences max — one per point. Reference actual tickers and scores. "
+                f"Start directly with point 1."
+            )
 
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)

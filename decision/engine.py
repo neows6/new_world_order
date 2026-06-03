@@ -560,6 +560,7 @@ class DecisionEngine:
             quantum_score=quantum_score,
             kalman_score=kalman_score,
             reynolds_position_mult=reynolds_result.position_multiplier,
+            reynolds_regime=reynolds_result.regime,
             technical_score=agg_signal.technical_score,
             insider_score=agg_signal.insider_score,
             momentum_score=getattr(agg_signal, "momentum_score", 0.0),

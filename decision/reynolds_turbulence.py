@@ -58,6 +58,10 @@ RE_TURBULENT_MAX   = 5.0    # Turbulent: high volatility
 # normalized Reynolds index lands ~0.5-1.5 in quiet markets and 5-10+ in crises.
 BASELINE_VOLATILITY = 0.012   # ~1.2%/day — typical large-cap
 
+# Normal-market bid-ask spread baseline (as % of price). A wider spread is
+# liquidity friction that damps turbulent flow, so it divides the Reynolds index.
+BASELINE_SPREAD = 0.001       # ~0.1% — typical large-cap spread
+
 
 @dataclass
 class ReynoldsResult:
@@ -151,11 +155,7 @@ class ReynoldsMarketAnalyzer:
             return 1.0
         return recent_return / (atr_normalized * 5)  # 5-day normalized
 
-    def _compute_viscosity(
-        self,
-        closes: list,
-        bid_ask_spread_pct: Optional[float] = None
-    ) -> float:
+    def _compute_viscosity(self, closes: list) -> float:
         """
         Realized volatility = stdev of |daily returns| over the ATR window.
 
@@ -168,7 +168,8 @@ class ReynoldsMarketAnalyzer:
         holds realized volatility. (Prior versions wrongly placed it in the Re
         denominator, which inverted the regime — calm blue chips read as
         "extreme" while volatile microcaps read "laminar". Fixed 2026-06-02.)
-        If a bid-ask spread is supplied it is blended in as additional friction.
+        Bid-ask spread is NOT blended in here — it acts as liquidity friction
+        and is applied as a damping divisor in analyze().
         """
         if len(closes) < 10:
             return 0.01
@@ -182,12 +183,7 @@ class ReynoldsMarketAnalyzer:
 
         vol = statistics.stdev(returns) if len(returns) > 1 else returns[0]
 
-        # Use bid-ask spread if available (better viscosity proxy)
-        if bid_ask_spread_pct:
-            # Spread represents actual friction in the market
-            vol = (vol + bid_ask_spread_pct) / 2
-
-        # Ensure minimum viscosity (can't be zero — no market is perfectly frictionless)
+        # Ensure non-zero (no market is perfectly frictionless)
         return max(0.001, vol)
 
     def _compute_flow_direction(self, closes: list) -> str:
@@ -297,7 +293,7 @@ class ReynoldsMarketAnalyzer:
         atr       = self._compute_atr(highs[-self.ATR_PERIOD-1:], lows[-self.ATR_PERIOD-1:], closes[-self.ATR_PERIOD-1:])
         density   = self._compute_density(volumes)
         velocity  = self._compute_velocity(closes, atr)
-        viscosity = self._compute_viscosity(closes, bid_ask_spread_pct)
+        viscosity = self._compute_viscosity(closes)
         length    = float(self.LOOKBACK_DAYS)
 
         # ── Reynolds Number (market turbulence index) ──────────────
@@ -312,6 +308,11 @@ class ReynoldsMarketAnalyzer:
         # quiet markets ≈ 0.5-1.5, genuine crises ≈ 5-10+.
         vol_factor = viscosity / BASELINE_VOLATILITY   # `viscosity` holds realized vol
         reynolds_normalized = density * velocity * vol_factor
+
+        # Liquidity friction: a wide bid-ask spread resists flow and damps
+        # turbulence (friction ≥ 1.0, so it can only lower the index).
+        if bid_ask_spread_pct:
+            reynolds_normalized /= (1.0 + bid_ask_spread_pct / BASELINE_SPREAD)
 
         notes.append(
             f"Re components: density={density:.2f}, velocity={velocity:.2f}, "
