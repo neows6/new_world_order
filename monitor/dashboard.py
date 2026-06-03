@@ -2995,8 +2995,8 @@ def _run_thesis_analysis() -> None:
             except Exception:
                 continue
 
-        if len(todays) < 2:
-            _log.info(f"[ThesisAnalysis] Only {len(todays)} thesis(es) today — need ≥2, skipping")
+        if len(todays) < 1:
+            _log.info(f"[ThesisAnalysis] No theses today — need ≥1, skipping")
             return
 
         ticker_count = len({e["ticker"] for e in todays})
