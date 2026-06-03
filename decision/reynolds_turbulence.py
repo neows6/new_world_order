@@ -53,6 +53,11 @@ RE_TRANSIENT_MAX   = 2.5    # Transitional: caution
 RE_TURBULENT_MAX   = 5.0    # Turbulent: high volatility
 # Above RE_TURBULENT_MAX = extreme turbulence / crisis
 
+# Normal-market daily volatility baseline (stdev of |daily returns| over ~2 weeks).
+# Used to scale realized volatility into an O(1) turbulence factor so the
+# normalized Reynolds index lands ~0.5-1.5 in quiet markets and 5-10+ in crises.
+BASELINE_VOLATILITY = 0.012   # ~1.2%/day — typical large-cap
+
 
 @dataclass
 class ReynoldsResult:
@@ -152,14 +157,18 @@ class ReynoldsMarketAnalyzer:
         bid_ask_spread_pct: Optional[float] = None
     ) -> float:
         """
-        Market viscosity = resistance to price movement.
-        Proxy: realized volatility std dev (high vol = low viscosity / easy to move)
+        Realized volatility = stdev of |daily returns| over the ATR window.
 
-        In physics: low viscosity = easy flow, high Reynolds Number
-        In markets: low volatility = calm = easy for trends to persist
+        This is the primary turbulence DRIVER, not a damper: high volatility
+        means chaotic, fast flow (high Reynolds), low volatility means calm
+        laminar flow. It is scaled by BASELINE_VOLATILITY in analyze() so it
+        contributes to the Reynolds index in the numerator.
 
-        We invert: high volatility → lower viscosity → higher Re → more turbulent
-        This matches the physics intuition.
+        NOTE: the field is named `viscosity` for backward compatibility, but it
+        holds realized volatility. (Prior versions wrongly placed it in the Re
+        denominator, which inverted the regime — calm blue chips read as
+        "extreme" while volatile microcaps read "laminar". Fixed 2026-06-02.)
+        If a bid-ask spread is supplied it is blended in as additional friction.
         """
         if len(closes) < 10:
             return 0.01
@@ -291,18 +300,22 @@ class ReynoldsMarketAnalyzer:
         viscosity = self._compute_viscosity(closes, bid_ask_spread_pct)
         length    = float(self.LOOKBACK_DAYS)
 
-        # ── Reynolds Number ────────────────────────────────────────
-        # Re = (ρ × v × L) / μ
-        reynolds = (density * velocity * length) / viscosity
-
-        # Normalize to a reasonable scale for financial markets
-        # Calibrated so that typical quiet markets ≈ 0.5-1.5
-        # and crisis periods ≈ 5-10+
-        reynolds_normalized = reynolds / 20.0   # Normalization factor from backtesting
+        # ── Reynolds Number (market turbulence index) ──────────────
+        # Re ∝ density × velocity × volatility
+        #
+        # FIX (2026-06-02): the prior formula was Re = (ρ·v·L)/μ with μ = realized
+        # volatility in the DENOMINATOR. That inverted the economics — the calmest
+        # blue chips (lowest vol) scored as the MOST turbulent, so quality setups
+        # like CRM/NVDA/MSFT were blocked as "extreme" while a jumpy microcap read
+        # "laminar". Volatility drives turbulence, so it belongs in the numerator,
+        # expressed relative to a normal-market baseline to keep the index O(1):
+        # quiet markets ≈ 0.5-1.5, genuine crises ≈ 5-10+.
+        vol_factor = viscosity / BASELINE_VOLATILITY   # `viscosity` holds realized vol
+        reynolds_normalized = density * velocity * vol_factor
 
         notes.append(
             f"Re components: density={density:.2f}, velocity={velocity:.2f}, "
-            f"L={length:.0f}, viscosity={viscosity:.4f}"
+            f"vol={viscosity:.4f} (factor {vol_factor:.2f}× baseline)"
         )
         notes.append(f"Reynolds Number (normalized): {reynolds_normalized:.2f}")
 
