@@ -41,14 +41,14 @@ class EdgarConfig:
 
 @dataclass
 class RiskConfig:
-    max_position_pct: float = 0.05       # 5% of portfolio per ticker
+    max_position_pct: float = 0.10       # 10% of portfolio per ticker
     max_sector_pct: float = 0.25         # 25% per sector
     daily_loss_halt_pct: float = 0.03    # Halt if down 3% on the day
     min_margin_of_safety: float = 0.15   # 15% discount to intrinsic value
     min_fud_score: float = 0.60          # Signal quality threshold
-    max_trade_dollars: float = 500.0     # Hard cap per single trade ($)
+    max_trade_dollars: float = 10000.0   # Hard cap per single trade ($) = 10% of the $100k paper book
     max_daily_trades: int = 5            # Max trades per day
-    max_shares_per_trade: int = 50       # Hard share quantity ceiling
+    max_shares_per_trade: int = 1000     # Hard share quantity ceiling (raised so 10% sizing isn't share-capped on low-priced names)
     dry_run: bool = True                 # ALWAYS True until you're confident
 
 

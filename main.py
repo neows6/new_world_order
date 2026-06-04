@@ -260,7 +260,7 @@ def run_trading_cycle(
     decisions = decision_engine.run_watchlist(
         layer3_results=layer3_results,
         portfolio_value=portfolio_value,
-        max_trade_dollars=config.risk.max_dollar_per_trade if hasattr(config.risk, "max_dollar_per_trade") else 500.0,
+        max_trade_dollars=getattr(config.risk, "max_trade_dollars", 500.0),  # fixed: was wrong attr name -> always 500
         gate_overrides=_gate_overrides,
         live_prices=_live_prices,
     )

@@ -492,7 +492,9 @@ def run_paper_cycle(
                 logger.error(f"[{m['name'].upper()}] L2/Signals/L3 failed for {ticker}: {e}")
 
     # ── Decision + risk + execution per model ─────────────────────────────────
-    max_dollars = config.risk.max_dollar_per_trade if hasattr(config.risk, "max_dollar_per_trade") else 500.0
+    # NOTE: the attribute is `max_trade_dollars` (RiskConfig). The old `max_dollar_per_trade`
+    # name never existed, so this silently fell back to 500 and capped every position at 0.5%.
+    max_dollars = getattr(config.risk, "max_trade_dollars", 500.0)
 
     for m in models:
         l3_results    = model_l3[m["name"]]

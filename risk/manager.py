@@ -153,7 +153,7 @@ class RiskManager:
 
     # Hard limits (override all other signals)
     MAX_PORTFOLIO_EXPOSURE   = 0.40   # Never deploy more than 40% total
-    MAX_SINGLE_POSITION_PCT  = 0.05   # 5% max per stock
+    MAX_SINGLE_POSITION_PCT  = 0.10   # 10% max per stock
     MIN_RR_RATIO             = 1.5    # Must have 1.5:1 R/R minimum
     # Per-trade hard caps — sourced from config so they can be tuned without code changes
     # MAX_DOLLAR_PER_TRADE  → config.risk.max_trade_dollars
