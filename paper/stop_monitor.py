@@ -16,6 +16,12 @@ from paper.account import PaperAccount, PaperPosition, PaperTrade
 
 _STAGEGATE_FILE = "data/stagegate.json"
 
+# Trailing-stop: once a position reaches take_profit_1, we STOP selling at tp1 and
+# instead ratchet a trailing stop up under the rising price so winners can run.
+# The trail is floored at breakeven (avg_cost) the moment tp1 is reached, so a
+# trade that has hit its first target can never turn back into a loss.
+TRAIL_PCT = 0.08   # trail 8% below the running peak once in profit
+
 
 def check_stops(paper_session_factory, market_data) -> int:
     """
@@ -67,14 +73,29 @@ def check_stops(paper_session_factory, market_data) -> int:
         if not price:
             continue
 
-        sl  = pos["stop_loss"]
-        tp1 = pos["take_profit_1"]
+        sl       = pos["stop_loss"]
+        tp1      = pos["take_profit_1"]
+        avg_cost = pos["avg_cost"]
+
+        # Trailing stop: once price reaches tp1, don't sell — ratchet the stop up
+        # under the rising price (floored at breakeven) so the winner keeps running.
+        if tp1 is not None and price >= tp1:
+            trail = price * (1.0 - TRAIL_PCT)
+            if avg_cost:
+                trail = max(trail, avg_cost)        # lock in at least breakeven
+            if sl is None or trail > sl:
+                new_sl = round(trail, 4)
+                if new_sl != sl:
+                    if _update_stop(paper_session_factory, ticker, new_sl):
+                        logger.info(
+                            f"[STOP MON] {ticker}: trailing stop → ${new_sl:.2f} "
+                            f"(price ${price:.2f}, was ${sl if sl else 0:.2f})"
+                        )
+                    sl = new_sl
 
         reason = None
-        if sl  is not None and price <= sl:
+        if sl is not None and price <= sl:
             reason = f"STOP @ ${price:.2f} ≤ stop ${sl:.2f}"
-        elif tp1 is not None and price >= tp1:
-            reason = f"TARGET @ ${price:.2f} ≥ tp1 ${tp1:.2f}"
 
         if reason:
             logger.info(f"[STOP MON] {ticker}: {reason} — triggering paper SELL")
@@ -124,6 +145,21 @@ def _execute_stop_sell(paper_session_factory, ticker: str, price: float, reason:
 
     except Exception as e:
         logger.error(f"[STOP MON] Stop-sell failed for {ticker}: {e}")
+        return False
+
+
+def _update_stop(paper_session_factory, ticker: str, new_stop: float) -> bool:
+    """Ratchet a held position's stop_loss up (trailing stop). Never sells."""
+    try:
+        with paper_session_factory() as s:
+            position = s.query(PaperPosition).filter_by(ticker=ticker).first()
+            if not position or position.qty <= 0.001:
+                return False
+            position.stop_loss = new_stop
+            s.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"[STOP MON] trail update failed for {ticker}: {e}")
         return False
 
 
