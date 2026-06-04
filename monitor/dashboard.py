@@ -223,8 +223,21 @@ def _save_synth_cache(cache: dict) -> None:
 
 
 def _append_thesis_log(entry: dict) -> None:
-    """Thread-safe append of one synthesis entry to thesis_log.json."""
+    """Thread-safe upsert of one synthesis entry into thesis_log.json.
+
+    Keeps at most one entry per (ticker, ET trading day) — the newest. A ticker
+    that re-synthesizes every cycle would otherwise pile up dozens of duplicate
+    same-day rows that bloat the log and skew the EOD pattern analysis toward
+    false "signal noise" (e.g. BAC logged 14x in one day).
+    """
     import json as _j
+
+    def _et_date(ts: str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(_ET).date()
+        except Exception:
+            return None
+
     with _THESIS_LOG_LOCK:
         try:
             _THESIS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +247,15 @@ def _append_thesis_log(entry: dict) -> None:
                     existing = _j.loads(_THESIS_LOG_PATH.read_text())
                 except Exception:
                     existing = []
+            # Drop any prior entry for the same ticker on the same ET day.
+            new_tkr = entry.get("ticker")
+            new_day = _et_date(entry.get("generated_at_utc", ""))
+            if new_tkr and new_day is not None:
+                existing = [
+                    e for e in existing
+                    if not (e.get("ticker") == new_tkr
+                            and _et_date(e.get("generated_at_utc", "")) == new_day)
+                ]
             existing.append(entry)
             _THESIS_LOG_PATH.write_text(_j.dumps(existing, indent=2))
         except Exception as exc:
@@ -2999,7 +3021,19 @@ def _run_thesis_analysis() -> None:
             _log.info(f"[ThesisAnalysis] No theses today — need ≥1, skipping")
             return
 
-        ticker_count = len({e["ticker"] for e in todays})
+        # Collapse to one entry per ticker (highest composite). A ticker that
+        # re-synthesizes each cycle would otherwise appear many times and push the
+        # analysis toward a false "signal noise" read (e.g. BAC seen 14x).
+        _by_ticker: dict = {}
+        for e in todays:
+            t = e.get("ticker")
+            if not t:
+                continue
+            if t not in _by_ticker or e.get("composite_score", 0) > _by_ticker[t].get("composite_score", 0):
+                _by_ticker[t] = e
+        todays = sorted(_by_ticker.values(), key=lambda e: e.get("composite_score", 0), reverse=True)
+
+        ticker_count = len(todays)
         entries_text = "\n".join(
             f"- {e['ticker']} ({e['signal']}, conf={e['confidence']:.0%}, "
             f"composite={e.get('composite_score', 0):.2f}, "
@@ -3007,10 +3041,25 @@ def _run_thesis_analysis() -> None:
             for e in todays
         )
 
+        # Ground the model in the real system so it cannot invent signals/thresholds.
+        system_ctx = (
+            "SYSTEM CONTEXT (use ONLY these facts; do not invent signals, thresholds, or "
+            "figures not shown below):\n"
+            "- Composite score = weighted sum of: fundamentals 0.22, momentum 0.20, insider 0.17, "
+            "technical 0.13, supertrend 0.10, tipranks 0.10, tga 0.05, cycle 0.02, volume 0.01.\n"
+            "- 'tga' means THREE GREEN ARROWS: a 0-3 technical confirmation count (SMA / MACD / "
+            "Stochastic crossovers). There is NO Treasury General Account or macro-liquidity "
+            "signal in this system; 'TGA' or 'N/3' ALWAYS refers to Three Green Arrows.\n"
+            "- Thresholds: composite >= 0.15 => BUY, >= 0.50 => STRONG_BUY. A BUY without momentum "
+            "or insider support is downgraded to WATCH, and >=1/3 Three Green Arrows (or positive "
+            "margin of safety) is already required as a confirmation gate.\n"
+            "- Reference only the tickers and numbers listed below.\n\n"
+        )
+
         if len(todays) == 1:
             # Single-signal day — cross-ticker "patterns" don't apply; analyse the lone thesis.
             only = todays[0]
-            prompt = (
+            prompt = system_ctx + (
                 f"Today produced a single BUY/STRONG_BUY thesis:\n\n"
                 f"{entries_text}\n\n"
                 f"Write a concise end-of-day note on this lone signal covering three points:\n"
@@ -3022,9 +3071,9 @@ def _run_thesis_analysis() -> None:
                 f"Start directly with point 1."
             )
         else:
-            prompt = (
+            prompt = system_ctx + (
                 f"Today's AI-generated trade theses for {ticker_count} tickers "
-                f"({len(todays)} BUY/STRONG_BUY signals):\n\n"
+                f"({ticker_count} distinct BUY/STRONG_BUY names):\n\n"
                 f"{entries_text}\n\n"
                 f"Write a concise end-of-day pattern analysis covering four points:\n"
                 f"1. Recurring sector or ticker themes (what narratives dominated today's signals).\n"

@@ -136,8 +136,11 @@ SIGNAL_WEIGHTS = {
     "volume":       0.01,   # Volume profile POC/Value Area
 }
 
-# Buy signal threshold — must match L3 reclassification threshold in filter_engine.py
-BUY_THRESHOLD = 0.10
+# Buy signal threshold — unified with L3 reclassification in fud/filter_engine.py (0.15).
+# Composites in [0.10, 0.15) were classified "buy" here but demoted to "hold" by L3, so
+# they could never trade — pure thesis noise. 0.15 is the effective trade floor.
+# (Paper models override this via buy_threshold_override; this is the live/default only.)
+BUY_THRESHOLD = 0.15
 
 
 class SignalAggregator:

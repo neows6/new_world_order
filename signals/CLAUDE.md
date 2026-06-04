@@ -27,8 +27,10 @@ tga           0.05    cycle        0.02    volume      0.01
 ```
 
 Thresholds:
-- `BUY_THRESHOLD = 0.10` (was 0.25 — was blocking valid signals)
-- Strong buy ≥ 0.50, Buy ≥ 0.10, Hold ≥ −0.15, Sell ≥ −0.40, Strong sell < −0.40
+- `BUY_THRESHOLD = 0.15` (0.25 → 0.10 to stop over-blocking, then → 0.15 to unify with the L3
+  reclassification floor in `fud/filter_engine.py`; composites in [0.10, 0.15) were "buy" here
+  but demoted to "hold" by L3, so they could never trade). Paper models override via `buy_threshold_override`.
+- Strong buy ≥ 0.50, Buy ≥ 0.15, Hold ≥ −0.15, Sell ≥ −0.40, Strong sell < −0.40
 
 **Conviction floor gate** (line ~527): if signal is "buy" but composite < 0.50 AND no momentum/insider confirmation, downgrade to HOLD. This prevents low-confidence buys from leaking through.
 
