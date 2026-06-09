@@ -438,7 +438,70 @@ def main():
         replace_existing=True,
     )
 
+    # Schwab token expiry monitor — Telegram alert before the 7-day refresh token lapses
+    def _check_schwab_token():
+        try:
+            import json as _json
+            from datetime import datetime as _dt, timedelta as _td
+            from pathlib import Path as _P
+            tok_path = _P(config.schwab.token_path)
+            if not tok_path.exists():
+                return
+            ct = _json.loads(tok_path.read_text()).get("creation_timestamp")
+            if not ct:
+                return
+            expiry = _dt.fromtimestamp(ct) + _td(days=7)
+            hours_left = (expiry - _dt.now()).total_seconds() / 3600.0
+
+            if   hours_left <= 0:  bucket = "expired"
+            elif hours_left <= 12: bucket = "12h"
+            elif hours_left <= 36: bucket = "36h"
+            else:                  return   # not yet in alert range
+
+            # Send each bucket at most once per token (keyed by this expiry)
+            state_path = _P("data/token_alert_state.json")
+            try:
+                state = _json.loads(state_path.read_text()) if state_path.exists() else {}
+            except Exception:
+                state = {}
+            key = expiry.isoformat()
+            if bucket in state.get(key, []):
+                return
+
+            if bucket == "expired":
+                msg = (f"\U0001F534 <b>Schwab token EXPIRED</b>\n"
+                       f"7-day refresh token lapsed {expiry:%Y-%m-%d %H:%M}. Price feed is DOWN — "
+                       f"run reauth.bat (or python get_token.py) now.")
+            else:
+                msg = (f"⚠️ <b>Schwab token expires in ~{hours_left:.0f}h</b>\n"
+                       f"Refresh token lapses {expiry:%Y-%m-%d %H:%M}. Run reauth.bat before then "
+                       f"to avoid a feed outage.")
+            try:
+                from monitor.telegram_bot import send_alert as _tg
+                _tg(msg)
+            except Exception as _te:
+                logger.warning(f"[TOKEN] telegram alert failed: {_te}")
+
+            state = {key: state.get(key, []) + [bucket]}   # keep only current token's buckets
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text(_json.dumps(state, indent=2))
+            except Exception:
+                pass
+            logger.info(f"[TOKEN] Schwab token alert sent: {bucket} ({hours_left:.0f}h left)")
+        except Exception as e:
+            logger.warning(f"[TOKEN] expiry check failed: {e}")
+
+    scheduler.add_job(
+        func=_check_schwab_token,
+        trigger=CronTrigger(hour="*/6", minute=15),
+        id="schwab_token_monitor",
+        name="Schwab token expiry monitor + Telegram alert",
+        replace_existing=True,
+    )
+
     scheduler.start()
+    _check_schwab_token()   # run once at startup so an already-near-expiry token alerts immediately
     logger.info("Scheduler started. Press Ctrl+C to stop.")
 
     try:
