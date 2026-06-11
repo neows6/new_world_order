@@ -309,7 +309,7 @@ def _generate_signal_synthesis(sig: dict, api_key: str) -> str:
         f"Scores: composite={r.get('composite_score', 0):.2f}, momentum={r.get('momentum_score', 0):.2f}, "
         f"news_quality={sig.get('fud_score', 0):.2f}, MOS={sig.get('margin_of_safety', 0):.0%}\n"
         f"Price: ${(sig.get('current_price') or 0):.2f} vs intrinsic ${(sig.get('intrinsic_value') or 0):.2f}\n"
-        f"TGA: {r.get('tga_arrows', 0)}/3 | "
+        f"Three Green Arrows (0-3 technical confirmation count — SMA/MACD/Stochastic crossovers): {r.get('tga_arrows', 0)}/3 | "
         f"Insider: {'CLUSTER BUY' if r.get('insider_cluster_buy') else 'none'} | "
         f"VIX: {r.get('vix_regime', 'normal')} | MACD: {r.get('macd_direction', r.get('macd_signal_direction', '?'))}\n"
         f"System reasons: {'; '.join(str(x) for x in why_buy[:3])}\n"
@@ -317,6 +317,8 @@ def _generate_signal_synthesis(sig: dict, api_key: str) -> str:
         f"Write exactly 2 plain sentences (no markdown, no headers, no bullets):\n"
         f"Sentence 1: The narrative connecting these signals into a coherent trade thesis.\n"
         f"Sentence 2: One non-obvious risk or timing factor the trader should watch.\n"
+        f"'Three Green Arrows' is a technical indicator only — NEVER interpret it as 'Treasury General Account', "
+        f"'Treasury', or any macro/liquidity concept; no such signal exists in this system.\n"
         f"Be specific and quantitative. No disclaimers. Start directly with sentence 1."
     )
     try:
