@@ -191,6 +191,7 @@ class DecisionEngine:
     MAX_REYNOLDS        = 10.0   # Reject in extreme turbulence (raised from 5.0 — Re 5-10 is turbulent but tradeable)
     MIN_RR_RATIO        = 1.5    # Minimum risk/reward ratio
     MAX_KALMAN_SURPRISE = 2.5    # Reject if Kalman innovation > 2.5σ (unusual move)
+    TGA_STRICT_COMPOSITE = 0.50  # Below this composite, Three Green Arrows gate needs 2/3 (positive MOS counts as one); at/above, 1/3
 
     def __init__(self, db_session_factory, threshold_multiplier: float = 1.0):
         self.Session = db_session_factory
@@ -206,6 +207,9 @@ class DecisionEngine:
             self.MIN_RR_RATIO        = round(self.__class__.MIN_RR_RATIO        * threshold_multiplier, 4)
             self.MAX_REYNOLDS        = round(self.__class__.MAX_REYNOLDS        / threshold_multiplier, 4)
             self.MAX_KALMAN_SURPRISE = round(self.__class__.MAX_KALMAN_SURPRISE / threshold_multiplier, 4)
+            # Lower the strict-TGA cutoff for relaxed models so fewer composites hit the
+            # 2/3 requirement — keeps relaxed/very_relaxed genuinely more permissive.
+            self.TGA_STRICT_COMPOSITE = round(self.__class__.TGA_STRICT_COMPOSITE * threshold_multiplier, 4)
 
     def _load_price_data(self, session, ticker: str) -> dict:
         """Load OHLCV price data for a ticker from DB."""
@@ -414,31 +418,57 @@ class DecisionEngine:
             )
             blocker = blocker or f"Margin of safety {mos:.0%} below -50% hard floor"
 
-        # Gate 10: Three Green Arrows — require ≥1/3 for BUY confirmation
-        # Guards against news-driven buys with zero momentum/technical validation.
+        # Gate 10: Three Green Arrows — momentum/technical confirmation.
+        # Require ≥1/3 arrows for a STRONG_BUY-tier composite; ≥2/3 when the composite is
+        # weak (< TGA_STRICT_COMPOSITE), because sub-strong_buy buys lean on valuation alone
+        # — the pattern the EOD analyzer flagged as "front-running mean reversion." A positive
+        # margin of safety counts as ONE confirmation (fundamental buffer): below the cutoff,
+        # MOS + one real arrow passes, but MOS + zero arrows no longer does.
         tga_count = getattr(agg, "tga_arrows_count", None)
+        composite = getattr(agg, "composite_score", None)
         if "tga" in _bypass:
             passed.append(f"TGA: BYPASSED ({tga_count}/3 arrows) — user override")
         elif tga_count is None:
             passed.append("TGA: skipped — no TGA data")
-        elif tga_count >= 1:
+        else:
+            strict     = composite is not None and composite < self.TGA_STRICT_COMPOSITE
+            req        = 2 if strict else 1
+            mos_credit = 1 if (mos is not None and mos >= 0.0) else 0
+            effective  = tga_count + mos_credit
             arrow_parts = []
             if getattr(agg, "tga_sma_arrow",   False): arrow_parts.append("SMA")
             if getattr(agg, "tga_macd_arrow",  False): arrow_parts.append("MACD")
             if getattr(agg, "tga_stoch_arrow", False): arrow_parts.append("Stoch")
-            passed.append(f"TGA: {tga_count}/3 arrows ({', '.join(arrow_parts) or 'active'}) — momentum confirmed")
-        elif mos is not None and mos >= 0.0:
-            # Positive MOS means price is at/below intrinsic value — fundamental buffer
-            # overrides the timing requirement; don't hard-block, pass with caution note
-            passed.append(
-                f"TGA: 0/3 arrows — MOS {mos:.0%} provides fundamental buffer ⚠"
-            )
-        else:
-            failed.append(
-                f"TGA: 0/3 arrows — no momentum/technical confirmation "
-                f"(bypass 'tga' to override)"
-            )
-            blocker = blocker or "Three Green Arrows: 0/3 signals — no momentum confirmation"
+            _arrows = ", ".join(arrow_parts) or "active"
+            _cstr   = f"{composite:.2f}" if composite is not None else "n/a"
+
+            if tga_count >= req:
+                passed.append(
+                    f"TGA: {tga_count}/3 arrows ({_arrows}) — momentum confirmed"
+                    + (f" [≥2/3 required: weak composite {_cstr}]" if strict else "")
+                )
+            elif effective >= req:
+                # Cleared on the MOS fundamental buffer, which counts as one confirmation.
+                passed.append(
+                    f"TGA: {tga_count}/3 arrows + MOS {mos:.0%} buffer = {effective}/{req} "
+                    f"confirmation"
+                    + (f" (weak composite {_cstr} → ≥2/3)" if strict else "")
+                    + " ⚠"
+                )
+            else:
+                failed.append(
+                    f"TGA: {tga_count}/3 arrows"
+                    + (f" + MOS {mos:.0%} buffer" if mos_credit else "")
+                    + f" = {effective}/{req} confirmation < {req} required"
+                    + (f" — weak composite {_cstr} needs ≥2/3" if strict
+                       else " — no momentum/technical confirmation")
+                    + " (bypass 'tga' to override)"
+                )
+                blocker = blocker or (
+                    f"Three Green Arrows: {effective}/{req} confirmation — needs ≥{req}/3"
+                    + (f" (weak composite {_cstr}; arrows + MOS buffer)" if strict
+                       else " momentum confirmation")
+                )
 
         go_no_go = len(failed) == 0 and blocker is None
         return passed, failed, blocker, go_no_go

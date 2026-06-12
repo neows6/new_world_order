@@ -26,7 +26,7 @@ Order of evaluation in `make_decision()`:
 | 7 | Composite signal | `signal in ("buy", "strong_buy")` | **NO** |
 | 8 | EMA(10) trend | `price ≥ EMA(10) × 0.995` | yes (`'ema'`) |
 | 9 | Margin of Safety | `≥ -0.50` | yes (`'mos'`) |
-| 10 | Three Green Arrows | `≥ 1/3` OR positive MoS | yes (`'tga'`) |
+| 10 | Three Green Arrows | `≥ 1/3` (composite ≥ 0.50) or `≥ 2/3` (composite < 0.50); positive MoS counts as one arrow | yes (`'tga'`) |
 
 `go_no_go = True` only if **no** gate failed.
 
@@ -38,6 +38,7 @@ MIN_QUANTUM_CERTAIN = 0.60   # was 0.45 — require substantial wave collapse
 MAX_REYNOLDS        = 10.0   # extreme-turbulence ceiling
 MIN_RR_RATIO        = 1.5
 MAX_KALMAN_SURPRISE = 2.5
+TGA_STRICT_COMPOSITE = 0.50  # composite below this → Gate 10 needs 2/3 arrows (positive MoS counts as one)
 ```
 
 Relaxed paper-trading models scale these via `threshold_multiplier` in `__init__` (e.g. `0.75` for "Relaxed", `0.5` for "Very Relaxed").
