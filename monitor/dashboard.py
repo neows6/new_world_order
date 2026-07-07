@@ -3036,10 +3036,52 @@ def _run_thesis_analysis() -> None:
         todays = sorted(_by_ticker.values(), key=lambda e: e.get("composite_score", 0), reverse=True)
 
         ticker_count = len(todays)
+
+        # Look up the REAL Three Green Arrows count per ticker from the stored
+        # signal reasoning JSON. The thesis log itself carries no TGA data, so
+        # without this the model would have to invent the arrow counts (it has
+        # previously hallucinated "0/3 across all names"). signal_id maps 1:1 to
+        # TradeSignal.id; tga_arrows is written by decision/engine.py.
+        _tga_by_ticker: dict = {}
+        try:
+            import json as _tj
+            _sids = []
+            for e in todays:
+                try:
+                    _sids.append(int(e.get("signal_id")))
+                except (TypeError, ValueError):
+                    pass
+            if _sids:
+                with Session() as _tsess:
+                    for _sig in (
+                        _tsess.query(TradeSignal)
+                        .filter(TradeSignal.id.in_(_sids))
+                        .all()
+                    ):
+                        try:
+                            _rsn = _tj.loads(_sig.reasoning or "{}")
+                        except Exception:
+                            _rsn = {}
+                        _tga_by_ticker[_sig.id] = {
+                            "arrows": int(_rsn.get("tga_arrows", 0) or 0),
+                            "signal": _rsn.get("tga_signal", "neutral"),
+                        }
+        except Exception as exc:
+            _log.warning(f"[ThesisAnalysis] TGA lookup failed: {exc}")
+
+        def _tga_str(e) -> str:
+            try:
+                t = _tga_by_ticker.get(int(e.get("signal_id")))
+            except (TypeError, ValueError):
+                t = None
+            if t is None:
+                return "TGA=n/a"
+            return f"TGA={t['arrows']}/3 ({t['signal']})"
+
         entries_text = "\n".join(
             f"- {e['ticker']} ({e['signal']}, conf={e['confidence']:.0%}, "
             f"composite={e.get('composite_score', 0):.2f}, "
-            f"MOS={e.get('margin_of_safety', 0):.0%}): {e['thesis_text']}"
+            f"MOS={e.get('margin_of_safety', 0):.0%}, {_tga_str(e)}): {e['thesis_text']}"
             for e in todays
         )
 
@@ -3054,9 +3096,21 @@ def _run_thesis_analysis() -> None:
             "such signal exists here. In your output always write the full name 'Three Green "
             "Arrows' and NEVER the strings 'TGA liquidity', 'Treasury', or 'macro liquidity'. "
             "'TGA' or 'N/3' ALWAYS refers to Three Green Arrows.\n"
+            "- Each ticker line below includes its REAL Three Green Arrows count as 'TGA=N/3'. "
+            "When you reference arrow counts you MUST use these exact values (or 'n/a' if shown) — "
+            "never estimate, round, or assume a count. If every listed ticker shows the same "
+            "count, you may say so, but only because the data below confirms it.\n"
             "- Thresholds: composite >= 0.15 => BUY, >= 0.50 => STRONG_BUY. A BUY without momentum "
             "or insider support is downgraded to WATCH, and >=1/3 Three Green Arrows (or positive "
             "margin of safety) is already required as a confirmation gate.\n"
+            "- GATES THAT ALREADY EXIST (do NOT recommend adding these — they are live): the "
+            "confirmation gate above (>=1/3 Three Green Arrows OR positive margin of safety), the "
+            "WATCH downgrade for BUYs lacking momentum/insider support, a VIX regime hard gate, "
+            "ATR-based stop losses, and a 2-hour minimum hold. Any recommendation must be a NEW "
+            "action or a specific parameter change to an existing gate (e.g. 'raise the confirmation "
+            "requirement to 2/3'), NOT a proposal to introduce a gate that is already running. If "
+            "you cannot identify a genuinely new action, recommend 'no change — wait for "
+            "confirmation' instead of restating an existing rule.\n"
             "- Reference only the tickers and numbers listed below.\n\n"
         )
 
@@ -3069,7 +3123,9 @@ def _run_thesis_analysis() -> None:
                 f"Write a concise end-of-day note on this lone signal covering three points:\n"
                 f"1. The core narrative driving the {only['ticker']} thesis.\n"
                 f"2. The main risk factor to watch.\n"
-                f"3. One actionable recommendation for the trading system operator.\n\n"
+                f"3. One actionable recommendation for the trading system operator — it must be "
+                f"a NEW action or a specific change to an existing gate, not a restatement of a "
+                f"gate that already exists.\n\n"
                 f"Plain prose only. No markdown, no bullets, no disclaimers. "
                 f"3 sentences max — one per point. Reference {only['ticker']} and its scores. "
                 f"Start directly with point 1."
@@ -3083,7 +3139,9 @@ def _run_thesis_analysis() -> None:
                 f"1. Recurring sector or ticker themes (what narratives dominated today's signals).\n"
                 f"2. Common risk factors mentioned across multiple theses.\n"
                 f"3. A market-wide observation implied by the collective signal set.\n"
-                f"4. One or two actionable recommendations for the trading system operator.\n\n"
+                f"4. One or two actionable recommendations for the trading system operator — each "
+                f"must be a NEW action or a specific change to an existing gate (cite the current "
+                f"value and the proposed value), not a restatement of a gate that already exists.\n\n"
                 f"Plain prose only. No markdown, no bullets, no disclaimers. "
                 f"4 sentences max — one per point. Reference actual tickers and scores. "
                 f"Start directly with point 1."
