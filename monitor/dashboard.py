@@ -16,7 +16,7 @@ Endpoints:
 import os
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import pytz
 
@@ -55,7 +55,7 @@ except Exception as _exc:
     _lg.warning(f"[DASHBOARD] Sentinel/entanglement runners failed to start: {_exc}")
 
 # ── Mount signals dashboard under /signals ────────────────────────────────────
-from monitor.signals_dashboard import app as _signals_app, _latest_signals as _get_live_signals
+from monitor.signals_dashboard import app as _signals_app
 app.mount("/signals", _signals_app)
 
 PAUSE_FLAG  = ROOT / "data" / "paused.flag"
@@ -244,7 +244,7 @@ def _append_thesis_log(entry: dict) -> None:
             existing = []
             if _THESIS_LOG_PATH.exists():
                 try:
-                    existing = _j.loads(_THESIS_LOG_PATH.read_text())
+                    existing = _j.loads(_THESIS_LOG_PATH.read_text(encoding="utf-8"))
                 except Exception:
                     existing = []
             # Drop any prior entry for the same ticker on the same ET day.
@@ -257,7 +257,7 @@ def _append_thesis_log(entry: dict) -> None:
                             and _et_date(e.get("generated_at_utc", "")) == new_day)
                 ]
             existing.append(entry)
-            _THESIS_LOG_PATH.write_text(_j.dumps(existing, indent=2))
+            _THESIS_LOG_PATH.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
         except Exception as exc:
             import logging as _lg
             _lg.getLogger(__name__).warning(f"[ThesisLog] append failed: {exc}")
@@ -268,7 +268,7 @@ def _load_thesis_analysis() -> dict | None:
     import json as _j
     try:
         if _THESIS_ANALYSIS_PATH.exists():
-            data = _j.loads(_THESIS_ANALYSIS_PATH.read_text())
+            data = _j.loads(_THESIS_ANALYSIS_PATH.read_text(encoding="utf-8"))
             if data:
                 return data[0]  # newest first
     except Exception:
@@ -284,11 +284,15 @@ def _save_thesis_analysis(entry: dict) -> None:
         existing = []
         if _THESIS_ANALYSIS_PATH.exists():
             try:
-                existing = _j.loads(_THESIS_ANALYSIS_PATH.read_text())
+                existing = _j.loads(_THESIS_ANALYSIS_PATH.read_text(encoding="utf-8"))
             except Exception:
                 existing = []
+        # Replace any prior entry for the same date — a manual trigger plus the
+        # scheduled run on the same day would otherwise create duplicate rows.
+        entry_date = entry.get("date")
+        existing = [e for e in existing if e.get("date") != entry_date]
         existing.insert(0, entry)
-        _THESIS_ANALYSIS_PATH.write_text(_j.dumps(existing, indent=2))
+        _THESIS_ANALYSIS_PATH.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
     except Exception as exc:
         import logging as _lg
         _lg.getLogger(__name__).warning(f"[ThesisAnalysis] save failed: {exc}")
@@ -731,7 +735,6 @@ def api_signals():
 @app.post("/api/signals/synthesize")
 async def api_signals_synthesize(request: Request):
     """Accepts {"ids": [1,2,3]} (max 5). Returns {"1": "synthesis text", ...}. Caches permanently."""
-    import json as _j
     api_key = config.brief.anthropic_api_key
     if not api_key:
         return JSONResponse({"error": "no_api_key"})
@@ -2981,7 +2984,7 @@ def _run_thesis_analysis() -> None:
     """
     Read today's thesis log entries (ET date), call Claude Haiku to identify
     patterns, persist result to data/thesis_analysis.json.
-    Runs in a background thread — scheduled at 16:10 ET or triggered manually.
+    Runs in a background thread — scheduled at/after 16:45 ET or triggered manually.
     """
     global _thesis_analysis_running
     if _thesis_analysis_running:
@@ -3001,7 +3004,7 @@ def _run_thesis_analysis() -> None:
 
         today_et = datetime.now(_ET).date()
         try:
-            all_entries = _j.loads(_THESIS_LOG_PATH.read_text())
+            all_entries = _j.loads(_THESIS_LOG_PATH.read_text(encoding="utf-8"))
         except Exception as exc:
             _log.warning(f"[ThesisAnalysis] Could not read thesis log: {exc}")
             return
@@ -3020,7 +3023,7 @@ def _run_thesis_analysis() -> None:
                 continue
 
         if len(todays) < 1:
-            _log.info(f"[ThesisAnalysis] No theses today — need ≥1, skipping")
+            _log.info("[ThesisAnalysis] No theses today — need ≥1, skipping")
             return
 
         # Collapse to one entry per ticker (highest composite). A ticker that
@@ -3241,7 +3244,7 @@ def api_thesis_analysis():
 
 @app.post("/api/thesis/analysis/trigger")
 def api_thesis_analysis_trigger():
-    """Manual trigger — for testing without waiting for 16:10 ET."""
+    """Manual trigger — for testing without waiting for 16:45 ET."""
     if _thesis_analysis_running:
         return {"status": "already_running"}
     threading.Thread(target=_run_thesis_analysis, daemon=True,
@@ -4695,7 +4698,6 @@ def api_daily_activity(date: str = ""):
     Return all paper trades across all 4 models for a given date (YYYY-MM-DD).
     Defaults to today (ET).
     """
-    import json as _j
     from datetime import date as _date, timedelta
     import pytz
     ET = pytz.timezone("America/New_York")
@@ -5381,7 +5383,7 @@ _STAGEGATE_FILE = "data/stagegate.json"
 
 def _load_stagegate() -> dict:
     """Load stage gate state; seed Stage 1 from signals if first run."""
-    import json, os
+    import json
     from pathlib import Path
     if Path(_STAGEGATE_FILE).exists():
         try:
@@ -5394,7 +5396,7 @@ def _load_stagegate() -> dict:
 
 
 def _save_stagegate(data: dict):
-    import json, os
+    import json
     from pathlib import Path
     os.makedirs("data", exist_ok=True)
     with open(_STAGEGATE_FILE, "w", encoding="utf-8") as f:
@@ -5439,7 +5441,7 @@ def api_stagegate_get():
 
 @app.post("/api/stagegate")
 async def api_stagegate_save(request: Request):
-    import json, threading
+    import threading
     body = await request.json()
     stage1 = body.get("stage1", [])
     stage2 = body.get("stage2", [])
@@ -5862,13 +5864,21 @@ async def _schedule_morning_brief():
                                      name="thesis-morning-recap").start()
                     _slog.info("[ThesisAnalysis] Morning recap sent at 08:00 ET")
 
-                # Market-close pattern analysis — 16:45 ET (theses finish generating ~16:35)
+                # Market-close pattern analysis — fires at/after 16:45 ET (theses finish
+                # generating ~16:35). Uses an at-or-after guard plus a same-day existence
+                # check so a dashboard that was down at 16:45 still runs the analysis when
+                # it comes back up later, without regenerating one already produced today.
                 key_close = (now.date(), "thesis_analysis")
-                if now.hour == 16 and now.minute == 45 and key_close not in fired_today:
-                    fired_today.add(key_close)
-                    threading.Thread(target=_run_thesis_analysis, daemon=True,
-                                     name="thesis-analysis").start()
-                    _slog.info("[ThesisAnalysis] Auto-analysis triggered at 16:45 ET")
+                after_close = now.hour > 16 or (now.hour == 16 and now.minute >= 45)
+                if after_close and key_close not in fired_today:
+                    fired_today.add(key_close)   # check once per session, not every 30s
+                    _existing = _load_thesis_analysis()
+                    if _existing and _existing.get("date") == str(now.date()):
+                        _slog.info("[ThesisAnalysis] Already analysed today — skipping catch-up")
+                    else:
+                        threading.Thread(target=_run_thesis_analysis, daemon=True,
+                                         name="thesis-analysis").start()
+                        _slog.info(f"[ThesisAnalysis] Auto-analysis triggered ({now.strftime('%H:%M')} ET)")
                 # Prune old keys daily
                 today = now.date()
                 fired_today = {k for k in fired_today if k and k[0] == today}
@@ -9124,7 +9134,6 @@ def api_pipeline_restore_point():
     Snapshot the DB and key JSON data files to backups/<timestamp>/.
     Returns list of files saved.
     """
-    import time as _t
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = ROOT / "backups" / ts
     backup_dir.mkdir(parents=True, exist_ok=True)
