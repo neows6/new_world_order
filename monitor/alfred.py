@@ -17,7 +17,7 @@ import json
 import math
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -804,7 +804,7 @@ def _compute_forecast_for_symbol(sym: str,
         f"Total directional bias (clamped ±ATR) = {total_bias:+.2f} pts",
         "Calibration multipliers: " + ", ".join(
             f"D{k}={calib.get(k, 1.0):.3f}" for k in range(1, 6)),
-        f"Range formula: ATR × √N × VIX_mult × calib  (N = trading days ahead)",
+        "Range formula: ATR × √N × VIX_mult × calib  (N = trading days ahead)",
     ]
 
     return {
@@ -1333,7 +1333,6 @@ def _build_alfred_html(forecast: dict, anchor: dict, backtest: dict) -> str:
             mult_val = CONTRACT_MULTIPLIERS.get(sym, 50)
             sigma_pct = round(opts.get("sigma_annual", 0) * 100, 1)
             sig_src   = opts.get("sigma_source", "VIX")
-            below_150_syms = []
 
             def _prem_cell(info: dict, side: str) -> str:
                 usd  = info.get("premium_$", 0)
@@ -1348,7 +1347,6 @@ def _build_alfred_html(forecast: dict, anchor: dict, backtest: dict) -> str:
                     col   = "#f85149"
                     n_ct  = max(2, math.ceil(150 / usd)) if usd > 0 else "?"
                     badge = f" <span style='font-size:9px;'>({n_ct}&times;)</span>"
-                txt_col = "#58a6ff" if side == "call" else "#f85149"
                 return (f'<td style="color:{col};font-weight:700;">'
                         f'${usd:,}{badge}'
                         f'<br><span style="color:#8b949e;font-weight:400;font-size:10px;">{pts:.1f}pts</span>'

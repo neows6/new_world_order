@@ -92,11 +92,11 @@ class AnalysisReport:
     def summary(self) -> str:
         """Human-readable one-page summary."""
         lines = [
-            f"═══════════════════════════════════════════════",
+            "═══════════════════════════════════════════════",
             f"  {self.ticker} — {self.company_name}",
             f"  Analyzed: {self.analyzed_at}",
-            f"═══════════════════════════════════════════════",
-            f"",
+            "═══════════════════════════════════════════════",
+            "",
             f"MOAT: {self.moat_strength.upper()} (score: {self.moat_score:.2f})",
             f"  Types: {', '.join(self.moat_types) or 'none detected'}",
         ]
@@ -106,7 +106,7 @@ class AnalysisReport:
             lines.append(f"  ⚠ {w}")
 
         lines += [
-            f"",
+            "",
             f"FUNDAMENTALS (FY{self.latest_year}):",
             f"  Revenue:          ${(self.revenue or 0)/1e9:.2f}B",
             f"  Gross Margin:     {(self.gross_margin or 0):.1%}",
@@ -115,15 +115,15 @@ class AnalysisReport:
             f"  Owner Earnings:   ${(self.owner_earnings or 0)/1e9:.2f}B",
             f"  FCF:              ${(self.free_cash_flow or 0)/1e9:.2f}B",
             f"  Net Debt/EBITDA:  {self.net_debt_to_ebitda:.2f}x" if self.net_debt_to_ebitda else "  Net Debt/EBITDA:  N/A",
-            f"",
-            f"VALUATION:",
+            "",
+            "VALUATION:",
             f"  Current Price:    ${self.current_price:.2f}" if self.current_price else "  Current Price:    N/A",
             f"  IV (Conservative): ${self.intrinsic_value_conservative:.2f}" if self.intrinsic_value_conservative else "  IV (Conservative): N/A",
             f"  IV (Base):         ${self.intrinsic_value_base:.2f}" if self.intrinsic_value_base else "  IV (Base):         N/A",
             f"  Margin of Safety:  {self.margin_of_safety:.1%}" if self.margin_of_safety is not None else "  Margin of Safety:  N/A",
-            f"",
+            "",
             f"  DCF Bear: ${self.dcf_bear_iv:.2f}  |  Base: ${self.dcf_base_iv:.2f}  |  Bull: ${self.dcf_bull_iv:.2f}" if all([self.dcf_bear_iv, self.dcf_base_iv, self.dcf_bull_iv]) else "",
-            f"",
+            "",
             f"VERDICT: {'✅ INVESTABLE' if self.is_investable else '❌ NOT INVESTABLE'}",
         ]
         for r in self.investable_reasons:

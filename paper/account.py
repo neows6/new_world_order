@@ -5,8 +5,7 @@ Persists to data/paper_trading.db (separate from the main trading DB).
 Tracks cash, positions, trade history, and daily equity snapshots for P&L charts.
 """
 
-from datetime import datetime, timezone, date
-from typing import Optional
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,

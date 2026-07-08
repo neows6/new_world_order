@@ -21,7 +21,7 @@ Moat types (Porter / Morningstar framework):
   - NONE              : Commodity business, no moat
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -131,7 +131,7 @@ class MoatDetector:
         elif pct_above >= 0.50:
             signal = f"ROIC above WACC in {pct_above:.0%} of years — moderate value creation"
         else:
-            signal = f"ROIC below WACC in majority of years — value destruction risk"
+            signal = "ROIC below WACC in majority of years — value destruction risk"
 
         return {
             "above_count": len(above),

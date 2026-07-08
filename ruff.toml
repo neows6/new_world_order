@@ -1,0 +1,23 @@
+# Ruff lint config for the New World Order trading system.
+# Default rule set is pyflakes (F) + pycodestyle errors (E) — correctness over style.
+
+# Runtime interpreter is CPython 3.14 (nested-quote f-strings require 3.12+).
+target-version = "py313"
+line-length = 120
+
+# Directories and files that are not importable modules / not our source.
+extend-exclude = [
+    "data",
+    "backups",
+    "logs",
+    "tokens",
+    "docs",
+    "__pycache__",
+    # Code *snippets* meant to be pasted into other files — not valid standalone modules.
+    "**/wheel_market_data_patch.py",
+    "scripts/archive",
+]
+
+[lint]
+# Keep the focus on real problems, not whole-codebase style churn.
+select = ["F", "E9"]

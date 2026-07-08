@@ -27,7 +27,6 @@ import requests
 from loguru import logger
 
 from config import config
-from fud.sources import classify_source_from_url
 
 
 @dataclass

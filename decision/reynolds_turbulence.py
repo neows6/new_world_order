@@ -40,7 +40,6 @@ PRACTICAL IMPLICATION:
 ═══════════════════════════════════════════════════════════════════════
 """
 
-import math
 import statistics
 from dataclasses import dataclass
 from typing import Optional

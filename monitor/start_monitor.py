@@ -31,8 +31,8 @@ def main():
 
     print(f"\n  NWO Monitor starting on http://0.0.0.0:{args.port}")
     print(f"  Local:   http://localhost:{args.port}")
-    print(f"  Network: find your IP via `ipconfig` > IPv4 Address")
-    print(f"  Press Ctrl+C to stop.\n")
+    print("  Network: find your IP via `ipconfig` > IPv4 Address")
+    print("  Press Ctrl+C to stop.\n")
 
     # Kill any process already holding the port
     import subprocess, os

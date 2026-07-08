@@ -24,6 +24,7 @@ API: https://data.sec.gov/api/xbrl/ (same EDGAR client from Layer 1)
 
 import json
 import time
+import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional

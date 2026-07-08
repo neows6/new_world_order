@@ -96,7 +96,6 @@ class SchwabMarketData:
         Fetch historical OHLCV data for a ticker.
         Returns list of dicts: {date, open, high, low, close, volume}
         """
-        import schwab
 
         client = self._get_client()
         end_dt = datetime.now()

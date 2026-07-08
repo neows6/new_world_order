@@ -24,14 +24,14 @@ It CANNOT override Layer 4's NO-GO decision.
 """
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 
 from config import config
-from models.database import init_db, Company, PriceHistory, TradeLog
+from models.database import Company, PriceHistory, TradeLog
 from decision.engine import DecisionResult
 from risk.behavioral_psychology import BehavioralPsychologyEngine, BehavioralPsychologyResult
 
@@ -101,10 +101,10 @@ class RiskAssessment:
             f"{'╔' + '═'*62 + '╗'}",
             f"║  LAYER 5 RISK MANAGER — {self.ticker:<35}║",
             f"{'╚' + '═'*62 + '╝'}",
-            f"",
+            "",
             f"  {status} — {self.action}",
-            f"",
-            f"FINAL POSITION:",
+            "",
+            "FINAL POSITION:",
             f"  Shares:    {self.final_shares}",
             f"  Amount:    ${self.final_dollar_amount:,.2f} ({self.final_position_pct:.1%})",
             f"  Entry:     ${self.entry_price:.2f}" if self.entry_price else "  Entry: N/A",
@@ -114,18 +114,18 @@ class RiskAssessment:
             f"  Target 3:  ${self.take_profit_3:.2f}" if self.take_profit_3 else "  T3: N/A",
             f"  R/R:       {self.risk_reward_ratio:.1f}:1" if self.risk_reward_ratio else "  R/R: N/A",
             f"  Max Risk:  ${self.dollar_risk:.2f}" if self.dollar_risk else "  Max Risk: N/A",
-            f"",
-            f"HUMAN NATURE ANALYSIS:",
+            "",
+            "HUMAN NATURE ANALYSIS:",
             f"  Bias:      {self.dominant_human_bias.replace('_', ' ')}",
             f"  Timing:    {self.entry_timing.upper()}",
             f"  Score:     {self.behavioral_score:+.2f}",
             f"  Edge:      {self.human_edge[:80]}",
-            f"",
-            f"PORTFOLIO EXPOSURE:",
+            "",
+            "PORTFOLIO EXPOSURE:",
             f"  Current:   {self.current_portfolio_exposure_pct:.1%}",
             f"  After trade: {self.new_total_exposure_pct:.1%}",
             f"  Within limits: {'✓' if self.exposure_within_limits else '✗'}",
-            f"",
+            "",
         ]
 
         if self.risk_warnings:
@@ -219,12 +219,6 @@ class RiskManager:
         lows   = [r.low for r in records if r.low]
         vols   = [r.volume for r in records if r.volume]
 
-        # Compute 52-week metrics
-        if len(closes) >= 252:
-            year_closes = closes[-252:]
-        else:
-            year_closes = closes
-
         high_52w = max(highs[-252:]) if len(highs) >= 252 else (max(highs) if highs else closes[-1])
         low_52w  = min(lows[-252:]) if len(lows) >= 252 else (min(lows) if lows else closes[-1])
 
@@ -259,7 +253,6 @@ class RiskManager:
         (Everyone else puts stops AT round numbers, so they get swept.)
         """
         round_below = behavioral.round_number.nearest_round_below
-        round_above = behavioral.round_number.nearest_round_above
 
         # If the raw stop is within 1% of a round number, move it just below
         # to avoid the stop-sweep zone

@@ -33,7 +33,7 @@ Extension levels (profit targets):
 """
 
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
 
@@ -234,11 +234,9 @@ class FibonacciAnalyzer:
             if is_uptrend:
                 # Price retracing down from high toward low
                 price = swing_high - (ratio * swing_range)
-                is_support = True
             else:
                 # Price retracing up from low toward high
                 price = swing_low + (ratio * swing_range)
-                is_support = False
 
             levels.append(FibLevel(
                 ratio=ratio, price=price, weight=weight, swing_from=label
@@ -276,7 +274,6 @@ class FibonacciAnalyzer:
             score = sum(l.weight for l in zone_levels)
 
             # Golden zone bonus
-            midpoint = (price_low + price_high) / 2
             in_golden = False
             if zone_levels:
                 ratios = [l.ratio for l in zone_levels]
@@ -316,7 +313,6 @@ class FibonacciAnalyzer:
 
         # Find nearest support zone below current price
         support_zones = [z for z in confluence_zones if z.price_high < current_price]
-        resistance_zones = [z for z in confluence_zones if z.price_low > current_price]
 
         # Is price IN a confluence zone right now?
         at_zone = [z for z in confluence_zones

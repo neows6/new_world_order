@@ -41,7 +41,7 @@ from decision.engine import DecisionEngine
 from risk.manager import RiskManager
 from broker.market_data import SchwabMarketData
 
-from paper.account import init_paper_db, PaperPosition
+from paper.account import PaperPosition
 from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS, DEFAULT_STAGE2_TICKERS
 
 # Base buy threshold (must match signals/aggregator.py BUY_THRESHOLD)
@@ -180,7 +180,6 @@ def _get_stage2_tickers(stagegate_file: str = "data/stagegate.json") -> list:
         try:
             sg = json.loads(shared.read_text(encoding="utf-8"))
             stage2 = sg.get("stage2", [])
-            stage3 = sg.get("stage3", [])
             if stage2:
                 logger.info(f"Stage Gate: running AI on {len(stage2)} Stage 2 tickers: {stage2}")
                 return stage2

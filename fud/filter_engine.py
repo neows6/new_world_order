@@ -28,17 +28,16 @@ FUD attack detection:
 """
 
 import statistics
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 
 from config import config
 from models.database import Company, Fundamental, NewsItem
-from fud.sources import get_source_profile
-from fud.classifier import FUDClassifier, ArticleScore
-from fud.news_fetcher import NewsFetcher, RawArticle
+from fud.classifier import FUDClassifier
+from fud.news_fetcher import NewsFetcher
 from signals.aggregator import AggregatedSignal
 
 
@@ -116,19 +115,19 @@ class Layer3Result:
             f"{'═'*58}",
             f"  LAYER 3 — FUD FILTER: {self.ticker}",
             f"{'═'*58}",
-            f"",
+            "",
             f"INCOMING SIGNAL: {self.incoming_signal.signal.upper()} "
             f"(composite={self.incoming_signal.composite_score:+.2f})",
-            f"",
-            f"NEWS QUALITY ANALYSIS:",
+            "",
+            "NEWS QUALITY ANALYSIS:",
             f"  Articles analyzed:  {self.fud_analysis.total_articles}",
             f"  Quality signals:    {self.fud_analysis.quality_articles} "
             f"({self.fud_analysis.quality_signal_ratio:.0%})",
             f"  FUD articles:       {self.fud_analysis.fud_articles}",
             f"  Avg quality score:  {self.fud_analysis.avg_fud_score:.2f}",
             f"  Weighted sentiment: {self.fud_analysis.weighted_sentiment:+.2f}",
-            f"",
-            f"PRIMARY SOURCE CHECK:",
+            "",
+            "PRIMARY SOURCE CHECK:",
             f"  Recent 10-K: {'✓' if self.fud_analysis.has_recent_10k else '✗'}",
             f"  Recent 10-Q: {'✓' if self.fud_analysis.has_recent_10q else '✗'}",
             f"  Recent 8-K:  {'✓' if self.fud_analysis.has_recent_8k else '✗'}",
@@ -139,30 +138,30 @@ class Layer3Result:
 
         if self.fud_analysis.fud_attack_detected:
             lines += [
-                f"",
+                "",
                 f"  ⚠️  FUD ATTACK DETECTED: {self.fud_analysis.fud_attack_reason}",
             ]
 
         lines += [
-            f"",
+            "",
             f"SIGNAL ADJUSTMENT: {self.fud_analysis.signal_adjustment:+.2f}",
             f"  Reason: {self.fud_analysis.adjustment_reason}",
-            f"",
+            "",
             f"FINAL SIGNAL: {self.adjusted_signal.upper()} "
             f"(composite={self.adjusted_composite_score:+.2f}, "
             f"confidence={self.final_confidence:.0%})",
-            f"",
+            "",
             f"GATE: {'✅ PROCEED' if self.proceed_to_execution else '❌ BLOCKED'}",
             f"  {self.gate_reason}",
         ]
 
         if self.fud_analysis.top_quality_articles:
-            lines.append(f"\nTOP QUALITY SIGNALS:")
+            lines.append("\nTOP QUALITY SIGNALS:")
             for a in self.fud_analysis.top_quality_articles[:2]:
                 lines.append(f"  [{a.source_profile.name}] {a.headline[:70]}")
 
         if self.fud_analysis.top_fud_articles:
-            lines.append(f"\nFUD DETECTED (excluded):")
+            lines.append("\nFUD DETECTED (excluded):")
             for a in self.fud_analysis.top_fud_articles[:2]:
                 lines.append(f"  [{a.source_profile.name}] {a.headline[:70]}")
 

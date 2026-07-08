@@ -105,7 +105,6 @@ def _deterministic_check(ticker: str, fundamentals_by_year: dict,
     # Fundamentals per-year checks
     bad_margin_years = []
     bad_roic_years   = []
-    bad_owner_earnings_years = []
     prev_revenue = None
     revenue_drops = []
     owner_earnings_signs = []

@@ -12,8 +12,7 @@ Usage:
 import argparse
 import sys
 import os
-from datetime import datetime, date
-from typing import Optional
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -122,7 +121,7 @@ def run_gate_breakdown(ticker: str, Session) -> None:
     from decision.engine import DecisionEngine
     from decision.reynolds_turbulence import ReynoldsMarketAnalyzer
     from decision.quantum_kalman import QuantumStateAnalyzer, KalmanPriceFilter
-    from decision.ensemble_kelly import EnsembleKellyEngine, ENSEMBLE_WEIGHTS
+    from decision.ensemble_kelly import EnsembleKellyEngine
 
     # ── Load price data ───────────────────────────────────────────
     with Session() as session:

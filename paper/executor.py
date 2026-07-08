@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy.orm import Session as SASession
 
 from risk.manager import RiskAssessment
 from paper.account import init_paper_db, PaperAccount, PaperPosition, PaperTrade, PaperEquitySnapshot
@@ -233,7 +232,7 @@ class PaperExecutor:
             daily_pnl_pct = 0.0
             try:
                 from paper.account import PaperEquitySnapshot
-                from datetime import date as _date, datetime as _dt
+                from datetime import date as _date
                 today = _date.today()
                 snap = (
                     s.query(PaperEquitySnapshot)

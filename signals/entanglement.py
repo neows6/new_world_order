@@ -48,7 +48,7 @@ import statistics
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -159,7 +159,6 @@ class EntanglementEngine:
 
         # Recent correlation window (last `window` returns)
         # Historical correlation window (the `window` returns ending `lookback` days ago)
-        all_pairs = []
         deltas    = []
         pair_data = []
 

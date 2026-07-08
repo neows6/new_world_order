@@ -15,7 +15,6 @@ import os
 import sys
 import argparse
 
-import httpx
 from dotenv import load_dotenv
 from loguru import logger
 

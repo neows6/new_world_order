@@ -10,7 +10,7 @@ so the regular 5-min pipeline picks them up immediately.
 
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 

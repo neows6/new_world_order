@@ -30,11 +30,11 @@ from loguru import logger
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import config
-from models.database import init_db, Company, PriceHistory, Fundamental, NewsItem
+from models.database import init_db, Company, PriceHistory, Fundamental
 from signals.fft_cycles import FFTCycleDetector, FFTResult
 from signals.fibonacci import FibonacciAnalyzer, FibResult
 from signals.market_microstructure import VWAPCalculator, VolumeProfileAnalyzer, VIXRegimeDetector
-from signals.momentum import MomentumAnalyzer, MomentumResult
+from signals.momentum import MomentumAnalyzer
 
 
 # Signal weights — must match aggregator.py
@@ -201,7 +201,7 @@ def run_ticker_diagnostic(session, ticker: str, as_of: date) -> dict:
     vwap_calc = VWAPCalculator()
     vol_an    = VolumeProfileAnalyzer()
     mom_an    = MomentumAnalyzer()
-    vix_det   = VIXRegimeDetector()
+    vix_det   = VIXRegimeDetector()  # noqa: F841  # kept for future use
 
     result = {"ticker": ticker, "as_of": as_of, "error": None}
 
@@ -312,7 +312,7 @@ def print_report(results: list, as_of: date, show_gates: bool):
     print()
     print("╔" + "═" * W + "╗")
     print(f"║  BACKTEST SIGNAL DIAGNOSTIC — {as_of}" + " " * (W - 35) + "║")
-    print(f"║  (data from DB as-of this date; insider score excluded)" + " " * (W - 55) + "║")
+    print("║  (data from DB as-of this date; insider score excluded)" + " " * (W - 55) + "║")
     print("╠" + "═" * W + "╣")
 
     for r in results:
@@ -334,7 +334,7 @@ def print_report(results: list, as_of: date, show_gates: bool):
 
         # Score table
         print(f"  {'─'*68}")
-        print(f"  SCORE BREAKDOWN:")
+        print("  SCORE BREAKDOWN:")
         print(f"    {'Signal':<18} {'Raw Score':>10}  {'Old contrib':>12}  {'New contrib':>12}")
         print(f"    {'──────':<18} {'─────────':>10}  {'───────────':>12}  {'───────────':>12}")
         rows = [
@@ -348,7 +348,7 @@ def print_report(results: list, as_of: date, show_gates: bool):
         for name, raw, ow, nw in rows:
             print(f"    {name:<18} {raw:>+10.3f}  {raw*ow:>+12.3f}  {raw*nw:>+12.3f}")
         print(f"    {'TOTAL':<18} {'':>10}  {r['old_composite']:>+12.3f}  {r['new_composite']:>+12.3f}")
-        print(f"    * Insider not computed in diagnostic (requires live EDGAR fetch)")
+        print("    * Insider not computed in diagnostic (requires live EDGAR fetch)")
 
         # Momentum detail
         mom = r.get("mom")
@@ -374,7 +374,7 @@ def print_report(results: list, as_of: date, show_gates: bool):
             fund = r.get("fund")
 
             print(f"  {'─'*68}")
-            print(f"  GATE DETAIL:")
+            print("  GATE DETAIL:")
 
             if fund:
                 roic_str = f"ROIC={fund.roic:.1%}" if fund.roic else "ROIC=n/a"
@@ -386,17 +386,17 @@ def print_report(results: list, as_of: date, show_gates: bool):
                 gz = " [GOLDEN ZONE]" if fib.in_golden_zone else ""
                 print(f"    Fibonacci:   signal={fib.entry_signal}  conf={fib.confluence_score:.2f}{gz}")
             else:
-                print(f"    Fibonacci:   insufficient data")
+                print("    Fibonacci:   insufficient data")
 
             if vwap:
                 print(f"    VWAP:        ${vwap.vwap:.2f}  price {vwap.position} VWAP  slope={vwap.vwap_slope}  bias={vwap.institutional_bias}")
             else:
-                print(f"    VWAP:        insufficient data")
+                print("    VWAP:        insufficient data")
 
             if fft and fft.signal_strength >= 0.3:
                 print(f"    FFT Cycle:   phase={fft.current_cycle_phase}  strength={fft.signal_strength:.2f}  score={r['c_score']:+.3f}")
             else:
-                print(f"    FFT Cycle:   weak/noisy signal (strength < 0.3) → neutral")
+                print("    FFT Cycle:   weak/noisy signal (strength < 0.3) → neutral")
 
             if vol:
                 print(f"    Vol Profile: POC=${vol.point_of_control:.2f}  RVOL={vol.rvol:.2f}×  in_VA={vol.price_in_value_area}")

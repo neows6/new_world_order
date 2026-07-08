@@ -153,7 +153,7 @@ class TradingViewSignalFetcher:
             TVSignalResult or None if tradingview-ta not installed / network error.
         """
         try:
-            from tradingview_ta import TA_Handler, Interval, Exchange
+            from tradingview_ta import TA_Handler, Interval
         except ImportError:
             logger.debug("[TV] tradingview-ta not installed — run: pip install tradingview-ta")
             return None

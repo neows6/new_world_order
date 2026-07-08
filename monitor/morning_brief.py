@@ -17,12 +17,11 @@ Falls back to raw data display if Claude key is not set.
 
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import feedparser
-import requests
 import yfinance as yf
 from loguru import logger
 

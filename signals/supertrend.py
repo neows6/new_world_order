@@ -13,7 +13,6 @@ exit context — i.e., where past pivots occurred in confirmed trend runs.
 
 from dataclasses import dataclass, field
 from typing import Optional
-import math
 
 from loguru import logger
 

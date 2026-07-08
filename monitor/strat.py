@@ -18,7 +18,6 @@ Routes:
 
 import json
 import threading
-import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -125,7 +124,6 @@ def _compute_symbol(sym: str, yf_ticker: str) -> dict:
     if prices is None or len(prices) < 5:
         return {"error": "no_data", "downside": {"occurrences": []}, "upside": {"occurrences": []}}
 
-    import pandas as pd
 
     prices_idx  = prices.index.date   # numpy array of date objects
     is_index    = sym in INDEX_SYMBOLS

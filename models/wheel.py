@@ -14,8 +14,7 @@ To wire into dashboard.py:
 
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
-import json, time, threading
-from datetime import date, timedelta
+import time, threading
 from typing import Optional
 
 # ── lazy import so module loads even if broker isn't on path yet ──────────

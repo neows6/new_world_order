@@ -77,8 +77,7 @@ Seven quantifiable human psychological forces we detect:
 """
 
 import statistics
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
 
@@ -457,7 +456,7 @@ class BehavioralPsychologyEngine:
         intensely than equivalent gains.
         """
         notes = []
-        alpha = beta = 0.88   # Prospect theory curvature parameters
+        alpha = 0.88   # Prospect theory curvature parameters
         lam = LOSS_AVERSION_LAMBDA   # 2.25
 
         gain_loss_pct = (current_price - reference_price) / reference_price if reference_price > 0 else 0

@@ -18,7 +18,7 @@ from typing import Optional
 from loguru import logger
 
 from config import config
-from models.database import init_db, TradeLog, TradeSignal, Company
+from models.database import init_db, TradeLog, TradeSignal
 from risk.manager import RiskAssessment
 from monitor.telegram_bot import send_alert
 
@@ -60,7 +60,6 @@ class SchwabExecutor:
         Returns dict with order_id and status.
         action: "BUY" or "SELL"
         """
-        import schwab
         from schwab.orders.equities import equity_buy_market, equity_sell_market
 
         client = self._get_client()

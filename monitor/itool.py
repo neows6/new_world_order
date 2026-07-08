@@ -19,7 +19,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import requests
 import yfinance as yf
 from loguru import logger
 

@@ -195,7 +195,7 @@ class TipRanksClient:
             try:
                 results[ticker] = self.get_stock_data(ticker)
                 time.sleep(delay)
-            except PermissionError as e:
+            except PermissionError:
                 logger.warning(f"[TipRanks] 403 on {ticker} — waiting 60s then retrying once")
                 time.sleep(60)
                 try:

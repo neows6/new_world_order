@@ -167,7 +167,7 @@ class ThreeGreenArrowsAnalyzer:
             if sma_arrow:
                 parts.append(f"SMA(30)^ ({price:.2f}>{sma_now:.2f})")
             elif sma_above:
-                parts.append(f"above SMA(30)")
+                parts.append("above SMA(30)")
             if macd_arrow:
                 parts.append(f"MACD hist^0 ({macd_hist:+.3f})")
             elif macd_positive:

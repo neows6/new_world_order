@@ -19,10 +19,9 @@ Signal weighting (research-backed priorities):
 VIX regime is a GATE not a weight — it scales the final position size.
 """
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
-import json
 
 from loguru import logger
 
@@ -32,8 +31,8 @@ from signals.fft_cycles import FFTResult
 from signals.fibonacci import FibResult
 from signals.insider_flow import InsiderSignalResult
 from signals.market_microstructure import VWAPResult, VolumeProfileResult, VIXRegime
-from signals.momentum import MomentumAnalyzer, MomentumResult
-from signals.supertrend import SuperTrendAnalyzer, SuperTrendResult
+from signals.momentum import MomentumResult
+from signals.supertrend import SuperTrendResult
 from signals.tipranks_signal import TipRanksResult
 from signals.three_green_arrows import ThreeGreenArrowsResult
 
@@ -367,7 +366,7 @@ class SignalAggregator:
 
         if fib:
             if fib.in_golden_zone:
-                why_buy.append(f"Price at Golden Zone (61.8% Fibonacci) — highest probability reversal")
+                why_buy.append("Price at Golden Zone (61.8% Fibonacci) — highest probability reversal")
             if fib.rsi_divergence:
                 why_buy.append("RSI bullish divergence at Fibonacci support — timing confirmation")
             if fib.trend_direction == "ranging":
@@ -385,7 +384,7 @@ class SignalAggregator:
             if fft.current_cycle_phase in ("trough_recovering",):
                 why_buy.append(f"FFT: At cycle trough in {fft.nearest_known_cycle}-day cycle — timing favorable")
             elif fft.current_cycle_phase in ("peak_forming", "falling"):
-                why_wait.append(f"FFT: Near cycle peak — wait for pullback before entering")
+                why_wait.append("FFT: Near cycle peak — wait for pullback before entering")
 
         # Standard risks
         risks.append("Always verify with your own research before live trading")
@@ -714,32 +713,32 @@ def summary(self, sig: AggregatedSignal) -> str:
             f"  Composite: {sig.composite_score:+.2f} | Confidence: {sig.confidence:.0%}",
             f"  VIX Regime: {sig.vix_regime} (size ×{sig.position_size_multiplier:.0%})",
             f"{'═'*55}",
-            f"",
-            f"SIGNAL BREAKDOWN:",
+            "",
+            "SIGNAL BREAKDOWN:",
             f"  Fundamentals: {sig.fundamentals_score:+.2f} (35%)",
             f"  Insider:      {sig.insider_score:+.2f} (25%)",
             f"  Technical:    {sig.technical_score:+.2f} (20%)",
             f"  FFT Cycle:    {sig.cycle_score:+.2f} (10%)",
             f"  Vol Profile:  {sig.volume_score:+.2f} (10%)",
-            f"",
-            f"TRADE PLAN:",
+            "",
+            "TRADE PLAN:",
             f"  Entry:     ${sig.entry_price:.2f}" if sig.entry_price else "  Entry: N/A",
             f"  Stop Loss: ${sig.stop_loss:.2f}" if sig.stop_loss else "  Stop Loss: N/A",
             f"  Target 1:  ${sig.take_profit_1:.2f}" if sig.take_profit_1 else "  Target 1: N/A",
             f"  Target 2:  ${sig.take_profit_2:.2f}" if sig.take_profit_2 else "  Target 2: N/A",
             f"  R/R Ratio: {sig.risk_reward_ratio:.1f}:1" if sig.risk_reward_ratio else "  R/R: N/A",
             f"  Position:  {sig.recommended_position_pct:.1%} of portfolio",
-            f"",
-            f"WHY BUY:",
+            "",
+            "WHY BUY:",
         ]
         for r in (sig.why_buy or ["No strong buy reasons"]):
             lines.append(f"  ✓ {r}")
 
-        lines.append(f"\nCAUTION:")
+        lines.append("\nCAUTION:")
         for r in (sig.why_wait or ["None noted"]):
             lines.append(f"  ⚠ {r}")
 
-        lines.append(f"\nRISKS:")
+        lines.append("\nRISKS:")
         for r in sig.key_risks:
             lines.append(f"  ⚡ {r}")
 

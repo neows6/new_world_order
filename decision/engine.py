@@ -52,14 +52,14 @@ Final output: A DecisionResult with:
 """
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 
 from config import config
-from models.database import init_db, Company, PriceHistory, TradeSignal
+from models.database import Company, PriceHistory, TradeSignal
 from fud.filter_engine import Layer3Result
 from signals.aggregator import AggregatedSignal
 from decision.reynolds_turbulence import ReynoldsMarketAnalyzer, ReynoldsResult
@@ -140,16 +140,16 @@ class DecisionResult:
             f"{'╔' + '═'*60 + '╗'}",
             f"║  LAYER 4 DECISION ENGINE — {self.ticker:<30}║",
             f"{'╚' + '═'*60 + '╝'}",
-            f"",
+            "",
             f"  {'✅ GO' if self.go_no_go else '❌ NO-GO'} — {self.action} | Confidence: {self.decision_confidence:.0%}",
-            f"",
-            f"PHYSICS MODEL READINGS:",
+            "",
+            "PHYSICS MODEL READINGS:",
             f"  Reynolds:  {self.reynolds_regime.upper()} (Re={self.reynolds_number:.2f}) | Scale: {self.reynolds_position_mult:.0%}",
             f"  Quantum:   {self.quantum_dominant_state.upper()} ({self.quantum_certainty:.0%} certain | {self.quantum_interference} interference)",
             f"  Kalman:    Price=${self.kalman_price:.2f} Trend={self.kalman_trend} Innovation={self.kalman_innovation_sigma:.1f}σ",
             f"  Ensemble:  P(Bull)={self.ensemble_probability_bull:.0%} Spread={self.ensemble_spread_category} Kelly={self.kelly_fraction:.1%}→{self.kelly_recommended_fraction:.1%}",
-            f"",
-            f"TRADE SPECIFICATION:",
+            "",
+            "TRADE SPECIFICATION:",
             f"  Entry:       ${self.entry_price:.2f}" if self.entry_price else "  Entry: N/A",
             f"  Stop Loss:   ${self.stop_loss:.2f}" if self.stop_loss else "  Stop Loss: N/A",
             f"  Target 1:    ${self.take_profit_1:.2f}" if self.take_profit_1 else "  Target 1: N/A",
@@ -158,12 +158,12 @@ class DecisionResult:
             f"  Shares:      {self.recommended_shares}",
             f"  Position:    {self.recommended_position_pct:.1%} of portfolio",
             f"  Max Risk:    ${self.max_dollar_risk:.2f}" if self.max_dollar_risk else "  Max Risk: N/A",
-            f"",
-            f"OUTCOME DISTRIBUTION:",
+            "",
+            "OUTCOME DISTRIBUTION:",
             f"  P10 (Bear):  ${self.price_target_bear:.2f}" if self.price_target_bear else "  P10: N/A",
             f"  P50 (Base):  ${self.price_target_base:.2f}" if self.price_target_base else "  P50: N/A",
             f"  P90 (Bull):  ${self.price_target_bull:.2f}" if self.price_target_bull else "  P90: N/A",
-            f"",
+            "",
             f"GATES: {len(self.gates_passed)} passed, {len(self.gates_failed)} failed",
         ]
         for g in self.gates_passed:
@@ -278,7 +278,7 @@ class DecisionEngine:
 
         # Gate 1: FUD Filter passed
         if 'fud' in _bypass:
-            passed.append(f"FUD filter: BYPASSED — user override")
+            passed.append("FUD filter: BYPASSED — user override")
         elif layer3.proceed_to_execution:
             passed.append("FUD filter: news quality acceptable")
         else:
@@ -382,7 +382,7 @@ class DecisionEngine:
         # Bypass key: 'ema'
         ema10 = _ema_value(closes, 10) if closes and len(closes) >= 10 else None
         if 'ema' in _bypass:
-            passed.append(f"Trend filter: BYPASSED (EMA10 gate) — user override")
+            passed.append("Trend filter: BYPASSED (EMA10 gate) — user override")
         elif ema10 is None or current_price is None:
             passed.append("Trend filter: skipped — insufficient price history")
         elif current_price >= ema10 * 0.995:
@@ -538,7 +538,7 @@ class DecisionEngine:
 
         # Prefer live intraday price; fall back to last close or aggregated entry price
         current_price = live_price or (closes[-1] if closes else None) or agg_signal.entry_price
-        shares_outstanding = price_data.get("shares_outstanding")
+        shares_outstanding = price_data.get("shares_outstanding")  # noqa: F841  # kept for future use
 
         # ── 1. Reynolds Number ─────────────────────────────────────
         reynolds_result = self.reynolds.analyze(
