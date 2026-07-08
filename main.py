@@ -133,6 +133,7 @@ def run_trading_cycle(
     executor:         SchwabExecutor,
     market_data:      SchwabMarketData,
     momentum_analyzer: MomentumAnalyzer = None,
+    st_analyzer: SuperTrendAnalyzer = None,
     tickers_override: list = None,      # None = full watchlist, list = subset (AI Watch)
 ):
     """
@@ -352,6 +353,7 @@ def main():
         executor=executor,
         market_data=market_data,
         momentum_analyzer=momentum_analyzer,
+        st_analyzer=st_analyzer,
     )
 
     # Full watchlist trading cycle every 5 min, Mon-Fri market hours
