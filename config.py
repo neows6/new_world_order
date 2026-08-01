@@ -65,8 +65,8 @@ class BriefConfig:
 
 @dataclass
 class TipRanksConfig:
-    email:    str = field(default_factory=lambda: os.getenv("TIPRANKS_EMAIL",    "Alonzoaceves@gmail.com"))
-    password: str = field(default_factory=lambda: os.getenv("TIPRANKS_PASSWORD", "Texas123"))
+    email:    str = field(default_factory=lambda: os.getenv("TIPRANKS_EMAIL",    ""))
+    password: str = field(default_factory=lambda: os.getenv("TIPRANKS_PASSWORD", ""))
 
 
 @dataclass
