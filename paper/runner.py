@@ -409,8 +409,13 @@ def run_paper_cycle(
                 reason = None
                 if sl and cur_p <= sl:
                     reason = f"STOP LOSS: ${cur_p:.2f} <= SL ${sl:.2f}"
-                elif tp1 and cur_p >= tp1:
-                    reason = f"TAKE PROFIT: ${cur_p:.2f} >= TP1 ${tp1:.2f}"
+                # NOTE: no take-profit branch here on purpose. Reaching tp1 is
+                # handled by paper/stop_monitor.py, which arms an 8% trailing
+                # stop instead of selling so winners can run. This block used to
+                # hard-sell at tp1 on the 5-min cycle, which beat the trailing
+                # stop to every winner — across 2026-06→09 the paper models
+                # logged 30 take-profit exits and zero trailing exits, giving up
+                # ~$4.6k. Exits now have a single owner: the stop level.
                 if reason:
                     logger.info(f"[{m['name'].upper()}][STOP/TP] {ticker}: {reason} — selling")
                     ex.execute_sell(ticker, cur_p, reason=reason)

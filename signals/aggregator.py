@@ -141,6 +141,13 @@ SIGNAL_WEIGHTS = {
 # (Paper models override this via buy_threshold_override; this is the live/default only.)
 BUY_THRESHOLD = 0.15
 
+# Minimum stop distance in ATRs, applied to both the Fibonacci and the plain
+# ATR-scaled stop paths so they can't disagree. Keep these two in sync: a stop
+# tighter than the instrument's own noise both gets hit on nothing AND inflates
+# the risk/reward ratio (small denominator), which lets the R/R >= 1.5 gate pass
+# trades that only look favourable because the stop is unrealistically close.
+MIN_STOP_ATR_MULT = 2.5
+
 
 class SignalAggregator:
     """
@@ -503,10 +510,14 @@ class SignalAggregator:
             tp2 = fib.take_profit_2
 
             # ATR floor: Fibonacci stops can be as tight as 1–3%.
-            # During normal volatility a 2× ATR stop keeps the trade alive through
-            # daily fluctuations without eating into the signal.
+            # Raised 2.0 → 2.5 ATR to match the non-Fibonacci branch below. The
+            # 2026-06→09 paper run exited 72% of round trips on a stop at a median
+            # of −3.89%, and 78% of those names were higher 10 trading days later
+            # — the stop was sitting inside ordinary noise. Note this floor only
+            # behaves as intended now that utils/price_data.dedupe_bars() stops
+            # duplicate daily rows from deflating ATR to ~0.6x of true.
             if _atr and stop_loss:
-                min_stop_dist = 2.0 * _atr
+                min_stop_dist = MIN_STOP_ATR_MULT * _atr
                 if (current_price - stop_loss) < min_stop_dist:
                     stop_loss = round(current_price - min_stop_dist, 2)
 
@@ -519,7 +530,7 @@ class SignalAggregator:
         elif current_price and analysis.current_price:
             # ATR-scaled stop: 2.5× ATR gives each stock room proportional to its volatility.
             # Fallback to 5% when SuperTrend ATR isn't available. Floor at -15%.
-            _stop_dist = (2.5 * _atr) if _atr else (current_price * 0.05)
+            _stop_dist = (MIN_STOP_ATR_MULT * _atr) if _atr else (current_price * 0.05)
             stop_loss = round(max(current_price - _stop_dist, current_price * 0.85), 2)
             tp1       = current_price * 1.09
             tp2       = current_price * 1.15

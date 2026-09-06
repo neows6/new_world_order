@@ -297,13 +297,34 @@ class PaperScheduler:
             self._cycle_running = False
 
     def _run_stop_check(self):
+        """
+        60-second stop/trail check across ALL paper models.
+
+        This used to pass only `self._paper_Session` — the standard model's DB —
+        so relaxed / very_relaxed / claude got no 60s exit resolution and never
+        had a trailing stop armed at all. Confirmed in the 2026-06→09 trade log:
+        only the standard model carried this monitor's "STOP @" exit notes.
+        """
         try:
             self._ensure_engines()
             from paper.stop_monitor import check_stops
-            exits = check_stops(self._paper_Session, self._market_data)
+
+            total = 0
+            for m in (self._paper_models or []):
+                name = m.get("name", "")
+                try:
+                    total += check_stops(
+                        m["executor"].Session,
+                        self._market_data,
+                        stagegate_file=m.get("stagegate_file"),
+                        model_label=name,
+                    )
+                except Exception as e:
+                    logger.warning(f"[AUTO] Stop check failed for {name}: {e}")
+
             self._last_stop_check = datetime.now(timezone.utc)
-            if exits:
-                self._stop_exits += exits
+            if total:
+                self._stop_exits += total
         except Exception as e:
             logger.warning(f"[AUTO] Stop check failed: {e}")
 

@@ -23,12 +23,20 @@ _STAGEGATE_FILE = "data/stagegate.json"
 TRAIL_PCT = 0.08   # trail 8% below the running peak once in profit
 
 
-def check_stops(paper_session_factory, market_data) -> int:
+def check_stops(paper_session_factory, market_data, stagegate_file: str = None,
+                model_label: str = "") -> int:
     """
     Check all open positions against their stop_loss / take_profit_1 levels.
     Executes a paper SELL for any position that has breached a level.
     Returns the number of exits triggered.
+
+    Args:
+        stagegate_file: per-model stagegate JSON to sync on exit. Defaults to the
+            standard model's file.
+        model_label: prefix for log lines so multi-model runs are distinguishable.
     """
+    sg_file = stagegate_file or _STAGEGATE_FILE
+    tag = f"[STOP MON{':' + model_label if model_label else ''}]"
     try:
         with paper_session_factory() as s:
             positions = (
@@ -49,7 +57,7 @@ def check_stops(paper_session_factory, market_data) -> int:
                 if p.stop_loss is not None or p.take_profit_1 is not None
             ]
     except Exception as e:
-        logger.warning(f"[STOP MON] Could not read positions: {e}")
+        logger.warning(f"{tag} Could not read positions: {e}")
         return 0
 
     if not pos_data:
@@ -60,7 +68,7 @@ def check_stops(paper_session_factory, market_data) -> int:
     try:
         quotes = market_data.get_quotes_batch(tickers)
     except Exception as e:
-        logger.warning(f"[STOP MON] Quote fetch failed: {e}")
+        logger.warning(f"{tag} Quote fetch failed: {e}")
         return 0
 
     exits = 0
@@ -88,7 +96,7 @@ def check_stops(paper_session_factory, market_data) -> int:
                 if new_sl != sl:
                     if _update_stop(paper_session_factory, ticker, new_sl):
                         logger.info(
-                            f"[STOP MON] {ticker}: trailing stop → ${new_sl:.2f} "
+                            f"{tag} {ticker}: trailing stop → ${new_sl:.2f} "
                             f"(price ${price:.2f}, was ${sl if sl else 0:.2f})"
                         )
                     sl = new_sl
@@ -98,15 +106,16 @@ def check_stops(paper_session_factory, market_data) -> int:
             reason = f"STOP @ ${price:.2f} ≤ stop ${sl:.2f}"
 
         if reason:
-            logger.info(f"[STOP MON] {ticker}: {reason} — triggering paper SELL")
-            ok = _execute_stop_sell(paper_session_factory, ticker, price, reason)
+            logger.info(f"{tag} {ticker}: {reason} — triggering paper SELL")
+            ok = _execute_stop_sell(paper_session_factory, ticker, price, reason, sg_file, tag)
             if ok:
                 exits += 1
 
     return exits
 
 
-def _execute_stop_sell(paper_session_factory, ticker: str, price: float, reason: str) -> bool:
+def _execute_stop_sell(paper_session_factory, ticker: str, price: float, reason: str,
+                       stagegate_file: str = None, tag: str = "[STOP MON]") -> bool:
     """Write a paper SELL directly to the DB for a stop/target exit."""
     try:
         with paper_session_factory() as s:
@@ -136,15 +145,15 @@ def _execute_stop_sell(paper_session_factory, ticker: str, price: float, reason:
             s.delete(position)
             s.commit()
 
-        _sync_stagegate(ticker)
+        _sync_stagegate(ticker, stagegate_file)
         logger.info(
-            f"[STOP MON] SOLD {sell_qty}× {ticker} @ ${price:.2f} "
+            f"{tag} SOLD {sell_qty}× {ticker} @ ${price:.2f} "
             f"= ${proceeds:,.2f} | {reason}"
         )
         return True
 
     except Exception as e:
-        logger.error(f"[STOP MON] Stop-sell failed for {ticker}: {e}")
+        logger.error(f"{tag} Stop-sell failed for {ticker}: {e}")
         return False
 
 
@@ -163,13 +172,14 @@ def _update_stop(paper_session_factory, ticker: str, new_stop: float) -> bool:
         return False
 
 
-def _sync_stagegate(ticker: str):
+def _sync_stagegate(ticker: str, stagegate_file: str = None):
     """Move ticker from stage3 back to stage2 after a stop exit."""
     import json, os
+    path = stagegate_file or _STAGEGATE_FILE
     try:
-        if not os.path.exists(_STAGEGATE_FILE):
+        if not os.path.exists(path):
             return
-        with open(_STAGEGATE_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             sg = json.load(f)
         for k in ("stage1", "stage2", "stage3"):
             sg.setdefault(k, [])
@@ -177,7 +187,7 @@ def _sync_stagegate(ticker: str):
             sg["stage3"].remove(ticker)
         if ticker not in sg["stage1"] and ticker not in sg["stage2"]:
             sg["stage2"].append(ticker)
-        with open(_STAGEGATE_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(sg, f, indent=2)
     except Exception as e:
         logger.warning(f"[STOP MON] stagegate sync failed: {e}")
