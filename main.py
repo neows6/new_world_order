@@ -92,10 +92,13 @@ def _load_price_data(Session, ticker: str) -> dict:
 
         cik = company.cik
 
-    closes  = [r.adjusted_close or r.close for r in records if (r.adjusted_close or r.close)]
-    highs   = [r.high   for r in records if r.high]
-    lows    = [r.low    for r in records if r.low]
-    volumes = [r.volume for r in records if r.volume]
+    # Dedupe the doubled daily rows before anything ATR-based reads them.
+    from utils.price_data import ohlcv_arrays
+    _bars   = ohlcv_arrays(records)
+    closes  = _bars["closes"]
+    highs   = _bars["highs"]
+    lows    = _bars["lows"]
+    volumes = _bars["volumes"]
 
     return {
         "closes": closes, "highs": highs,

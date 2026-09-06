@@ -108,22 +108,23 @@ class AnalysisPipeline:
                 .filter_by(company_id=company.id)
                 .order_by(PriceHistory.date)
                 .all()
-            )[-lookback:]
+            )
 
             if not records:
                 return {}
 
-            closes  = [r.adjusted_close or r.close for r in records if (r.adjusted_close or r.close)]
-            highs   = [r.high   for r in records if r.high]
-            lows    = [r.low    for r in records if r.low]
-            volumes = [r.volume for r in records if r.volume]
+            # Dedupe the doubled daily rows, THEN trim to lookback — trimming
+            # first would leave ~half as many distinct trading days as intended.
+            from utils.price_data import ohlcv_arrays
+            bars = ohlcv_arrays(records, lookback=lookback)
+            closes = bars["closes"]
 
             return {
                 "closes":  closes,
-                "highs":   highs,
-                "lows":    lows,
-                "volumes": volumes,
-                "dates":   [r.date for r in records],
+                "highs":   bars["highs"],
+                "lows":    bars["lows"],
+                "volumes": bars["volumes"],
+                "dates":   bars["dates"],
                 "price":   closes[-1] if closes else None,
                 "cik":     company.cik,
             }

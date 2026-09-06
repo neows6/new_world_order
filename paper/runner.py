@@ -43,6 +43,7 @@ from broker.market_data import SchwabMarketData
 
 from paper.account import PaperPosition
 from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS, DEFAULT_STAGE2_TICKERS
+from utils.price_data import ohlcv_arrays
 
 # Base buy threshold (must match signals/aggregator.py BUY_THRESHOLD)
 _BASE_BUY_THRESHOLD = 0.08
@@ -84,10 +85,12 @@ def _load_price_data(Session, ticker: str, live_quotes: dict | None = None) -> d
             return {}
         cik = company.cik
 
-    closes  = [r.adjusted_close or r.close for r in records if (r.adjusted_close or r.close)]
-    highs   = [r.high   for r in records if r.high]
-    lows    = [r.low    for r in records if r.low]
-    volumes = [r.volume for r in records if r.volume]
+    # Dedupe the doubled daily rows before anything ATR-based reads them.
+    _bars   = ohlcv_arrays(records)
+    closes  = _bars["closes"]
+    highs   = _bars["highs"]
+    lows    = _bars["lows"]
+    volumes = _bars["volumes"]
 
     # Inject live intraday bar into all arrays so every indicator uses live data
     if live_quotes is not None:

@@ -227,13 +227,19 @@ class DecisionEngine:
         if not records:
             return {}
 
+        # Dedupe the doubled daily rows before anything ATR-based reads them.
+        from utils.price_data import ohlcv_arrays
+        bars = ohlcv_arrays(records)
+        if not bars["bars"]:
+            return {}
+
         return {
-            "closes":  [r.adjusted_close or r.close for r in records if (r.adjusted_close or r.close)],
-            "highs":   [r.high for r in records if r.high],
-            "lows":    [r.low for r in records if r.low],
-            "volumes": [r.volume for r in records if r.volume],
-            "market_cap": records[-1].market_cap,
-            "shares_outstanding": records[-1].shares_outstanding,
+            "closes":  bars["closes"],
+            "highs":   bars["highs"],
+            "lows":    bars["lows"],
+            "volumes": bars["volumes"],
+            "market_cap": bars["bars"][-1].market_cap,
+            "shares_outstanding": bars["bars"][-1].shares_outstanding,
         }
 
     def _compute_quantum_score(self, q_result: QuantumStateResult) -> float:
