@@ -248,6 +248,10 @@ class EnsembleKellyEngine:
         # Dollar limits
         max_trade_dollars: float = 500.0,
         max_position_pct: float = 0.05,
+
+        # Quantum certainty as a size scalar (see DecisionEngine._quantum_position_mult).
+        # 1.0 = no penalty, so existing callers that don't pass it are unaffected.
+        quantum_position_mult: float = 1.0,
     ) -> EnsembleForecastResult:
         """
         Run ensemble forecast and compute Kelly-optimal position size.
@@ -350,7 +354,14 @@ class EnsembleKellyEngine:
         # ── Final position size ────────────────────────────────────
         # Start with Kelly recommendation, apply regime and dollar limits
         base_pct = min(kelly_recommended, max_position_pct)
-        adjusted_pct = base_pct * regime_weight_mult * confidence_multiplier
+        adjusted_pct = (base_pct * regime_weight_mult
+                        * quantum_position_mult * confidence_multiplier)
+        if quantum_position_mult < 1.0:
+            notes.append(
+                f"Quantum certainty below full-size threshold — position scaled to "
+                f"{quantum_position_mult:.0%} (was {base_pct * regime_weight_mult * confidence_multiplier:.2%}, "
+                f"now {adjusted_pct:.2%})"
+            )
 
         # Hard dollar cap
         if portfolio_value and portfolio_value > 0:

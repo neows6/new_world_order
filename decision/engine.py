@@ -108,6 +108,7 @@ class DecisionResult:
     reynolds_position_mult: float
     quantum_dominant_state: str       # bull/bear/sideways
     quantum_certainty: float
+    quantum_position_mult: float      # size scalar derived from certainty (1.0 = no penalty)
     quantum_interference: str         # constructive/destructive/neutral
     kalman_trend: str                 # up/down/flat
     kalman_price: float               # De-noised price estimate
@@ -145,7 +146,7 @@ class DecisionResult:
             "",
             "PHYSICS MODEL READINGS:",
             f"  Reynolds:  {self.reynolds_regime.upper()} (Re={self.reynolds_number:.2f}) | Scale: {self.reynolds_position_mult:.0%}",
-            f"  Quantum:   {self.quantum_dominant_state.upper()} ({self.quantum_certainty:.0%} certain | {self.quantum_interference} interference)",
+            f"  Quantum:   {self.quantum_dominant_state.upper()} ({self.quantum_certainty:.0%} certain | {self.quantum_interference} interference | size {self.quantum_position_mult:.0%})",
             f"  Kalman:    Price=${self.kalman_price:.2f} Trend={self.kalman_trend} Innovation={self.kalman_innovation_sigma:.1f}σ",
             f"  Ensemble:  P(Bull)={self.ensemble_probability_bull:.0%} Spread={self.ensemble_spread_category} Kelly={self.kelly_fraction:.1%}→{self.kelly_recommended_fraction:.1%}",
             "",
@@ -187,7 +188,25 @@ class DecisionEngine:
 
     # Decision gates — all must pass for GO
     MIN_ENSEMBLE_PROB   = 0.52   # P(bull) must exceed this (was 0.45 — 52% = meaningful edge over coin flip)
-    MIN_QUANTUM_CERTAIN = 0.60   # Wave function must be substantially collapsed (was 0.45 — near coin flip)
+
+    # Quantum certainty is a POSITION SCALAR, not a binary gate.
+    #
+    # At a flat 0.60 block this was the single biggest constraint on the standard
+    # model: over 2026-06-03..09-05 the pipeline generated 9,381 BUY signals but
+    # the model executed 11 buys and sat ~94% in cash (+0.28% vs SPY +2.38%).
+    # Observed certainty centres around 54% in a laminar/sideways tape — the
+    # regime that dominates — so a 0.60 wall admits almost nothing, and the
+    # certainty it does admit is not obviously better, just rarer.
+    #
+    # Now: below MIN_QUANTUM_CERTAIN the trade is still blocked outright (a
+    # genuinely undecided wave function is not tradeable). Between there and
+    # QUANTUM_FULL_SIZE_CERTAIN, position size ramps linearly from
+    # QUANTUM_MIN_SIZE_MULT to 1.0, so weak conviction trades small rather than
+    # not at all. This mirrors how Reynolds already scales size by regime
+    # instead of vetoing.
+    MIN_QUANTUM_CERTAIN       = 0.45   # hard block below this (restores the pre-2026-05 floor)
+    QUANTUM_FULL_SIZE_CERTAIN = 0.60   # at/above this, no size penalty
+    QUANTUM_MIN_SIZE_MULT     = 0.40   # size multiplier at exactly MIN_QUANTUM_CERTAIN
     MAX_REYNOLDS        = 10.0   # Reject in extreme turbulence (raised from 5.0 — Re 5-10 is turbulent but tradeable)
     MIN_RR_RATIO        = 1.5    # Minimum risk/reward ratio
     MAX_KALMAN_SURPRISE = 2.5    # Reject if Kalman innovation > 2.5σ (unusual move)
@@ -204,6 +223,10 @@ class DecisionEngine:
         if threshold_multiplier != 1.0:
             self.MIN_ENSEMBLE_PROB   = round(self.__class__.MIN_ENSEMBLE_PROB   * threshold_multiplier, 4)
             self.MIN_QUANTUM_CERTAIN = round(self.__class__.MIN_QUANTUM_CERTAIN * threshold_multiplier, 4)
+            # The full-size point moves with the floor so the ramp keeps its shape
+            # for relaxed models rather than collapsing to "always full size".
+            self.QUANTUM_FULL_SIZE_CERTAIN = round(
+                self.__class__.QUANTUM_FULL_SIZE_CERTAIN * threshold_multiplier, 4)
             self.MIN_RR_RATIO        = round(self.__class__.MIN_RR_RATIO        * threshold_multiplier, 4)
             self.MAX_REYNOLDS        = round(self.__class__.MAX_REYNOLDS        / threshold_multiplier, 4)
             self.MAX_KALMAN_SURPRISE = round(self.__class__.MAX_KALMAN_SURPRISE / threshold_multiplier, 4)
@@ -241,6 +264,27 @@ class DecisionEngine:
             "market_cap": bars["bars"][-1].market_cap,
             "shares_outstanding": bars["bars"][-1].shares_outstanding,
         }
+
+    def _quantum_position_mult(self, certainty: float) -> float:
+        """
+        Position-size multiplier from quantum state certainty.
+
+        Linear ramp: QUANTUM_MIN_SIZE_MULT at MIN_QUANTUM_CERTAIN, rising to 1.0
+        at QUANTUM_FULL_SIZE_CERTAIN and flat above. Below MIN_QUANTUM_CERTAIN
+        Gate 3 has already blocked the trade, so this is never consulted there.
+
+        With the defaults (0.45 floor, 0.60 full, 0.40 min): 45% certainty trades
+        at 40% size, 54% (the observed median) at ~72%, 60%+ at full size.
+        """
+        lo, hi = self.MIN_QUANTUM_CERTAIN, self.QUANTUM_FULL_SIZE_CERTAIN
+        if hi <= lo:
+            return 1.0
+        if certainty >= hi:
+            return 1.0
+        if certainty <= lo:
+            return self.QUANTUM_MIN_SIZE_MULT
+        span = (certainty - lo) / (hi - lo)
+        return self.QUANTUM_MIN_SIZE_MULT + span * (1.0 - self.QUANTUM_MIN_SIZE_MULT)
 
     def _compute_quantum_score(self, q_result: QuantumStateResult) -> float:
         """Convert quantum state to -1.0 to +1.0 score."""
@@ -314,9 +358,13 @@ class DecisionEngine:
         if 'quantum' in _bypass:
             passed.append(f"Quantum: BYPASSED ({quantum.state_certainty:.0%} certain) — user override")
         elif quantum.state_certainty >= self.MIN_QUANTUM_CERTAIN:
+            _qmult = self._quantum_position_mult(quantum.state_certainty)
+            _size_note = ("" if _qmult >= 1.0
+                          else f" — size scaled to {_qmult:.0%} (certainty below "
+                               f"{self.QUANTUM_FULL_SIZE_CERTAIN:.0%})")
             passed.append(
                 f"Quantum: {quantum.dominant_state.upper()} state ({quantum.state_certainty:.0%} certain, "
-                f"{quantum.interference_type} interference)"
+                f"{quantum.interference_type} interference){_size_note}"
             )
         else:
             failed.append(
@@ -324,6 +372,9 @@ class DecisionEngine:
                 f"{self.MIN_QUANTUM_CERTAIN:.0%} required) — {quantum.dominant_state} but not decisive (bypass 'QSt' to override)"
             )
             blocker = blocker or f"Market direction ambiguous — {quantum.dominant_state} state only {quantum.state_certainty:.0%} certain, need {self.MIN_QUANTUM_CERTAIN:.0%}"
+
+        # Gate 3b: no separate gate — certainty above the floor scales size via
+        # _quantum_position_mult(), applied in the ensemble sizing call.
 
         # Gate 4: Ensemble probability
         if 'ensemble' in _bypass:
@@ -596,6 +647,7 @@ class DecisionEngine:
             quantum_score=quantum_score,
             kalman_score=kalman_score,
             reynolds_position_mult=reynolds_result.position_multiplier,
+            quantum_position_mult=self._quantum_position_mult(quantum_result.state_certainty),
             reynolds_regime=reynolds_result.regime,
             technical_score=agg_signal.technical_score,
             insider_score=agg_signal.insider_score,
@@ -685,6 +737,7 @@ class DecisionEngine:
             reynolds_position_mult=reynolds_result.position_multiplier,
             quantum_dominant_state=quantum_result.dominant_state,
             quantum_certainty=quantum_result.state_certainty,
+            quantum_position_mult=self._quantum_position_mult(quantum_result.state_certainty),
             quantum_interference=quantum_result.interference_type,
             kalman_trend=kalman_result.trend_direction,
             kalman_price=kalman_result.filtered_price,
