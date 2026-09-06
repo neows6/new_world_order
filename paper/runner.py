@@ -14,7 +14,7 @@ Can run alongside main.py (uses a separate DB and port-less — no web server).
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,14 +41,77 @@ from decision.engine import DecisionEngine
 from risk.manager import RiskManager
 from broker.market_data import SchwabMarketData
 
-from paper.account import PaperPosition
+from paper.account import PaperPosition, PaperTrade
 from paper.executor import PaperExecutor, PAPER_MODEL_CONFIGS, DEFAULT_STAGE2_TICKERS
 from utils.price_data import ohlcv_arrays
 
 # Base buy threshold (must match signals/aggregator.py BUY_THRESHOLD)
 _BASE_BUY_THRESHOLD = 0.08
 
+# ── Post-stop re-entry cooldown ───────────────────────────────────────────────
+# Over 2026-06-03..09-05, 55-65% of all buys in the relaxed/very_relaxed/claude
+# models were re-entries into a ticker that had just stopped out — NVDA was
+# bought 6x in very_relaxed (4 stops), PLD 4x in claude (4 stops, zero wins),
+# MCD 3x (3 stops, zero wins). The signal flips BUY->HOLD->SELL on consecutive
+# 5-minute cycles, so with nothing to damp it the system bought straight back
+# into the same chop.
+#
+# After a STOP exit a ticker is benched for this many days, UNLESS price has
+# reclaimed the original entry — a genuine thesis recovery, not a dead-cat
+# bounce. Calendar days, not trading days: 7 covers a normal 5-session week.
+STOP_REENTRY_COOLDOWN_DAYS = 7
+
 _momentum_analyzer = MomentumAnalyzer()
+
+
+def _stop_cooldown_block(executor, ticker: str, current_price: float | None):
+    """
+    Return a human-readable reason if `ticker` is still benched after a stop-out
+    in this model's book, or None if a BUY is allowed.
+
+    Reads the model's own paper_trades — no extra state to persist or reset.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=STOP_REENTRY_COOLDOWN_DAYS)
+        with executor.Session() as s:
+            last_sell = (
+                s.query(PaperTrade)
+                .filter(PaperTrade.ticker == ticker, PaperTrade.action == "SELL")
+                .order_by(PaperTrade.timestamp.desc())
+                .first()
+            )
+            if not last_sell or "STOP" not in (last_sell.notes or "").upper():
+                return None                     # never stopped out, or exited some other way
+
+            ts = last_sell.timestamp
+            if ts is None:
+                return None
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts < cutoff:
+                return None                     # cooldown already elapsed
+
+            prior_buy = (
+                s.query(PaperTrade)
+                .filter(PaperTrade.ticker == ticker,
+                        PaperTrade.action == "BUY",
+                        PaperTrade.timestamp < last_sell.timestamp)
+                .order_by(PaperTrade.timestamp.desc())
+                .first()
+            )
+            entry = prior_buy.price if prior_buy else None
+
+        # Reclaim override — back above the entry the stop invalidated.
+        if entry and current_price and current_price > entry:
+            return None
+
+        days_left = STOP_REENTRY_COOLDOWN_DAYS - (datetime.now(timezone.utc) - ts).days
+        detail = f" (needs > ${entry:.2f} to re-enter early)" if entry else ""
+        return (f"stopped out {ts:%Y-%m-%d}, {max(days_left, 0)}d cooldown remaining"
+                f"{detail}")
+    except Exception as e:
+        logger.warning(f"[COOLDOWN] check failed for {ticker}: {e}")
+        return None                             # never block a trade on a lookup error
 
 
 def setup_logging():
@@ -543,11 +606,26 @@ def run_paper_cycle(
                 market_returns=[],
             )
             approved = []
+            benched  = []
             for ticker, assessment in risk_assessments.items():
                 if assessment.approved:
+                    if (assessment.action or "").upper() == "BUY":
+                        cooldown = _stop_cooldown_block(
+                            ex, ticker, _live_prices.get(ticker) or assessment.entry_price
+                        )
+                        if cooldown:
+                            benched.append(ticker)
+                            logger.info(
+                                f"[{m['name'].upper()}][COOLDOWN] {ticker}: BUY skipped — {cooldown}"
+                            )
+                            continue
                     result = ex.execute(assessment)
                     if result:
                         approved.append(ticker)
+            if benched:
+                logger.info(
+                    f"[{m['name'].upper()}] {len(benched)} buy(s) benched by post-stop cooldown: {benched}"
+                )
             logger.info(
                 f"[{m['name'].upper()}] Cycle complete. {len(approved)} trade(s)" +
                 (f": {approved}" if approved else ".")
